@@ -1,7 +1,5 @@
-// odin
 // cargo
 // libseccomp-dev
 
 > cd source-code
->>> cd cli && odin build . -out:hpm
->>> cd backend && cargo build --release
+> cargo build --release
