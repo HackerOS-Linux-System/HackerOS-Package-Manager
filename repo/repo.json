@@ -1,59 +1,7 @@
 {
-  "test": {
-    "author": "michal",
-    "license": "MIT",
-    "description": "Opis pakietu testowego",
-    "versions": [
-      {
-        "version": "0.1",
-        "url": "https://github.com/michal92299/test/releases/download/v0.1/moj-pakiet.hpm",
-        "sha256": "8356e3b1f5a01d82a3d14e73200ddbce057399ae48bb9b470c2c6911d31430a0",
-        "deps": {}
-      }
-      {
-        "version": "0.2",
-        "url": "https://github.com/michal92299/test/releases/download/v0.2/test.hpm"
-        "sha256": "765b7e84973101de1cdc8bca569b67bdae248ac381b9d2809680ff7f73430540"
-        "deps": {}
-    ]
-  },
-  "hackerland": {
-    "author": "HackerOS Team",
-    "license": "MIT",
-    "description": "HackerLand language",
-    "versions": [
-      {
-        "version": "0.3",
-        "url": "https://github.com/HackerOS-Linux-System/HackerLand/releases/download/v0.3/hackerland.hpm",
-        "sha256": "WSTAW_SUME_SHA256_DLA_HACKERLAND",
-        "deps": {}
-      }
-    ]
-  },
-  "Blue-Enviroment": {
-    "author": "HackerOS Team",
-    "license": "MIT",
-    "description": "Blue Environment components",
-    "versions": [
-      {
-        "version": "0.3",
-        "url": "https://github.com/HackerOS-Linux-System/Blue-Enviroment/releases/download/v0.3/Blue-Enviroment.hpm",
-        "sha256": "WSTAW_SUME_SHA256_DLA_BLUE",
-        "deps": {}
-      }
-    ]
-  },
-  "legendary": {
-    "author": "HackerOS Team",
-    "license": "MIT",
-    "description": "Legendary package",
-    "versions": [
-      {
-        "version": "0.3",
-        "url": "https://github.com/HackerOS-Linux-System/legendary/releases/download/v0.3/legendary.hpm",
-        "sha256": "WSTAW_SUME_SHA256_DLA_LEGENDARY",
-        "deps": {}
-      }
-    ]
+  "packages": {
+    "test": {
+      "repo": "https://github.com/michal92299/test.git"
+    }
   }
 }
