@@ -1,7 +1,7 @@
 {
   "packages": {
     "test": {
-      "repo": "https://github.com/michal92299/test.git",
+      "repo": "https://github.com/michal92299/test.git"
     }
   }
 }
