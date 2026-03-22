@@ -1,15 +1,7 @@
 {
   "packages": {
-    "example-pkg": {
-      "repo": "https://github.com/example/example-pkg.git",
-      "versions": ["1.0.0", "1.1.0", "2.0.0"]
-    },
-    "another-pkg": {
-      "repo": "https://github.com/example/another-pkg.git"
-    },
-    "simple-pkg": {
-      "repo": "https://github.com/example/simple-pkg.git",
-      "versions": []
+    "test": {
+      "repo": "https://github.com/michal92299/test.git",
     }
   }
 }
