@@ -1,4 +1,4 @@
-use anyhow::Result;
+use miette::{Result, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -23,15 +23,15 @@ impl State {
         if !Path::new(STATE_PATH).exists() {
             return Ok(State::default());
         }
-        let data = fs::read(STATE_PATH)?;
-        Ok(serde_json::from_slice(&data)?)
+        let data = fs::read(STATE_PATH).into_diagnostic()?;
+        Ok(serde_json::from_slice(&data).into_diagnostic()?)
     }
 
     pub fn save(&self) -> Result<()> {
-        let data = serde_json::to_vec(self)?;
+        let data = serde_json::to_vec(self).into_diagnostic()?;
         let tmp_path = format!("{}.tmp", STATE_PATH);
-        fs::write(&tmp_path, data)?;
-        fs::rename(&tmp_path, STATE_PATH)?;
+        fs::write(&tmp_path, data).into_diagnostic()?;
+        fs::rename(&tmp_path, STATE_PATH).into_diagnostic()?;
         Ok(())
     }
 
