@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Result};
+use miette::{Result, miette};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use hk_parser::HkValue;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildInfo {
@@ -52,43 +53,52 @@ pub struct Sandbox {
     pub full_gui: bool,
 }
 
+// Helper function to check if an HkValue is considered "empty"
+fn is_empty_value(v: &HkValue) -> bool {
+    match v {
+        HkValue::String(s) => s.is_empty(),
+        HkValue::Bool(b) => !b, // treat false as empty
+        _ => false, // other types (numbers, maps, lists) are not considered empty
+    }
+}
+
 impl Manifest {
     pub fn load_from_path(path: &str) -> Result<Self> {
         let info_path = format!("{}/info.hk", path);
         let mut config = hk_parser::load_hk_file(&info_path)
-        .map_err(|e| anyhow!("Failed to load info.hk: {}", e))?;
+        .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
         hk_parser::resolve_interpolations(&mut config)
-        .map_err(|e| anyhow!("Failed to resolve interpolations: {}", e))?;
+        .map_err(|e| miette!("Failed to resolve interpolations: {}", e))?;
 
         let metadata = config
         .get("metadata")
-        .ok_or(anyhow!("Missing [metadata] section"))?
+        .ok_or_else(|| miette!("Missing [metadata] section"))?
         .as_map()
-        .map_err(|_| anyhow!("Invalid metadata"))?;
+        .map_err(|_| miette!("Invalid metadata"))?;
 
         let name = metadata
         .get("name")
-        .ok_or(anyhow!("Missing name"))?
+        .ok_or_else(|| miette!("Missing name"))?
         .as_string()
-        .map_err(|_| anyhow!("Invalid name"))?;
+        .map_err(|_| miette!("Invalid name"))?;
 
         let version = metadata
         .get("version")
-        .ok_or(anyhow!("Missing version"))?
+        .ok_or_else(|| miette!("Missing version"))?
         .as_string()
-        .map_err(|_| anyhow!("Invalid version"))?;
+        .map_err(|_| miette!("Invalid version"))?;
 
         let authors = metadata
         .get("authors")
-        .ok_or(anyhow!("Missing authors"))?
+        .ok_or_else(|| miette!("Missing authors"))?
         .as_string()
-        .map_err(|_| anyhow!("Invalid authors"))?;
+        .map_err(|_| miette!("Invalid authors"))?;
 
         let license = metadata
         .get("license")
-        .ok_or(anyhow!("Missing license"))?
+        .ok_or_else(|| miette!("Missing license"))?
         .as_string()
-        .map_err(|_| anyhow!("Invalid license"))?;
+        .map_err(|_| miette!("Invalid license"))?;
 
         let description = config.get("description").and_then(|v| v.as_map().ok());
         let summary = description
@@ -105,7 +115,9 @@ impl Manifest {
         if let Some(s) = specs {
             for (k, v) in s {
                 if k != "dependencies" {
-                    system_specs.insert(k.clone(), v.as_string().map_err(|_| anyhow!("Invalid spec value"))?);
+                    let val = v.as_string()
+                    .map_err(|_| miette!("Invalid spec value"))?;
+                    system_specs.insert(k.clone(), val);
                 }
             }
         }
@@ -116,18 +128,21 @@ impl Manifest {
         {
             let mut m = IndexMap::new();
             for (k, v) in d {
-                m.insert(k.clone(), v.as_string().map_err(|_| anyhow!("Invalid dep value"))?);
+                let val = v.as_string()
+                .map_err(|_| miette!("Invalid dep value"))?;
+                m.insert(k.clone(), val);
             }
             m
         } else {
             IndexMap::new()
         };
 
-        let bins_map = metadata.get("bins").and_then(|v| v.as_map().ok());
+        // Bins: map where keys are binary names and values are empty strings (or false)
+        let bins_map = metadata.get("bins").and_then(|v: &HkValue| v.as_map().ok());
         let mut bins = Vec::new();
         if let Some(bm) = bins_map {
             for (k, v) in bm {
-                if v.as_string().map_err(|_| anyhow!("Invalid bin value"))? == "" {
+                if is_empty_value(v) {
                     bins.push(k.clone());
                 }
             }
@@ -135,32 +150,47 @@ impl Manifest {
 
         let sandbox_sec = config
         .get("sandbox")
-        .ok_or(anyhow!("Missing [sandbox] section"))?
+        .ok_or_else(|| miette!("Missing [sandbox] section"))?
         .as_map()
-        .map_err(|_| anyhow!("Invalid sandbox"))?;
+        .map_err(|_| miette!("Invalid sandbox"))?;
+
         let network = sandbox_sec
         .get("network")
-        .and_then(|v| v.as_bool().ok())
+        .and_then(|v: &HkValue| v.as_bool().ok())
         .unwrap_or(false);
-        let gui = sandbox_sec.get("gui").and_then(|v| v.as_bool().ok()).unwrap_or(false);
-        let dev = sandbox_sec.get("dev").and_then(|v| v.as_bool().ok()).unwrap_or(false);
-        let full_gui = sandbox_sec.get("full_gui").and_then(|v| v.as_bool().ok()).unwrap_or(false);
-        let fs_map = sandbox_sec.get("filesystem").and_then(|v| v.as_map().ok());
+        let gui = sandbox_sec
+        .get("gui")
+        .and_then(|v: &HkValue| v.as_bool().ok())
+        .unwrap_or(false);
+        let dev = sandbox_sec
+        .get("dev")
+        .and_then(|v: &HkValue| v.as_bool().ok())
+        .unwrap_or(false);
+        let full_gui = sandbox_sec
+        .get("full_gui")
+        .and_then(|v: &HkValue| v.as_bool().ok())
+        .unwrap_or(false);
+
+        // Filesystem: map of paths with empty values
+        let fs_map = sandbox_sec
+        .get("filesystem")
+        .and_then(|v: &HkValue| v.as_map().ok());
         let mut filesystem = Vec::new();
         if let Some(fm) = fs_map {
             for (k, v) in fm {
-                if v.as_string().map_err(|_| anyhow!("Invalid fs value"))? == "" {
+                if is_empty_value(v) {
                     filesystem.push(k.clone());
                 }
             }
         }
 
+        // Install commands: map of command names with empty values
         let install_sec = config.get("install").and_then(|v| v.as_map().ok());
         let mut install_commands = Vec::new();
         if let Some(is) = install_sec {
             if let Some(cmds) = is.get("commands").and_then(|v| v.as_map().ok()) {
                 for (k, v) in cmds {
-                    if v.as_string().map_err(|_| anyhow!("Invalid cmd value"))? == "" {
+                    if is_empty_value(v) {
                         install_commands.push(k.clone());
                     }
                 }
@@ -174,14 +204,14 @@ impl Manifest {
         if let Some(b) = build_sec {
             if let Some(cmds) = b.get("commands").and_then(|v| v.as_map().ok()) {
                 for (k, v) in cmds {
-                    if v.as_string().map_err(|_| anyhow!("Invalid cmd value"))? == "" {
+                    if is_empty_value(v) {
                         build_commands.push(k.clone());
                     }
                 }
             }
             if let Some(deps) = b.get("deb_deps").and_then(|v| v.as_map().ok()) {
                 for (k, v) in deps {
-                    if v.as_string().map_err(|_| anyhow!("Invalid dep value"))? == "" {
+                    if is_empty_value(v) {
                         build_deb_deps.push(k.clone());
                     }
                 }
@@ -194,7 +224,7 @@ impl Manifest {
         if let Some(r) = runtime_sec {
             if let Some(deps) = r.get("deb_deps").and_then(|v| v.as_map().ok()) {
                 for (k, v) in deps {
-                    if v.as_string().map_err(|_| anyhow!("Invalid dep value"))? == "" {
+                    if is_empty_value(v) {
                         runtime_deb_deps.push(k.clone());
                     }
                 }
