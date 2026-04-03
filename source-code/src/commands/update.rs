@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use crate::{
     repo::RepoManager,
@@ -40,12 +40,13 @@ pub fn update() -> Result<()> {
         let latest_ver = repo_pkg.versions.iter()
         .map(|v| &v.version)
         .max_by(|a, b| compare_versions(a, b))
-        .ok_or_else(|| anyhow!("No versions for {}", pkg_name))?;
+        .ok_or_else(|| miette::miette!("No versions for {}", pkg_name))?;
 
         if compare_versions(latest_ver, &current_ver) == std::cmp::Ordering::Greater {
             println!("{} Updating {} from {} to {}", "→".yellow(), pkg_name.cyan(), current_ver.cyan(), latest_ver.cyan());
             remove_version(&pkg_name, &current_ver, &mut state)?;
-            install_single(&pkg_name, latest_ver, &repo_mgr, &mut state)?;
+            // Instaluj nową wersję – podajemy ją jawnie
+            install_single(&pkg_name, Some(latest_ver), &repo_mgr, &mut state)?;
             updated += 1;
         } else {
             current += 1;
