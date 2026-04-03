@@ -1,4 +1,4 @@
-use anyhow::Result;
+use miette::Result;
 use colored::Colorize;
 use crate::{
     STORE_PATH,
