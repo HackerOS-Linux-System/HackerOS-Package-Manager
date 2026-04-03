@@ -1,0 +1,5 @@
+#!/bin/sh
+# hello-hpm — example binary for hpm-example-repo
+echo "Hello from HackerOS Package Manager!"
+echo "Running as: $(whoami)"
+echo "Args: $*"
