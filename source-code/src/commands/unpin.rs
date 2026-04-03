@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use crate::state::State;
 
@@ -9,13 +9,13 @@ pub fn unpin(package: String) -> Result<()> {
     let mut state = State::load()?;
 
     let current_ver = state.get_current_version(&package)
-    .with_context(|| format!("Package '{}' not installed", package))?;
+    .ok_or_else(|| miette::miette!("Package '{}' not installed", package))?;
 
     let versions = state.packages.get_mut(&package)
-    .context("Package not found in state")?;
+    .ok_or_else(|| miette::miette!("Package not found in state"))?;
 
     let info = versions.get_mut(&current_ver)
-    .context("Current version not found in state")?;
+    .ok_or_else(|| miette::miette!("Current version not found in state"))?;
 
     info.pinned = false;
     state.save()?;
