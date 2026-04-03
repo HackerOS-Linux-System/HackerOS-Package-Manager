@@ -1,4 +1,4 @@
-use anyhow::Result;
+use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use std::fs;
 use std::process::Command;
@@ -14,12 +14,12 @@ pub fn upgrade() -> Result<()> {
 
     let tmp_version = "/tmp/hpm-version.hacker";
     download_file(VERSION_URL, tmp_version)?;
-    let remote_raw = fs::read_to_string(tmp_version)?;
+    let remote_raw = fs::read_to_string(tmp_version).into_diagnostic()?;
     let remote_version = remote_raw.trim().to_string();
 
     let local_version = if fs::metadata(LOCAL_VERSION_FILE).is_ok() {
-        let data = fs::read_to_string(LOCAL_VERSION_FILE)?;
-        let v: serde_json::Value = serde_json::from_str(&data)?;
+        let data = fs::read_to_string(LOCAL_VERSION_FILE).into_diagnostic()?;
+        let v: serde_json::Value = serde_json::from_str(&data).into_diagnostic()?;
         v["version"].as_str().unwrap_or("0.0").to_string()
     } else {
         "0.0".to_string()
@@ -34,11 +34,11 @@ pub fn upgrade() -> Result<()> {
         download_file(&hpm_url, "/usr/bin/hpm")?;
         download_file(&backend_url, "/usr/lib/HackerOS/hpm/backend")?;
 
-        Command::new("chmod").args(&["+x", "/usr/bin/hpm"]).status()?;
-        Command::new("chmod").args(&["+x", "/usr/lib/HackerOS/hpm/backend"]).status()?;
+        Command::new("chmod").args(&["+x", "/usr/bin/hpm"]).status().into_diagnostic()?;
+        Command::new("chmod").args(&["+x", "/usr/lib/HackerOS/hpm/backend"]).status().into_diagnostic()?;
 
         let new_state = serde_json::json!({ "version": remote_version });
-        fs::write(LOCAL_VERSION_FILE, new_state.to_string())?;
+        fs::write(LOCAL_VERSION_FILE, new_state.to_string()).into_diagnostic()?;
 
         println!("{} Upgrade complete to version {}", "✔".green(), remote_version.green());
     } else {
