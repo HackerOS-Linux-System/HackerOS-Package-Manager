@@ -1,1 +1,27 @@
+[metadata]
+-> name => hello-hpm
+-> version => 1.0.0
+-> authors => HackerOS Team
+-> license => MIT
+-> bins.hello-hpm => ""
 
+[description]
+-> summary => A minimal example package for the HackerOS Package Manager
+-> long => This package demonstrates the correct layout of an hpm package repository. It includes a simple shell script binary installed to /usr/bin/hello-hpm.
+
+[sandbox]
+-> network => false
+-> gui => false
+-> dev => false
+-> full_gui => false
+-> filesystem => {}
+
+[install]
+-> commands => {}
+
+[build]
+-> commands => {}
+-> deb_deps => {}
+
+[runtime]
+-> deb_deps => {}
