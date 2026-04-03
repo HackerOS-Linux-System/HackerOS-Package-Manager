@@ -1,7 +1,8 @@
-use anyhow::{anyhow, Result};
+use miette::{Result, bail, miette};
 use colored::Colorize;
 use std::fs;
 use std::path::Path;
+use std::ffi::OsStr;
 use crate::{
     STORE_PATH,
     state::State,
@@ -17,20 +18,20 @@ pub fn run(package_spec: String, bin: String, extra_args: Vec<String>) -> Result
     let state = State::load()?;
 
     if !state.packages.contains_key(pkg_name) {
-        anyhow::bail!("Package {} not installed", pkg_name);
+        bail!("Package {} not installed", pkg_name);
     }
 
     let pkg_path = if let Some(ver) = version {
         let path = format!("{}{}/{}", STORE_PATH, pkg_name, ver);
         if !Path::new(&path).exists() {
-            anyhow::bail!("Version {} of package {} not installed", ver, pkg_name);
+            bail!("Version {} of package {} not installed", ver, pkg_name);
         }
         path
     } else {
         let current_link = format!("{}{}/current", STORE_PATH, pkg_name);
         let target = fs::read_link(&current_link)
-        .map_err(|_| anyhow!("No current version for package {}", pkg_name))?;
-        let ver = target.file_name().and_then(|n| n.to_str()).unwrap();
+        .map_err(|_| miette!("No current version for package {}", pkg_name))?;
+        let ver = target.file_name().and_then(OsStr::to_str).unwrap();
         format!("{}{}/{}", STORE_PATH, pkg_name, ver)
     };
 
