@@ -16,8 +16,10 @@ pub mod unpin;
 pub mod outdated;
 pub mod verify;
 pub mod deps;
+pub mod refresh;
 
 pub use install::install;
+pub use install::install_single;
 pub use remove::remove;
 pub use update::update;
 pub use switch::switch_version;
@@ -33,3 +35,4 @@ pub use unpin::unpin;
 pub use outdated::outdated;
 pub use verify::verify;
 pub use deps::deps;
+pub use refresh::refresh;
