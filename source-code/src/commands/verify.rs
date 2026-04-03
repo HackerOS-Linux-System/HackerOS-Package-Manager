@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use miette::{Result, bail, miette};
 use colored::Colorize;
 use std::path::Path;
 use crate::{
@@ -11,12 +11,12 @@ pub fn verify(package: String) -> Result<()> {
     let state = State::load()?;
 
     let current_ver = state.get_current_version(&package)
-    .with_context(|| format!("Package {} not installed", package))?;
+    .ok_or_else(|| miette!("Package {} not installed", package))?;
 
     let expected_checksum = state.packages.get(&package)
     .and_then(|vers| vers.get(&current_ver))
     .map(|info| info.checksum.clone())
-    .context("No checksum in state")?;
+    .ok_or_else(|| miette!("No checksum in state"))?;
 
     let pkg_path = Path::new(STORE_PATH).join(&package).join(&current_ver);
     let computed = compute_dir_hash(&pkg_path)?;
@@ -28,6 +28,6 @@ pub fn verify(package: String) -> Result<()> {
         eprintln!("{} Checksum mismatch for {}@{}", "✗".red(), package.cyan(), current_ver.cyan());
         eprintln!("  Expected: {}", expected_checksum);
         eprintln!("  Computed: {}", computed);
-        anyhow::bail!("Verification failed");
+        bail!("Verification failed");
     }
 }
