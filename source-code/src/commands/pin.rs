@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use crate::state::State;
 
@@ -9,10 +9,10 @@ pub fn pin(package: String, version: String) -> Result<()> {
     let mut state = State::load()?;
 
     let versions = state.packages.get_mut(&package)
-    .with_context(|| format!("Package '{}' not installed", package))?;
+    .ok_or_else(|| miette::miette!("Package '{}' not installed", package))?;
 
     let info = versions.get_mut(&version)
-    .with_context(|| format!("Version '{}' of package '{}' not installed", version, package))?;
+    .ok_or_else(|| miette::miette!("Version '{}' of package '{}' not installed", version, package))?;
 
     info.pinned = true;
     state.save()?;
