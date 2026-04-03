@@ -2,9 +2,9 @@
 name = "hpm"
 version = "0.7.0"
 edition = "2021"
-authors = ["HackerOS Team"]
-description = "Hacker Package Manager – nowoczesny menedżer pakietów oparty na repozytoriach git"
-license = "MIT"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+description = "Hacker Package Manager – HackerOS community repo package manager"
+license = "GPL-3.0"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
