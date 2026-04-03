@@ -1,6 +1,5 @@
-use anyhow::Result;
+use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
-use tokio::runtime::Runtime;
 use crate::{
     repo::RepoManager,
     state::State,
@@ -8,7 +7,10 @@ use crate::{
 };
 
 pub fn outdated() -> Result<()> {
-    let rt = Runtime::new()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .build()
+    .into_diagnostic()?;
     let repo_mgr = rt.block_on(RepoManager::load())?;
     let index = repo_mgr.build_index()?;
     let state = State::load()?;
@@ -42,7 +44,7 @@ pub fn outdated() -> Result<()> {
         println!("{} Outdated packages:", "→".yellow());
         println!("{:<20} {:<15} {}", "Package".cyan(), "Current".cyan(), "Latest".cyan());
         for (pkg, cur, lat) in outdated {
-            println!("{:<20} {:<15} {}", pkg.magenta(), cur.red(), lat.green());
+            println!("{:<20} {:<15} {}", pkg.as_str().magenta(), cur.as_str().red(), lat.as_str().green());
         }
     }
 
