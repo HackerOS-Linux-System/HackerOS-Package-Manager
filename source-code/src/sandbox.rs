@@ -1,5 +1,5 @@
 use crate::manifest::{Manifest, Sandbox};
-use anyhow::{anyhow, Context as _, Result};
+use miette::{Result, bail, miette, IntoDiagnostic};
 use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
 };
@@ -26,20 +26,20 @@ pub fn setup_sandbox(
     extra_args: Vec<String>,
     test: bool,
 ) -> Result<()> {
-    let (read_fd, write_fd) = pipe().context("Pipe creation failed")?;
+    let (read_fd, write_fd) = pipe().into_diagnostic()?;
 
-    match unsafe { fork() }? {
+    match unsafe { fork() }.into_diagnostic()? {
         ForkResult::Parent { child, .. } => {
-            let status = nix::sys::wait::waitpid(child, None)?;
+            let status = nix::sys::wait::waitpid(child, None).into_diagnostic()?;
             let code = match status {
                 nix::sys::wait::WaitStatus::Exited(_, c) => c,
                 _ => 1,
             };
             if code != 0 {
                 let mut buf = vec![0u8; 4096];
-                let n = read(read_fd.as_raw_fd(), &mut buf)?;
+                let n = read(read_fd.as_raw_fd(), &mut buf).into_diagnostic()?;
                 let msg = String::from_utf8_lossy(&buf[0..n]);
-                return Err(anyhow!("Sandbox child failed: {}", msg));
+                bail!("Sandbox child failed: {}", msg);
             }
             Ok(())
         }
@@ -62,7 +62,7 @@ pub fn run_commands(
 ) -> Result<()> {
     let script_path = format!("{}/run_commands.sh", path);
     let script_content = commands.join("\n");
-    std::fs::write(&script_path, script_content)?;
+    std::fs::write(&script_path, script_content).into_diagnostic()?;
     crate::utils::make_executable(Path::new(&script_path))?;
     let result = setup_sandbox(path, manifest, false, Some("run_commands.sh"), vec![], false);
     let _ = std::fs::remove_file(&script_path);
@@ -90,9 +90,9 @@ fn child_setup(
     if !manifest.sandbox.gui {
         flags |= CloneFlags::CLONE_NEWIPC;
     }
-    unshare(flags).context("Unshare failed")?;
+    unshare(flags).into_diagnostic()?;
 
-    sethostname(&manifest.name)?;
+    sethostname(&manifest.name).into_diagnostic()?;
 
     mount(
         None::<&str>,
@@ -100,20 +100,20 @@ fn child_setup(
         None::<&str>,
         MsFlags::MS_PRIVATE | MsFlags::MS_REC,
         None::<&str>,
-    )?;
+    ).into_diagnostic()?;
 
     setup_user_mapping()?;
 
     let new_root_str = format!("/tmp/hpm_newroot_{}", getpid());
     let new_root = PathBuf::from(&new_root_str);
-    create_dir_all(&new_root)?;
+    create_dir_all(&new_root).into_diagnostic()?;
     mount(
         Some("tmpfs"),
           new_root_str.as_str(),
           Some("tmpfs"),
           MsFlags::empty(),
           None::<&str>,
-    )?;
+    ).into_diagnostic()?;
 
     let display = env::var("DISPLAY").ok();
     setup_mounts(&new_root, path, &manifest.sandbox, display.as_ref())?;
@@ -127,7 +127,7 @@ fn child_setup(
     // Uproszczony seccomp – zezwalamy na wszystkie syscalle
     // setup_seccomp()?;
 
-    chdir("/app")?;
+    chdir("/app").into_diagnostic()?;
 
     if test {
         return Ok(());
@@ -140,14 +140,14 @@ fn setup_user_mapping() -> Result<()> {
     let uid = Uid::current();
     let gid = Gid::current();
 
-    let mut uid_map = File::create("/proc/self/uid_map")?;
-    writeln!(uid_map, "0 {} 1", uid)?;
+    let mut uid_map = File::create("/proc/self/uid_map").into_diagnostic()?;
+    writeln!(uid_map, "0 {} 1", uid).into_diagnostic()?;
 
-    let mut setgroups = File::create("/proc/self/setgroups")?;
-    writeln!(setgroups, "deny")?;
+    let mut setgroups = File::create("/proc/self/setgroups").into_diagnostic()?;
+    writeln!(setgroups, "deny").into_diagnostic()?;
 
-    let mut gid_map = File::create("/proc/self/gid_map")?;
-    writeln!(gid_map, "0 {} 1", gid)?;
+    let mut gid_map = File::create("/proc/self/gid_map").into_diagnostic()?;
+    writeln!(gid_map, "0 {} 1", gid).into_diagnostic()?;
 
     Ok(())
 }
@@ -162,49 +162,49 @@ fn setup_mounts(
     for p in ro_paths {
         let target = new_root.join(p.trim_start_matches('/'));
         if Path::new(p).exists() {
-            create_dir_all(&target)?;
+            create_dir_all(&target).into_diagnostic()?;
             mount(
                 Some(p),
                   target.to_str().unwrap(),
                   None::<&str>,
                   MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY,
                   None::<&str>,
-            )?;
+            ).into_diagnostic()?;
         }
     }
 
     let app_path = new_root.join("app");
-    create_dir_all(&app_path)?;
+    create_dir_all(&app_path).into_diagnostic()?;
     mount(
         Some(path),
           app_path.to_str().unwrap(),
           None::<&str>,
           MsFlags::MS_BIND | MsFlags::MS_REC,
           None::<&str>,
-    )?;
+    ).into_diagnostic()?;
 
     let tmp_path = new_root.join("tmp");
-    create_dir_all(&tmp_path)?;
+    create_dir_all(&tmp_path).into_diagnostic()?;
     mount(
         Some("tmpfs"),
           tmp_path.to_str().unwrap(),
           Some("tmpfs"),
           MsFlags::empty(),
           None::<&str>,
-    )?;
+    ).into_diagnostic()?;
 
     if sandbox.gui || sandbox.full_gui {
         // X11
         if Path::new("/tmp/.X11-unix").exists() {
             let x11_path = new_root.join("tmp/.X11-unix");
-            create_dir_all(&x11_path)?;
+            create_dir_all(&x11_path).into_diagnostic()?;
             mount(
                 Some("/tmp/.X11-unix"),
                   x11_path.to_str().unwrap(),
                   None::<&str>,
                   MsFlags::MS_BIND | MsFlags::MS_REC,
                   None::<&str>,
-            )?;
+            ).into_diagnostic()?;
         }
 
         // Wayland
@@ -212,14 +212,14 @@ fn setup_mounts(
             let wayland_socket = format!("{}/wayland-0", runtime_dir);
             if Path::new(&wayland_socket).exists() {
                 let target = new_root.join(runtime_dir.trim_start_matches('/')).join("wayland-0");
-                create_dir_all(target.parent().unwrap())?;
+                create_dir_all(target.parent().unwrap()).into_diagnostic()?;
                 mount(
                     Some(wayland_socket.as_str()),
                       target.to_str().unwrap(),
                       None::<&str>,
                       MsFlags::MS_BIND | MsFlags::MS_REC,
                       None::<&str>,
-                )?;
+                ).into_diagnostic()?;
             }
         }
 
@@ -228,14 +228,14 @@ fn setup_mounts(
             let bus_socket = format!("{}/bus", runtime_dir);
             if Path::new(&bus_socket).exists() {
                 let target = new_root.join(runtime_dir.trim_start_matches('/')).join("bus");
-                create_dir_all(target.parent().unwrap())?;
+                create_dir_all(target.parent().unwrap()).into_diagnostic()?;
                 mount(
                     Some(bus_socket.as_str()),
                       target.to_str().unwrap(),
                       None::<&str>,
                       MsFlags::MS_BIND | MsFlags::MS_REC,
                       None::<&str>,
-                )?;
+                ).into_diagnostic()?;
             }
         }
 
@@ -244,41 +244,41 @@ fn setup_mounts(
             let pulse_dir = format!("{}/pulse", runtime_dir);
             if Path::new(&pulse_dir).exists() {
                 let target = new_root.join(runtime_dir.trim_start_matches('/')).join("pulse");
-                create_dir_all(target.parent().unwrap())?;
+                create_dir_all(target.parent().unwrap()).into_diagnostic()?;
                 mount(
                     Some(pulse_dir.as_str()),
                       target.to_str().unwrap(),
                       None::<&str>,
                       MsFlags::MS_BIND | MsFlags::MS_REC,
                       None::<&str>,
-                )?;
+                ).into_diagnostic()?;
             }
         }
 
         // /dev/dri
         if Path::new("/dev/dri").exists() {
             let target = new_root.join("dev/dri");
-            create_dir_all(&target)?;
+            create_dir_all(&target).into_diagnostic()?;
             mount(
                 Some("/dev/dri"),
                   target.to_str().unwrap(),
                   None::<&str>,
                   MsFlags::MS_BIND | MsFlags::MS_REC,
                   None::<&str>,
-            )?;
+            ).into_diagnostic()?;
         }
     }
 
     if sandbox.dev {
         let dev_path = new_root.join("dev");
-        create_dir_all(&dev_path)?;
+        create_dir_all(&dev_path).into_diagnostic()?;
         mount(
             Some("tmpfs"),
               dev_path.to_str().unwrap(),
               Some("tmpfs"),
               MsFlags::empty(),
               None::<&str>,
-        )?;
+        ).into_diagnostic()?;
 
         let devices = vec![
             ("null", 1, 3),
@@ -296,7 +296,7 @@ fn setup_mounts(
     for fs_p in &sandbox.filesystem {
         let target = new_root.join(fs_p.trim_start_matches('/'));
         if let Some(parent) = target.parent() {
-            create_dir_all(parent)?;
+            create_dir_all(parent).into_diagnostic()?;
         }
         if Path::new(fs_p).exists() {
             mount(
@@ -305,17 +305,17 @@ fn setup_mounts(
                   None::<&str>,
                   MsFlags::MS_BIND | MsFlags::MS_REC,
                   None::<&str>,
-            )?;
+            ).into_diagnostic()?;
         }
     }
 
     let proc_path = new_root.join("proc");
-    create_dir_all(&proc_path)?;
-    mount(Some("proc"), proc_path.to_str().unwrap(), Some("proc"), MsFlags::empty(), None::<&str>)?;
+    create_dir_all(&proc_path).into_diagnostic()?;
+    mount(Some("proc"), proc_path.to_str().unwrap(), Some("proc"), MsFlags::empty(), None::<&str>).into_diagnostic()?;
 
     let sys_path = new_root.join("sys");
-    create_dir_all(&sys_path)?;
-    mount(Some("sysfs"), sys_path.to_str().unwrap(), Some("sysfs"), MsFlags::empty(), None::<&str>)?;
+    create_dir_all(&sys_path).into_diagnostic()?;
+    mount(Some("sysfs"), sys_path.to_str().unwrap(), Some("sysfs"), MsFlags::empty(), None::<&str>).into_diagnostic()?;
 
     if let Some(d) = display {
         env::set_var("DISPLAY", d);
@@ -325,62 +325,70 @@ fn setup_mounts(
 }
 
 fn pivot_and_chdir(new_root: &Path) -> Result<()> {
-    chdir(new_root)?;
-    create_dir_all("old_root")?;
-    pivot_root(".", "old_root")?;
-    chdir("/")?;
-    umount2("/old_root", MntFlags::MNT_DETACH)?;
+    chdir(new_root).into_diagnostic()?;
+    create_dir_all("old_root").into_diagnostic()?;
+    pivot_root(".", "old_root").into_diagnostic()?;
+    chdir("/").into_diagnostic()?;
+    umount2("/old_root", MntFlags::MNT_DETACH).into_diagnostic()?;
     Ok(())
 }
 
 fn set_resource_limits() -> Result<()> {
-    setrlimit(Resource::RLIMIT_CPU, 60, 60)?;
+    setrlimit(Resource::RLIMIT_CPU, 60, 60).into_diagnostic()?;
     let mem_limit = 512 * 1024 * 1024;
-    setrlimit(Resource::RLIMIT_AS, mem_limit, mem_limit)?;
-    setrlimit(Resource::RLIMIT_NPROC, 1024, 1024)?;
+    setrlimit(Resource::RLIMIT_AS, mem_limit, mem_limit).into_diagnostic()?;
+    setrlimit(Resource::RLIMIT_NPROC, 1024, 1024).into_diagnostic()?;
     Ok(())
 }
 
 fn setup_landlock(manifest: &Manifest) -> Result<()> {
     let abi = ABI::V1;
     let mut ruleset = Ruleset::default()
-    .handle_access(AccessFs::from_all(abi))?
-    .create()?;
+    .handle_access(AccessFs::from_all(abi))
+    .map_err(|e| miette!("Landlock error: {}", e))?
+    .create()
+    .map_err(|e| miette!("Landlock error: {}", e))?;
 
     let ro_access = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
 
     for path in &["/usr", "/lib", "/lib64", "/bin", "/etc"] {
         if Path::new(path).exists() {
-            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path)?, ro_access))?;
+            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path).map_err(|e| miette!("Landlock error: {}", e))?, ro_access))
+            .map_err(|e| miette!("Landlock error: {}", e))?;
         }
     }
 
     for path in &["/proc", "/sys"] {
         if Path::new(path).exists() {
-            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path)?, AccessFs::ReadFile | AccessFs::ReadDir))?;
+            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path).map_err(|e| miette!("Landlock error: {}", e))?, AccessFs::ReadFile | AccessFs::ReadDir))
+            .map_err(|e| miette!("Landlock error: {}", e))?;
         }
     }
 
-    ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/app")?, AccessFs::from_all(abi)))?;
-    ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/tmp")?, AccessFs::from_all(abi)))?;
+    ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/app").map_err(|e| miette!("Landlock error: {}", e))?, AccessFs::from_all(abi)))
+    .map_err(|e| miette!("Landlock error: {}", e))?;
+    ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/tmp").map_err(|e| miette!("Landlock error: {}", e))?, AccessFs::from_all(abi)))
+    .map_err(|e| miette!("Landlock error: {}", e))?;
 
     if manifest.sandbox.dev && Path::new("/dev").exists() {
-        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/dev")?, AccessFs::from_all(abi)))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/dev").map_err(|e| miette!("Landlock error: {}", e))?, AccessFs::from_all(abi)))
+        .map_err(|e| miette!("Landlock error: {}", e))?;
     }
 
     for fs_p in &manifest.sandbox.filesystem {
         if Path::new(fs_p).exists() {
-            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(fs_p)?, AccessFs::from_all(abi)))?;
+            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(fs_p).map_err(|e| miette!("Landlock error: {}", e))?, AccessFs::from_all(abi)))
+            .map_err(|e| miette!("Landlock error: {}", e))?;
         }
     }
 
-    ruleset.restrict_self()?;
+    ruleset.restrict_self().map_err(|e| miette!("Landlock error: {}", e))?;
     Ok(())
 }
 
 fn setup_seccomp() -> Result<()> {
-    let ctx = SeccompContext::default(Action::Allow)?;
-    ctx.load()?;
+    let ctx = SeccompContext::default(Action::Allow).map_err(|e| miette!("Seccomp error: {}", e))?;
+    ctx.load().map_err(|e| miette!("Seccomp error: {}", e))?;
     Ok(())
 }
 
@@ -397,19 +405,19 @@ fn exec_in_sandbox(
             install_commands.join(" && ")
         };
         (
-            CString::new("/bin/sh")?,
-         vec![CString::new("-c")?, CString::new(install_cmd)?],
+            CString::new("/bin/sh").map_err(|e| miette!("CString error: {}", e))?,
+         vec![CString::new("-c").map_err(|e| miette!("CString error: {}", e))?, CString::new(install_cmd).map_err(|e| miette!("CString error: {}", e))?],
         )
     } else {
         let bin_path = format!("/app/{}", bin.expect("Bin required"));
-        let mut a = vec![CString::new(bin_path.as_str())?];
+        let mut a = vec![CString::new(bin_path.as_str()).map_err(|e| miette!("CString error: {}", e))?];
         for arg in extra_args {
-            a.push(CString::new(arg)?);
+            a.push(CString::new(arg).map_err(|e| miette!("CString error: {}", e))?);
         }
-        (CString::new(bin_path)?, a)
+        (CString::new(bin_path).map_err(|e| miette!("CString error: {}", e))?, a)
     };
 
     let args_ptr: Vec<&CStr> = args_c.iter().map(|c| c.as_c_str()).collect();
-    execve(&cmd, &args_ptr, &[] as &[&CStr])?;
+    execve(&cmd, &args_ptr, &[] as &[&CStr]).map_err(|e| miette!("execve error: {}", e))?;
     unreachable!()
 }
