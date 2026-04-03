@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use miette::{Result, bail, IntoDiagnostic};
 use colored::Colorize;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -7,12 +7,12 @@ use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
 
-pub const LOCK_PATH: &str = "/var/lib/hpm/lock";
+pub const LOCK_PATH: &str = "/tmp/hpm.lock";
 
 pub fn acquire_lock() -> Result<fs::File> {
     use fs2::FileExt;
-    let file = fs::File::create(LOCK_PATH)?;
-    file.try_lock_exclusive()?;
+    let file = fs::File::create(LOCK_PATH).into_diagnostic()?;
+    file.try_lock_exclusive().into_diagnostic()?;
     Ok(file)
 }
 
@@ -30,7 +30,7 @@ pub fn compute_dir_hash(dir: &Path) -> Result<String> {
     .collect();
     let mut hasher = Sha256::new();
     for file_path in entries {
-        let data = fs::read(&file_path)?;
+        let data = fs::read(&file_path).into_diagnostic()?;
         hasher.update(&data);
     }
     let hash = hasher.finalize();
@@ -38,16 +38,16 @@ pub fn compute_dir_hash(dir: &Path) -> Result<String> {
 }
 
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
+    fs::create_dir_all(dst).into_diagnostic()?;
+    for entry in fs::read_dir(src).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let ty = entry.file_type().into_diagnostic()?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         if ty.is_dir() {
             copy_dir_all(&src_path, &dst_path)?;
         } else {
-            fs::copy(&src_path, &dst_path)?;
+            fs::copy(&src_path, &dst_path).into_diagnostic()?;
         }
     }
     Ok(())
@@ -55,14 +55,14 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 
 pub fn make_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
+    let mut perms = fs::metadata(path).into_diagnostic()?.permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(path, perms)?;
+    fs::set_permissions(path, perms).into_diagnostic()?;
     Ok(())
 }
 
 pub fn run_command(args: &[String]) -> Result<i32> {
-    let status = Command::new(&args[0]).args(&args[1..]).status()?;
+    let status = Command::new(&args[0]).args(&args[1..]).status().into_diagnostic()?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -127,8 +127,9 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
     }
     let output = Command::new("dpkg-query")
     .args(&["-W", "-f=${Package}\\n"])
-    .output()?;
-    let installed = String::from_utf8(output.stdout)?;
+    .output()
+    .into_diagnostic()?;
+    let installed = String::from_utf8(output.stdout).into_diagnostic()?;
     let installed_lines: Vec<&str> = installed.lines().collect();
     let missing: Vec<_> = packages.iter()
     .filter(|p| !installed_lines.contains(&p.as_str()))
@@ -141,16 +142,17 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
         println!("  - {}", p);
     }
     print!("Install them now? [y/N] ");
-    std::io::stdout().flush()?;
+    std::io::stdout().flush().into_diagnostic()?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    std::io::stdin().read_line(&mut input).into_diagnostic()?;
     if input.trim().eq_ignore_ascii_case("y") {
         let status = Command::new("sudo")
         .arg("apt")
         .arg("install")
         .arg("-y")
         .args(&missing)
-        .status()?;
+        .status()
+        .into_diagnostic()?;
         if !status.success() {
             bail!("Failed to install system packages");
         }
