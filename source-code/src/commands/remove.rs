@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use miette::{Result, IntoDiagnostic, bail};
 use colored::Colorize;
 use std::fs;
 use std::path::Path;
@@ -22,7 +22,7 @@ pub fn remove(spec: String) -> Result<()> {
     };
 
     if !state.packages.contains_key(&pkg_name) {
-        anyhow::bail!("Package {} not installed", pkg_name);
+        bail!("Package {} not installed", pkg_name);
     }
 
     if let Some(ver) = version {
@@ -43,24 +43,24 @@ pub fn remove(spec: String) -> Result<()> {
 pub fn remove_version(pkg_name: &str, version: &str, state: &mut State) -> Result<()> {
     let pkg_path = Path::new(STORE_PATH).join(pkg_name).join(version);
     if !pkg_path.exists() {
-        anyhow::bail!("Path {} does not exist", pkg_path.display());
+        bail!("Path {} does not exist", pkg_path.display());
     }
 
     let manifest = crate::manifest::Manifest::load_from_path(pkg_path.to_str().unwrap())?;
     for bin in &manifest.bins {
         let wrapper_path = Path::new("/usr/bin").join(bin);
         if wrapper_path.exists() {
-            fs::remove_file(wrapper_path)?;
+            fs::remove_file(wrapper_path).into_diagnostic()?;
         }
     }
 
-    fs::remove_dir_all(&pkg_path)?;
+    fs::remove_dir_all(&pkg_path).into_diagnostic()?;
     state.remove_package_version(pkg_name, version);
 
     let current_link = Path::new(STORE_PATH).join(pkg_name).join("current");
     if let Ok(target) = fs::read_link(&current_link) {
         if target == Path::new(version) {
-            fs::remove_file(current_link)?;
+            fs::remove_file(current_link).into_diagnostic()?;
         }
     }
 
