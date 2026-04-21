@@ -1,4 +1,4 @@
-# hpm-example-repo
+# hello hpm
 
 Minimal example package for the [HackerOS Package Manager (hpm)](https://github.com/HackerOS-Linux-System/HackerOS-Package-Manager).
 
