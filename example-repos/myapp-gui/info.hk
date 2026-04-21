@@ -1,0 +1,36 @@
+! Example HPM package manifest — myapp-gui
+! GUI application example
+
+[metadata]
+-> name    => myapp-gui
+-> version => 1.0.0
+-> authors => HackerOS Team
+-> license => MIT
+-> gui     => true
+-> bins.myapp-gui => ""
+
+[description]
+-> summary => Example GUI application packaged for HPM
+-> long    => Shows how to package a GTK/Qt application with icon and .desktop file.
+
+[sandbox]
+-> network  => false
+-> gui      => true
+-> dev      => false
+-> full_gui => false
+-> filesystem => {}
+
+[build]
+-> commands => {}
+-> deb_deps => {}
+
+[runtime]
+-> deb_deps => {}
+
+[desktop]
+-> display_name => My App
+-> icon         => icons/myapp-gui.png
+-> categories   => Utility;GTK;
+-> comment      => An example GUI application
+-> mime_types   => text/plain;
+-> keywords     => example;demo;hpm;
