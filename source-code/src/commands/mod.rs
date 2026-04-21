@@ -17,6 +17,10 @@ pub mod outdated;
 pub mod verify;
 pub mod deps;
 pub mod refresh;
+pub mod autoremove;
+pub mod doctor;
+pub mod rollback;
+pub mod create;
 
 pub use install::install;
 pub use install::install_single;
@@ -36,3 +40,7 @@ pub use outdated::outdated;
 pub use verify::verify;
 pub use deps::deps;
 pub use refresh::refresh;
+pub use autoremove::autoremove;
+pub use doctor::doctor;
+pub use rollback::rollback;
+pub use create::create;
