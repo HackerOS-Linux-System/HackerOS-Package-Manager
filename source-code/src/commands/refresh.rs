@@ -20,9 +20,9 @@ pub fn refresh() -> Result<()> {
     let repo_mgr = rt.block_on(RepoManager::load())?;
     let total = repo_mgr.index.packages.len();
 
-    pb.set_message(format!("Pre-fetching metadata for {} packages...", total));
+    pb.set_message(format!("Fetching metadata for {} packages...", total));
 
-    // Fetch all info.hk files concurrently (empty query = all packages)
+    // Pre-fetch all info.hk concurrently so search/info are fast afterwards
     let results = rt.block_on(repo_mgr.search_lightweight(""))?;
 
     pb.finish_and_clear();
@@ -30,41 +30,36 @@ pub fn refresh() -> Result<()> {
     let ok = results.len();
     let failed = total.saturating_sub(ok);
 
+    // ── apt-like output ──────────────────────────────────────────────────────
+    println!("{} Get package index from HackerOS Package Repository", "→".blue());
     println!(
-        "{} Package index refreshed — {} packages{}",
-        "✔".green(),
-             total.to_string().cyan(),
-             if failed > 0 {
-                 format!(", {} unreachable", failed).yellow().to_string()
-             } else {
-                 String::new()
-             }
+        "{} Reading package lists... {}",
+        "→".blue(),
+             "Done".green()
+    );
+    println!(
+        "{} Building dependency tree... {}",
+        "→".blue(),
+             "Done".green()
+    );
+    println!(
+        "{} Reading state information... {}",
+        "→".blue(),
+             "Done".green()
     );
 
-    if !results.is_empty() {
-        println!();
+    if failed > 0 {
         println!(
-            "  {:<22} {:<12} {}",
-            "Package".bold().cyan(),
-                 "Version".bold().cyan(),
-                 "Description".bold().cyan()
+            "{} {} package(s) could not be reached.",
+                 "⚠".yellow(), failed
         );
-        println!("  {}", "─".repeat(72).dimmed());
-        for meta in &results {
-            let desc = if meta.summary.len() > 50 {
-                format!("{}…", &meta.summary[..49])
-            } else {
-                meta.summary.clone()
-            };
-            println!(
-                "  {:<22} {:<12} {}",
-                meta.name.magenta(),
-                     meta.version.green(),
-                     desc
-            );
-        }
-        println!();
     }
+
+    println!(
+        "\n{} packages available ({} newly fetched).",
+             total.to_string().cyan(),
+             ok.to_string().green()
+    );
 
     Ok(())
 }
