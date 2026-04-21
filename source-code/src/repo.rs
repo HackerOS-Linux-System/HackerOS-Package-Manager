@@ -10,6 +10,14 @@ use dirs;
 
 const REPO_JSON_URL: &str = "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Package-Manager/main/repo/repo.json";
 
+/// Metadata cache TTL in seconds (1 hour).
+const CACHE_TTL_SECS: u64 = 3600;
+
+/// Directory for cached package metadata.
+fn meta_cache_dir() -> PathBuf {
+    PathBuf::from("/var/cache/hpm/meta")
+}
+
 fn repos_dir() -> PathBuf {
     dirs::cache_dir()
     .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -17,7 +25,7 @@ fn repos_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// repo.json structures
+// repo.json
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,30 +33,12 @@ pub struct RepoIndex {
     pub packages: HashMap<String, PackageEntry>,
 }
 
-/// A package entry in repo.json.
-/// Only `repo` is required; `versions` is optional — when absent hpm reads
-/// versions from git tags at install/update time.
-///
-/// Minimal repo.json example:
-/// ```json
-/// {
-///   "packages": {
-///     "mypkg": { "repo": "https://github.com/user/mypkg" }
-///   }
-/// }
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageEntry {
-    /// Git repository URL (GitHub HTTPS recommended).
     pub repo: String,
-    /// Optional explicit version hints. When empty, versions come from git tags.
     #[serde(default)]
     pub versions: Vec<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Structures returned to callers
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct RepoPackage {
@@ -64,116 +54,119 @@ pub struct PackageVersion {
     pub deps: HashMap<String, String>,
 }
 
-/// Lightweight metadata fetched without cloning, used for search/info previews.
-#[derive(Debug, Clone)]
+/// Lightweight metadata (used for search and info preview).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageMeta {
     pub name: String,
     pub version: String,
     pub summary: String,
     pub authors: String,
     pub license: String,
+    /// Unix timestamp when this was fetched.
+    #[serde(default)]
+    pub fetched_at: u64,
+}
+
+impl PackageMeta {
+    fn is_stale(&self) -> bool {
+        let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+        now.saturating_sub(self.fetched_at) > CACHE_TTL_SECS
+    }
 }
 
 // ---------------------------------------------------------------------------
-// build.toml — describes how to obtain / build the package binary
+// build.toml
 // ---------------------------------------------------------------------------
 
-/// How the package binary is obtained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BuildSource {
-    /// Download a pre-built binary or archive from a URL.
-    /// Use {version} placeholder for the tag version.
-    ///
-    /// Example build.toml:
-    /// ```toml
-    /// type = "download"
-    /// url = "https://github.com/user/repo/releases/download/v{version}/mybinary-linux-x86_64"
-    /// install_path = "bin/mybinary"
-    /// ```
     Download {
         url: String,
-        /// Path inside the downloaded archive that becomes the binary.
-        /// If empty, the downloaded file itself is used.
-        #[serde(default)]
-        binary_path: String,
-        /// Strip N leading path components from a tar archive.
-        #[serde(default)]
-        strip_components: u32,
+        #[serde(default)] binary_path: String,
+        #[serde(default)] strip_components: u32,
     },
-    /// Build from source. hpm runs `commands` inside a sandbox and expects
-    /// the final artefact at `output` (relative to repo root).
-    ///
-    /// Example build.toml:
-    /// ```toml
-    /// type = "build"
-    /// commands = ["cargo build --release"]
-    /// output = "target/release/mybinary"
-    /// install_path = "bin/mybinary"
-    ///
-    /// [build_deps]   # Debian packages needed only during build
-    /// build-essential = ""
-    /// rustup = ""
-    /// ```
     Build {
         commands: Vec<String>,
-        /// Relative path where the final binary/directory appears after build.
         output: String,
     },
-    /// The binary is already present in contents/ (classic layout).
-    /// This is the default when build.toml is absent.
     Prebuilt,
 }
 
 impl Default for BuildSource {
-    fn default() -> Self {
-        BuildSource::Prebuilt
-    }
+    fn default() -> Self { BuildSource::Prebuilt }
 }
 
-/// Parsed build.toml from a package repository.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BuildConfig {
-    /// Optional name override (defaults to info.hk name).
-    #[serde(default)]
-    pub name: String,
-
-    #[serde(flatten)]
-    pub source: BuildSource,
-
-    /// Debian packages required during the build step.
-    #[serde(default)]
-    pub build_deps: Vec<String>,
-
-    /// Debian packages required at runtime.
-    #[serde(default)]
-    pub runtime_deps: Vec<String>,
-
-    /// Extra environment variables passed to build commands.
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-
-    /// Destination path inside contents/ for the produced binary.
-    /// Example: "bin/mybinary"  →  stored at contents/bin/mybinary
-    /// Defaults to "bin/<package-name>".
-    #[serde(default)]
-    pub install_path: String,
+    #[serde(default)] pub name: String,
+    #[serde(flatten)] pub source: BuildSource,
+    #[serde(default)] pub build_deps: Vec<String>,
+    #[serde(default)] pub runtime_deps: Vec<String>,
+    #[serde(default)] pub env: HashMap<String, String>,
+    #[serde(default)] pub install_path: String,
 }
 
 impl BuildConfig {
-    /// Try to load build.toml from a checked-out directory. Returns None if absent.
     pub fn load_from_dir(dir: &Path) -> Option<Self> {
         let path = dir.join("build.toml");
-        if !path.exists() {
-            return None;
-        }
+        if !path.exists() { return None; }
         let content = fs::read_to_string(&path).ok()?;
         match toml::from_str::<BuildConfig>(&content) {
             Ok(cfg) => Some(cfg),
-            Err(e) => {
-                eprintln!("Warning: failed to parse build.toml: {}", e);
-                None
-            }
+            Err(e) => { eprintln!("Warning: failed to parse build.toml: {}", e); None }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP client
+// ---------------------------------------------------------------------------
+
+fn make_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+    .timeout(std::time::Duration::from_secs(30))
+    .build()
+    .map_err(|e| miette!(
+        "Failed to build HTTP client: {}\n\
+SSL hint: sudo apt install ca-certificates && sudo update-ca-certificates", e
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Metadata cache helpers
+// ---------------------------------------------------------------------------
+
+fn cache_path_for(pkg_name: &str) -> PathBuf {
+    meta_cache_dir().join(format!("{}.json", pkg_name))
+}
+
+fn load_cached_meta(pkg_name: &str) -> Option<PackageMeta> {
+    let path = cache_path_for(pkg_name);
+    if !path.exists() { return None; }
+    let data = fs::read(&path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn save_cached_meta(meta: &PackageMeta) {
+    let dir = meta_cache_dir();
+    if fs::create_dir_all(&dir).is_err() { return; }
+    let path = dir.join(format!("{}.json", meta.name));
+    if let Ok(data) = serde_json::to_vec(meta) {
+        let _ = fs::write(path, data);
+    }
+}
+
+/// Invalidate all metadata cache entries (called by `hpm refresh`).
+pub fn invalidate_meta_cache() {
+    let dir = meta_cache_dir();
+    if !dir.exists() { return; }
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }
@@ -189,16 +182,27 @@ pub struct RepoManager {
 
 impl RepoManager {
     pub async fn load() -> Result<Self> {
-        let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .into_diagnostic()?;
-
+        let client = make_client()?;
         let pb = ProgressBar::new_spinner();
         pb.set_message("Downloading package index...");
-        let response = client.get(REPO_JSON_URL).send().await.into_diagnostic()?;
+
+        let response = client.get(REPO_JSON_URL).send().await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("certificate") || msg.contains("SSL") || msg.contains("tls") {
+                miette!(
+                    "TLS error: {}\nFix: sudo apt install ca-certificates && sudo update-ca-certificates",
+                    e
+                )
+            } else if e.is_timeout() {
+                miette!("Connection timed out. Check your internet connection.")
+            } else {
+                miette!("Network error: {}", e)
+            }
+        })?;
+
         if !response.status().is_success() {
-            bail!("Failed to download repo.json: HTTP {}", response.status());
+            bail!("Failed to download package index: HTTP {}", response.status());
         }
         let index: RepoIndex = response.json().await.into_diagnostic()?;
         pb.finish_with_message(format!("Index loaded ({} packages)", index.packages.len()));
@@ -207,9 +211,7 @@ impl RepoManager {
 
     pub fn load_sync() -> Result<Self> {
         tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+        .enable_all().build().unwrap()
         .block_on(Self::load())
     }
 
@@ -227,16 +229,12 @@ impl RepoManager {
         let url = repo_url.trim_end_matches('/').trim_end_matches(".git");
         if url.contains("github.com") {
             Some(url.replace("https://github.com/", "https://raw.githubusercontent.com/"))
-        } else {
-            None
-        }
+        } else { None }
     }
 
-    /// Fetch a single file from a repo via raw HTTP.
-    /// Tries branches: main → master → HEAD.
     async fn fetch_raw_file(client: &reqwest::Client, repo_url: &str, filename: &str) -> Result<String> {
         let base = Self::raw_base_url(repo_url)
-        .ok_or_else(|| miette!("Only GitHub repositories are supported for fast metadata fetch"))?;
+        .ok_or_else(|| miette!("Only GitHub repos supported for fast fetch"))?;
         for branch in &["main", "master", "HEAD"] {
             let url = format!("{}/{}/{}", base, branch, filename);
             if let Ok(resp) = client.get(&url).send().await {
@@ -248,19 +246,21 @@ impl RepoManager {
         bail!("Could not fetch '{}' from {}", filename, repo_url);
     }
 
-    /// Fetch info.hk without cloning.
     pub async fn fetch_raw_info_hk(&self, repo_url: &str) -> Result<String> {
         Self::fetch_raw_file(&self.client, repo_url, "info.hk").await
     }
 
-    /// Fetch and parse build.toml without cloning. Returns None if absent or unparseable.
     pub async fn fetch_raw_build_config(&self, repo_url: &str) -> Option<BuildConfig> {
         let text = Self::fetch_raw_file(&self.client, repo_url, "build.toml").await.ok()?;
         toml::from_str(&text).ok()
     }
 
-    /// Parse info.hk raw text into a lightweight PackageMeta.
     pub fn parse_meta_from_content(name: &str, content: &str) -> PackageMeta {
+        let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
         if let Ok(tmp) = tempfile::tempdir() {
             let info_path = tmp.path().join("info.hk");
             if fs::write(&info_path, content).is_ok() {
@@ -271,11 +271,12 @@ impl RepoManager {
                         summary: manifest.summary,
                         authors: manifest.authors,
                         license: manifest.license,
+                        fetched_at: now,
                     };
                 }
             }
         }
-        // Fallback: line-by-line scan
+        // Fallback
         let mut version = String::from("unknown");
         let mut summary = String::from("No description available");
         let mut authors = String::new();
@@ -287,20 +288,33 @@ impl RepoManager {
             if let Some(v) = extract_hk_value(line, "authors") { authors = v; }
             if let Some(v) = extract_hk_value(line, "license") { license = v; }
         }
-        PackageMeta { name: name.to_string(), version, summary, authors, license }
+        PackageMeta { name: name.to_string(), version, summary, authors, license, fetched_at: now }
     }
 
-    /// Search packages by name/description using only lightweight HTTP fetches.
-    /// Never clones any git repository.
-    /// Empty `query` returns all packages (used by `hpm refresh`).
+    /// Fetch metadata for a package, using local cache when fresh.
+    pub async fn fetch_package_meta(&self, name: &str) -> Result<PackageMeta> {
+        // Try cache first
+        if let Some(cached) = load_cached_meta(name) {
+            if !cached.is_stale() {
+                return Ok(cached);
+            }
+        }
+        // Cache miss or stale — fetch from network
+        let entry = self.index.packages.get(name)
+        .ok_or_else(|| miette!("Package '{}' not found in index", name))?;
+        let content = self.fetch_raw_info_hk(&entry.repo).await?;
+        let meta = Self::parse_meta_from_content(name, &content);
+        save_cached_meta(&meta);
+        Ok(meta)
+    }
+
+    /// Search packages. Uses cache for already-fetched packages.
+    /// Empty query = all packages (used by refresh).
     pub async fn search_lightweight(&self, query: &str) -> Result<Vec<PackageMeta>> {
         let query_lower = query.to_lowercase();
 
-        // Build list of candidate (name, repo_url) pairs
         let candidates: Vec<(String, String)> = if query_lower.is_empty() {
-            self.index.packages.iter()
-            .map(|(n, e)| (n.clone(), e.repo.clone()))
-            .collect()
+            self.index.packages.iter().map(|(n, e)| (n.clone(), e.repo.clone())).collect()
         } else {
             self.index.packages.iter()
             .filter(|(n, _)| n.to_lowercase().contains(&query_lower))
@@ -308,28 +322,30 @@ impl RepoManager {
             .collect()
         };
 
-        // Build futures (no tokio::spawn, so no Send requirement issues)
-        let futures_vec: Vec<_> = candidates
-        .into_iter()
-        .map(|(name, repo_url)| {
+        let futures_vec: Vec<_> = candidates.into_iter().map(|(name, repo_url)| {
             let client = self.client.clone();
             let ql = query_lower.clone();
             async move {
+                // Check cache first
+                if let Some(cached) = load_cached_meta(&name) {
+                    if !cached.is_stale() {
+                        let matches = ql.is_empty()
+                        || cached.name.to_lowercase().contains(&ql)
+                        || cached.summary.to_lowercase().contains(&ql);
+                        return if matches { Some(cached) } else { None };
+                    }
+                }
+                // Fetch from network
                 match Self::fetch_raw_file(&client, &repo_url, "info.hk").await {
                     Ok(content) => {
                         let meta = Self::parse_meta_from_content(&name, &content);
-                        // Secondary filter: also search inside description
-                        if ql.is_empty()
-                            || meta.name.to_lowercase().contains(&ql)
-                            || meta.summary.to_lowercase().contains(&ql)
-                            {
-                                Some(meta)
-                            } else {
-                                None
-                            }
+                        save_cached_meta(&meta);
+                        let matches = ql.is_empty()
+                        || meta.name.to_lowercase().contains(&ql)
+                        || meta.summary.to_lowercase().contains(&ql);
+                        if matches { Some(meta) } else { None }
                     }
                     Err(_) => {
-                        // Return stub entry so the package is still visible
                         if ql.is_empty() || name.to_lowercase().contains(&ql) {
                             Some(PackageMeta {
                                 name: name.clone(),
@@ -337,29 +353,18 @@ impl RepoManager {
                                  summary: "Could not fetch description".to_string(),
                                  authors: String::new(),
                                  license: String::new(),
+                                 fetched_at: 0,
                             })
-                        } else {
-                            None
-                        }
+                        } else { None }
                     }
                 }
             }
-        })
-        .collect();
+        }).collect();
 
-        // Execute all fetches concurrently
         let results: Vec<Option<PackageMeta>> = futures::future::join_all(futures_vec).await;
         let mut metas: Vec<PackageMeta> = results.into_iter().flatten().collect();
         metas.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(metas)
-    }
-
-    /// Fetch lightweight metadata for a single package (used by `hpm info`).
-    pub async fn fetch_package_meta(&self, name: &str) -> Result<PackageMeta> {
-        let entry = self.index.packages.get(name)
-        .ok_or_else(|| miette!("Package '{}' not found in index", name))?;
-        let content = self.fetch_raw_info_hk(&entry.repo).await?;
-        Ok(Self::parse_meta_from_content(name, &content))
     }
 
     // ── Git operations ──────────────────────────────────────────────────────
@@ -376,12 +381,9 @@ impl RepoManager {
 
     fn clone_repo(&self, url: &str, path: &Path) -> Result<()> {
         let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(|url, _username, _allowed| {
-            if url.starts_with("https://") {
-                Cred::userpass_plaintext("", "")
-            } else {
-                Cred::ssh_key_from_agent("git")
-            }
+        callbacks.credentials(|url, _, _| {
+            if url.starts_with("https://") { Cred::userpass_plaintext("", "") }
+                else { Cred::ssh_key_from_agent("git") }
         });
         let mut fetch_opts = FetchOptions::new();
         fetch_opts.remote_callbacks(callbacks);
@@ -400,35 +402,26 @@ impl RepoManager {
             remote = repo.find_remote("origin").into_diagnostic()?;
         }
         let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(|url, _username, _allowed| {
-            if url.starts_with("https://") {
-                Cred::userpass_plaintext("", "")
-            } else {
-                Cred::ssh_key_from_agent("git")
-            }
+        callbacks.credentials(|url, _, _| {
+            if url.starts_with("https://") { Cred::userpass_plaintext("", "") }
+                else { Cred::ssh_key_from_agent("git") }
         });
         let mut fetch_opts = FetchOptions::new();
         fetch_opts.remote_callbacks(callbacks);
-        remote
-        .fetch(
+        fetch_opts.download_tags(git2::AutotagOption::All);
+        remote.fetch(
             &["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"],
-            Some(&mut fetch_opts),
-               None,
-        )
-        .map_err(|e| miette!("Failed to fetch: {}", e))?;
+            Some(&mut fetch_opts), None,
+        ).map_err(|e| miette!("Failed to fetch: {}", e))?;
         Ok(())
     }
 
     pub fn find_commit_for_version(&self, repo_path: &Path, version: &str) -> Result<Oid> {
         let repo = Repository::open(repo_path).into_diagnostic()?;
-        let tags = repo.tag_names(None).into_diagnostic()?;
-        for tag_name in tags.iter().flatten() {
+        for tag_name in repo.tag_names(None).into_diagnostic()?.iter().flatten() {
             let obj = repo.revparse_single(tag_name).into_diagnostic()?;
             let commit = obj.peel_to_commit().into_diagnostic()?;
-            let tag_str = tag_name.trim_start_matches('v');
-            if tag_str == version {
-                return Ok(commit.id());
-            }
+            if tag_name.trim_start_matches('v') == version { return Ok(commit.id()); }
         }
         bail!("Version {} not found in repository tags", version);
     }
@@ -437,7 +430,6 @@ impl RepoManager {
         let repo = Repository::open(repo_path).into_diagnostic()?;
         let tags = repo.tag_names(None).into_diagnostic()?;
         let mut tag_versions = Vec::new();
-
         for tag_name in tags.iter().flatten() {
             let ver_str = tag_name.trim_start_matches('v');
             let obj = repo.revparse_single(tag_name).into_diagnostic()?;
@@ -446,56 +438,44 @@ impl RepoManager {
             if let Ok(entry) = tree.get_path(Path::new("info.hk")) {
                 let blob = repo.find_blob(entry.id()).into_diagnostic()?;
                 let content = String::from_utf8(blob.content().to_vec()).into_diagnostic()?;
-                let tmp_dir = tempfile::tempdir().into_diagnostic()?;
-                let info_path = tmp_dir.path().join("info.hk");
-                fs::write(&info_path, content).into_diagnostic()?;
-                if let Ok(manifest) = Manifest::load_from_path(tmp_dir.path().to_str().unwrap()) {
+                let tmp = tempfile::tempdir().into_diagnostic()?;
+                fs::write(tmp.path().join("info.hk"), &content).into_diagnostic()?;
+                if let Ok(manifest) = Manifest::load_from_path(tmp.path().to_str().unwrap()) {
                     tag_versions.push((ver_str.to_string(), commit.id(), manifest));
                 }
             }
         }
-
         if !tag_versions.is_empty() {
             tag_versions.sort_by(|a, b| crate::utils::compare_versions(&a.0, &b.0));
-            let (latest_ver, _, manifest) = tag_versions.last().unwrap();
-            return Ok((latest_ver.clone(), manifest.clone()));
+            let (v, _, m) = tag_versions.last().unwrap();
+            return Ok((v.clone(), m.clone()));
         }
-
-        // No tags — fall back to HEAD
         let head = repo.head().into_diagnostic()?;
         let commit = head.peel_to_commit().into_diagnostic()?;
         let tree = commit.tree().into_diagnostic()?;
         if let Ok(entry) = tree.get_path(Path::new("info.hk")) {
             let blob = repo.find_blob(entry.id()).into_diagnostic()?;
             let content = String::from_utf8(blob.content().to_vec()).into_diagnostic()?;
-            let tmp_dir = tempfile::tempdir().into_diagnostic()?;
-            let info_path = tmp_dir.path().join("info.hk");
-            fs::write(&info_path, content).into_diagnostic()?;
-            let manifest = Manifest::load_from_path(tmp_dir.path().to_str().unwrap())?;
+            let tmp = tempfile::tempdir().into_diagnostic()?;
+            fs::write(tmp.path().join("info.hk"), &content).into_diagnostic()?;
+            let manifest = Manifest::load_from_path(tmp.path().to_str().unwrap())?;
             let version = manifest.version.clone();
             return Ok((version, manifest));
         }
-
         bail!("No info.hk found in repository");
     }
 
-    pub async fn refresh(&self) -> Result<()> {
-        Ok(())
-    }
+    pub async fn refresh(&self) -> Result<()> { Ok(()) }
 
     pub fn build_index(&self) -> Result<HashMap<String, RepoPackage>> {
         let repos_dir = repos_dir();
         let mut index = HashMap::new();
-
         for (name, _entry) in &self.index.packages {
             let repo_path = repos_dir.join(name);
-            if !repo_path.exists() {
-                continue;
-            }
+            if !repo_path.exists() { continue; }
             let repo = Repository::open(&repo_path).into_diagnostic()?;
             let tags = repo.tag_names(None).into_diagnostic()?;
             let mut vers = Vec::new();
-
             for tag_name in tags.iter().flatten() {
                 let obj = repo.revparse_single(tag_name).into_diagnostic()?;
                 let commit = obj.peel_to_commit().into_diagnostic()?;
@@ -503,25 +483,15 @@ impl RepoManager {
                 if let Ok(entry) = tree.get_path(Path::new("info.hk")) {
                     let blob = repo.find_blob(entry.id()).into_diagnostic()?;
                     let content = String::from_utf8(blob.content().to_vec()).into_diagnostic()?;
-                    let tmp_dir = tempfile::tempdir().into_diagnostic()?;
-                    let info_path = tmp_dir.path().join("info.hk");
-                    fs::write(&info_path, content).into_diagnostic()?;
-                    if let Ok(manifest) = Manifest::load_from_path(tmp_dir.path().to_str().unwrap()) {
+                    let tmp = tempfile::tempdir().into_diagnostic()?;
+                    fs::write(tmp.path().join("info.hk"), &content).into_diagnostic()?;
+                    if let Ok(manifest) = Manifest::load_from_path(tmp.path().to_str().unwrap()) {
                         let version = manifest.version.clone();
                         let deps = manifest.deps.clone().into_iter().collect();
-                        vers.push(PackageVersion {
-                            version,
-                            commit: commit.id(),
-                                  manifest,
-                                  deps,
-                        });
-                    } else {
-                        eprintln!("Warning: failed to parse manifest for {} tag {}", name, tag_name);
+                        vers.push(PackageVersion { version, commit: commit.id(), manifest, deps });
                     }
                 }
             }
-
-            // Repo without tags: read from HEAD
             if vers.is_empty() {
                 if let Ok(head) = repo.head() {
                     if let Ok(commit) = head.peel_to_commit() {
@@ -529,9 +499,9 @@ impl RepoManager {
                             if let Ok(entry) = tree.get_path(Path::new("info.hk")) {
                                 if let Ok(blob) = repo.find_blob(entry.id()) {
                                     if let Ok(content) = String::from_utf8(blob.content().to_vec()) {
-                                        if let Ok(tmp_dir) = tempfile::tempdir() {
-                                            let _ = fs::write(tmp_dir.path().join("info.hk"), &content);
-                                            if let Ok(manifest) = Manifest::load_from_path(tmp_dir.path().to_str().unwrap()) {
+                                        if let Ok(tmp) = tempfile::tempdir() {
+                                            let _ = fs::write(tmp.path().join("info.hk"), &content);
+                                            if let Ok(manifest) = Manifest::load_from_path(tmp.path().to_str().unwrap()) {
                                                 let version = manifest.version.clone();
                                                 let deps = manifest.deps.clone().into_iter().collect();
                                                 vers.push(PackageVersion { version, commit: commit.id(), manifest, deps });
@@ -544,7 +514,6 @@ impl RepoManager {
                     }
                 }
             }
-
             vers.sort_by(|a, b| crate::utils::compare_versions(&a.version, &b.version));
             index.insert(name.clone(), RepoPackage { name: name.clone(), versions: vers });
         }
@@ -552,15 +521,9 @@ impl RepoManager {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Minimal fallback parser for key = "value" lines in info.hk
-// ---------------------------------------------------------------------------
-
 fn extract_hk_value(line: &str, key: &str) -> Option<String> {
     let prefix = format!("{} =", key);
-    if !line.starts_with(&prefix) {
-        return None;
-    }
+    if !line.starts_with(&prefix) { return None; }
     let rest = line[prefix.len()..].trim();
     if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
         Some(rest[1..rest.len() - 1].to_string())
