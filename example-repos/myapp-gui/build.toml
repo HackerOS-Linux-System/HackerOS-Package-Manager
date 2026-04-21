@@ -1,0 +1,8 @@
+! Download a pre-built binary from GitHub Releases
+type         = "download"
+url          = "https://github.com/user/myapp/releases/download/v{version}/myapp-linux-x86_64.tar.gz"
+binary_path  = "myapp-{version}/bin/myapp-gui"
+strip_components = 0
+install_path = "bin/myapp-gui"
+
+runtime_deps = ["libgtk-3-0", "libglib2.0-0"]
