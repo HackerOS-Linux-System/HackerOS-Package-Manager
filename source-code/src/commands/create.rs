@@ -1,5 +1,3 @@
-// src/commands/create.rs
-
 use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use std::fs;
