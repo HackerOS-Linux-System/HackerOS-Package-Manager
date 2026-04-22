@@ -1,6 +1,5 @@
 use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -17,10 +16,8 @@ pub fn rollback(package: Option<String>) -> Result<()> {
     let mut state = State::load()?;
 
     if let Some(pkg_name) = package {
-        // Roll back a single package to its previous version
         rollback_single_package(&pkg_name, &mut state)?;
     } else {
-        // Roll back entire system state
         rollback_full_state(&mut state)?;
     }
 
@@ -34,34 +31,30 @@ pub fn rollback(package: Option<String>) -> Result<()> {
 
 fn rollback_single_package(pkg_name: &str, state: &mut State) -> Result<()> {
     let prev_ver = state.get_previous_version(pkg_name)
-    .ok_or_else(|| miette::miette!(
-        "No previous version found for '{}'.\n\
-Only one version is installed — nothing to roll back to.",
-pkg_name
-    ))?;
+        .ok_or_else(|| miette::miette!(
+            "No previous version found for '{}'.\n\
+             Only one version is installed — nothing to roll back to.",
+            pkg_name
+        ))?;
 
-    let current_ver = state.get_current_version(pkg_name)
-    .unwrap_or_default();
+    let current_ver = state.get_current_version(pkg_name).unwrap_or_default();
 
     println!("{} Rolling back {} from {} to {}",
-             "→".yellow(), pkg_name.cyan(), current_ver.cyan(), prev_ver.cyan());
+        "→".yellow(), pkg_name.cyan(), current_ver.cyan(), prev_ver.cyan());
 
     let prev_dir = Path::new(STORE_PATH).join(pkg_name).join(&prev_ver);
     if !prev_dir.exists() {
         return Err(miette::miette!(
             "Version {}@{} files not found in store.\n\
-The version is in state.json but its directory is missing.\n\
-Run {} to diagnose.",
-pkg_name, prev_ver, "hpm doctor".yellow()
+             Run {} to diagnose.",
+            pkg_name, prev_ver, "hpm doctor".yellow()
         ));
     }
 
-    // Update current symlink
     let current_link = Path::new(STORE_PATH).join(pkg_name).join("current");
     let _ = fs::remove_file(&current_link);
     std::os::unix::fs::symlink(&prev_ver, &current_link).into_diagnostic()?;
 
-    // Rebuild /usr/bin wrappers for the previous version
     let hpm_exe = std::env::current_exe().into_diagnostic()?;
     if let Ok(manifest) = crate::manifest::Manifest::load_from_path(prev_dir.to_str().unwrap()) {
         for bin_name in &manifest.bins {
@@ -77,7 +70,8 @@ pkg_name, prev_ver, "hpm doctor".yellow()
         }
     }
 
-    println!("{} {}@{} is now the current version", "✔".green(), pkg_name.cyan(), prev_ver.cyan());
+    println!("{} {}@{} is now the current version",
+        "✔".green(), pkg_name.cyan(), prev_ver.cyan());
     Ok(())
 }
 
@@ -94,7 +88,6 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
         return Ok(());
     }
 
-    // Display history
     println!("{} Rollback history (most recent last):\n", "→".cyan());
     for (i, timestamp, desc) in &history {
         let dt = format_timestamp(*timestamp);
@@ -114,42 +107,45 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
         return Ok(());
     }
 
-    let index: usize = input.parse().map_err(|_| miette::miette!("Invalid index: {}", input))?;
+    let index: usize = input.parse()
+        .map_err(|_| miette::miette!("Invalid index: {}", input))?;
 
     if index >= history.len() {
         return Err(miette::miette!("Index {} out of range (0..{})", index, history.len() - 1));
     }
 
-    let snapshot_desc = history[index].2.to_string();
+    let snapshot_desc = state.history[index].description.clone();
     println!("\n{} Restoring to: {}", "→".yellow(), snapshot_desc);
 
-    // Compute diff
+    // Clone both maps before computing diff to avoid borrow issues
     let target_snapshot = state.history[index].snapshot.clone();
     let current_pkgs = state.packages.clone();
 
-    let to_install: Vec<(String, String)> = target_snapshot.iter()
-    .flat_map(|(name, vers)| {
-        vers.keys().filter_map(move |ver| {
-            if current_pkgs.get(name).map(|vs| vs.contains_key(ver)).unwrap_or(false) {
-                None
-            } else {
-                Some((name.clone(), ver.clone()))
+    // Packages in target but not in current → need to reinstall (if files present)
+    let mut to_install: Vec<(String, String)> = Vec::new();
+    for (name, vers) in &target_snapshot {
+        for ver in vers.keys() {
+            let in_current = current_pkgs.get(name)
+                .map(|vs| vs.contains_key(ver))
+                .unwrap_or(false);
+            if !in_current {
+                to_install.push((name.clone(), ver.clone()));
             }
-        })
-    })
-    .collect();
+        }
+    }
 
-    let to_remove: Vec<(String, String)> = current_pkgs.iter()
-    .flat_map(|(name, vers)| {
-        vers.keys().filter_map(move |ver| {
-            if target_snapshot.get(name).map(|vs| vs.contains_key(ver)).unwrap_or(false) {
-                None
-            } else {
-                Some((name.clone(), ver.clone()))
+    // Packages in current but not in target → remove
+    let mut to_remove: Vec<(String, String)> = Vec::new();
+    for (name, vers) in &current_pkgs {
+        for ver in vers.keys() {
+            let in_target = target_snapshot.get(name)
+                .map(|vs| vs.contains_key(ver))
+                .unwrap_or(false);
+            if !in_target {
+                to_remove.push((name.clone(), ver.clone()));
             }
-        })
-    })
-    .collect();
+        }
+    }
 
     if to_install.is_empty() && to_remove.is_empty() {
         println!("{} Current state matches the selected snapshot. Nothing to do.", "✔".green());
@@ -157,7 +153,7 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     }
 
     if !to_install.is_empty() {
-        println!("\n  Packages to reinstall:");
+        println!("\n  Packages to reinstall (files must already be in store):");
         for (name, ver) in &to_install {
             println!("    {} {}@{}", "+".green(), name.cyan(), ver);
         }
@@ -172,9 +168,9 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     println!();
     eprint!("Proceed? [y/N] ");
     std::io::stdout().flush().into_diagnostic()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).into_diagnostic()?;
-    if !input.trim().eq_ignore_ascii_case("y") {
+    let mut confirm = String::new();
+    std::io::stdin().read_line(&mut confirm).into_diagnostic()?;
+    if !confirm.trim().eq_ignore_ascii_case("y") {
         println!("{} Aborted.", "→".yellow());
         return Ok(());
     }
@@ -188,19 +184,18 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
         }
     }
 
-    // Restore state to snapshot (files for to_install must already be in store)
+    // Restore files already in store
     for (name, ver) in &to_install {
         let pkg_path = Path::new(STORE_PATH).join(name).join(ver);
         if pkg_path.exists() {
-            // Restore current symlink
             let current_link = Path::new(STORE_PATH).join(name).join("current");
             let _ = fs::remove_file(&current_link);
             std::os::unix::fs::symlink(ver, &current_link).into_diagnostic()?;
-            println!("  {} Restored {}@{} (files already in store)", "✔".green(), name.cyan(), ver);
+            println!("  {} Restored {}@{} (files in store)", "✔".green(), name.cyan(), ver);
         } else {
-            println!("  {} {}@{} not in store — run {} to reinstall",
-                     "⚠".yellow(), name.cyan(), ver,
-                     format!("hpm install {}@{}", name, ver).yellow());
+            println!("  {} {}@{} not in store — reinstall manually: {}",
+                "⚠".yellow(), name.cyan(), ver,
+                format!("sudo hpm install {}@{}", name, ver).yellow());
         }
     }
 
@@ -212,10 +207,9 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
 }
 
 fn format_timestamp(ts: u64) -> String {
-    // Simple human-readable format without chrono dependency
     let secs = ts;
     let days = secs / 86400;
-    let epoch_days = 719468i64; // days from year 0 to 1970
+    let epoch_days = 719468i64;
     let z = days as i64 + epoch_days;
     let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
     let doe = z - era * 146097;
