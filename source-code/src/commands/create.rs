@@ -1,3 +1,5 @@
+// src/commands/create.rs
+
 use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use std::fs;
@@ -7,29 +9,21 @@ use std::path::Path;
 pub fn create(name: Option<String>) -> Result<()> {
     println!("\n{} HPM Package Creation Wizard\n", "◆".red());
 
-    // ── Gather information ───────────────────────────────────────────────────
-    let pkg_name = if let Some(n) = name {
-        n
-    } else {
-        prompt("Package name", None)?
-    };
-
+    let pkg_name = if let Some(n) = name { n } else { prompt("Package name", None)? };
     validate_pkg_name(&pkg_name)?;
 
-    let version  = prompt("Version", Some("1.0.0"))?;
-    let authors  = prompt("Author(s)", None)?;
-    let license  = prompt_choice("License", &["MIT", "GPL-2.0", "GPL-3.0", "Apache-2.0", "BSD-2-Clause", "custom"], 0)?;
-    let summary  = prompt("Short description (shown in hpm search)", None)?;
-    let long_desc = prompt("Long description (shown in hpm info)", Some(""))?;
+    let version   = prompt("Version", Some("1.0.0"))?;
+    let authors   = prompt("Author(s)", None)?;
+    let license   = prompt_choice("License",
+        &["MIT", "GPL-2.0", "GPL-3.0", "Apache-2.0", "BSD-2-Clause", "custom"], 0)?;
+    let summary   = prompt("Short description (shown in hpm search)", None)?;
+    let long_desc = prompt("Long description (shown in hpm info)", Some(&summary))?;
 
-    let pkg_type = prompt_choice(
-        "Package type",
-        &["CLI application", "GUI application", "Library / tool (no binary)", "Custom"],
-                                 0,
-    )?;
+    let pkg_type  = prompt_choice("Package type",
+        &["CLI application", "GUI application", "Library / tool (no binary)", "Custom"], 0)?;
 
-    let is_gui = pkg_type == "GUI application";
-    let has_binary = pkg_type != "Library / tool (no binary)";
+    let is_gui      = pkg_type == "GUI application";
+    let has_binary  = pkg_type != "Library / tool (no binary)";
 
     let bin_name = if has_binary {
         prompt("Binary name", Some(&pkg_name))?
@@ -38,15 +32,12 @@ pub fn create(name: Option<String>) -> Result<()> {
     };
 
     let build_type = if has_binary {
-        prompt_choice(
-            "How is the binary obtained?",
+        prompt_choice("How is the binary obtained?",
             &[
                 "Already in contents/ (prebuilt)",
-                      "Download from URL (GitHub Releases etc.)",
-                      "Build from source (cargo / make / cmake)",
-            ],
-            0,
-        )?
+                "Download from URL (GitHub Releases etc.)",
+                "Build from source (cargo / make / cmake)",
+            ], 0)?
     } else {
         String::new()
     };
@@ -66,11 +57,8 @@ pub fn create(name: Option<String>) -> Result<()> {
     // ── Create directory structure ───────────────────────────────────────────
     let pkg_dir = Path::new(&pkg_name);
     if pkg_dir.exists() {
-        let overwrite = prompt_bool(
-            &format!("Directory '{}' already exists. Continue anyway?", pkg_name),
-                                    false,
-        )?;
-        if !overwrite {
+        if !prompt_bool(
+            &format!("Directory '{}' already exists. Continue?", pkg_name), false)? {
             println!("{} Aborted.", "→".yellow());
             return Ok(());
         }
@@ -82,100 +70,89 @@ pub fn create(name: Option<String>) -> Result<()> {
         let bin_dir = pkg_dir.join("contents/bin");
         fs::create_dir_all(&bin_dir).into_diagnostic()?;
 
-        // Create placeholder binary script
-        let placeholder = bin_dir.join(&bin_name);
-        if !placeholder.exists() && build_type == "Already in contents/ (prebuilt)" {
-            fs::write(&placeholder, format!(
-                "#!/bin/sh\n# {}\n# Replace this with the actual binary.\necho 'Hello from {}!'\n",
-                pkg_name, pkg_name
-            )).into_diagnostic()?;
-            // Mark as executable in git later via .gitattributes
+        if !bin_name.is_empty() && build_type == "Already in contents/ (prebuilt)" {
+            let placeholder = bin_dir.join(&bin_name);
+            if !placeholder.exists() {
+                let content = format!(
+                    "#!/bin/sh\n# {} — replace with actual binary\necho 'Hello from {}!'\n",
+                    pkg_name, pkg_name
+                );
+                fs::write(&placeholder, content).into_diagnostic()?;
+                // Make the placeholder executable immediately
+                crate::utils::make_executable(&placeholder)?;
+            }
         }
 
         if is_gui {
             let icon_dir = pkg_dir.join("contents/icons");
             fs::create_dir_all(&icon_dir).into_diagnostic()?;
-            // Create a minimal SVG placeholder icon
             let icon = icon_dir.join(format!("{}.svg", pkg_name));
             if !icon.exists() {
-                fs::write(&icon, format!(
-                    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-                    <rect width="64" height="64" rx="12" fill="#ff2040"/>
-                    <text x="32" y="42" font-size="28" text-anchor="middle" fill="white" font-family="sans-serif">{}</text>
-                    </svg>"#,
-                    pkg_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?')
-                )).into_diagnostic()?;
+                // Use raw string to avoid Rust 2021 prefix issue with "sans-serif"
+                let initial = pkg_name.chars().next()
+                    .and_then(|c| c.to_uppercase().next())
+                    .unwrap_or('?');
+                let svg = format!(
+                    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#ff2040"/>
+  <text x="32" y="42" font-size="28" text-anchor="middle" fill="white" font-family="sans-serif">{}</text>
+</svg>"##,
+                    initial
+                );
+                fs::write(&icon, svg).into_diagnostic()?;
             }
         }
     }
 
-    // ── Write info.hk ────────────────────────────────────────────────────────
+    // ── info.hk ─────────────────────────────────────────────────────────────
     let info_hk = generate_info_hk(
         &pkg_name, &version, &authors, &license, &summary, &long_desc,
         &bin_name, is_gui, needs_network, &categories,
+        &build_type,
     );
     fs::write(pkg_dir.join("info.hk"), &info_hk).into_diagnostic()?;
 
-    // ── Write build.toml (if needed) ─────────────────────────────────────────
+    // ── build.toml ──────────────────────────────────────────────────────────
     if has_binary && build_type != "Already in contents/ (prebuilt)" {
         let build_toml = generate_build_toml(&pkg_name, &bin_name, &build_type);
         fs::write(pkg_dir.join("build.toml"), &build_toml).into_diagnostic()?;
     }
 
-    // ── Write README.md ──────────────────────────────────────────────────────
-    let readme = generate_readme(&pkg_name, &summary, &authors, &license, is_gui);
-    fs::write(pkg_dir.join("README.md"), &readme).into_diagnostic()?;
+    // ── README.md ───────────────────────────────────────────────────────────
+    fs::write(pkg_dir.join("README.md"),
+        generate_readme(&pkg_name, &summary, &authors, &license, is_gui))
+        .into_diagnostic()?;
 
-    // ── Write .gitignore ─────────────────────────────────────────────────────
-    fs::write(pkg_dir.join(".gitignore"), "target/\n*.o\n*.so\n*.tmp\n").into_diagnostic()?;
+    // ── .gitignore ──────────────────────────────────────────────────────────
+    fs::write(pkg_dir.join(".gitignore"),
+        "target/\n*.o\n*.so\n*.tmp\n.staging-*\n")
+        .into_diagnostic()?;
 
-    // ── Write .gitattributes (ensure binary is executable in git) ────────────
+    // ── .gitattributes ──────────────────────────────────────────────────────
     if has_binary && !bin_name.is_empty() {
-        fs::write(
-            pkg_dir.join(".gitattributes"),
-                  format!("contents/bin/{} text eol=lf\n", bin_name),
-        ).into_diagnostic()?;
+        fs::write(pkg_dir.join(".gitattributes"),
+            format!("contents/bin/* text eol=lf\n"))
+            .into_diagnostic()?;
     }
 
-    // ── Write GitHub Actions CI ──────────────────────────────────────────────
+    // ── GitHub Actions CI ────────────────────────────────────────────────────
     let gh_dir = pkg_dir.join(".github/workflows");
     fs::create_dir_all(&gh_dir).into_diagnostic()?;
-    fs::write(gh_dir.join("hpm-validate.yml"), generate_ci_workflow(&pkg_name))
-    .into_diagnostic()?;
+    fs::write(gh_dir.join("hpm-validate.yml"), generate_ci_workflow())
+        .into_diagnostic()?;
 
-    // ── Print summary ────────────────────────────────────────────────────────
-    println!("\n{} Package '{}' created successfully!\n", "✔".green(), pkg_name.cyan());
-
+    // ── Summary ──────────────────────────────────────────────────────────────
+    println!("\n{} Package '{}' created!\n", "✔".green(), pkg_name.cyan());
     println!("{}", "Next steps:".bold());
     println!("  1. cd {}", pkg_name.cyan());
     if has_binary && build_type == "Already in contents/ (prebuilt)" {
         println!("  2. Replace {} with your actual binary", format!("contents/bin/{}", bin_name).cyan());
-        println!("  3. {}", "git add . && git update-index --chmod=+x contents/bin/".cyan());
-    } else if build_type.contains("Build from source") {
-        println!("  2. Edit {} with your build commands", "build.toml".cyan());
-    } else if build_type.contains("Download") {
-        println!("  2. Edit {} with the download URL", "build.toml".cyan());
+        println!("  3. Make it executable in git:");
+        println!("     {}", format!("git update-index --chmod=+x contents/bin/{}", bin_name).cyan());
+        println!("     (hpm also auto-detects shebang scripts and chmod +x them)");
     }
-    if has_binary {
-        println!("  {}. Edit {} — fill in the long description", if has_binary { "4" } else { "3" }, "info.hk".cyan());
-    }
-    println!("  n. {} to create the first release", "git tag v1.0.0 && git push origin main --tags".cyan());
-    println!("  n. Submit a PR to add your package to the HPM index\n");
-
-    println!("{} Files created:", "→".blue());
-    println!("  {} info.hk", "✔".green());
-    if has_binary && build_type != "Already in contents/ (prebuilt)" {
-        println!("  {} build.toml", "✔".green());
-    }
-    if has_binary {
-        println!("  {} contents/bin/{} (placeholder)", "✔".green(), bin_name);
-    }
-    if is_gui {
-        println!("  {} contents/icons/{}.svg (placeholder icon)", "✔".green(), pkg_name);
-    }
-    println!("  {} README.md", "✔".green());
-    println!("  {} .gitignore", "✔".green());
-    println!("  {} .github/workflows/hpm-validate.yml", "✔".green());
+    println!("  n. git tag v1.0.0 && git push origin main --tags");
+    println!("  n. Submit PR to add package to HPM index\n");
 
     Ok(())
 }
@@ -188,9 +165,9 @@ fn generate_info_hk(
     name: &str, version: &str, authors: &str, license: &str,
     summary: &str, long_desc: &str,
     bin_name: &str, is_gui: bool, needs_network: bool, categories: &str,
+    build_type: &str,
 ) -> String {
     let mut out = String::new();
-
     out.push_str(&format!("! {}\n! Generated by hpm create\n\n", name));
     out.push_str("[metadata]\n");
     out.push_str(&format!("-> name    => {}\n", name));
@@ -199,15 +176,16 @@ fn generate_info_hk(
     out.push_str(&format!("-> license => {}\n", license));
     if is_gui { out.push_str("-> gui     => true\n"); }
     if !bin_name.is_empty() {
-        out.push_str(&format!("-> bins.{} => \"\"\n", bin_name));
+        // If prebuilt, declare explicit path so hpm knows where to look
+        if build_type == "Already in contents/ (prebuilt)" {
+            out.push_str(&format!("-> bins.{} => \"bin/{}\"\n", bin_name, bin_name));
+        } else {
+            out.push_str(&format!("-> bins.{} => \"\"\n", bin_name));
+        }
     }
     out.push_str("\n[description]\n");
     out.push_str(&format!("-> summary => {}\n", summary));
-    if !long_desc.is_empty() {
-        out.push_str(&format!("-> long    => {}\n", long_desc));
-    } else {
-        out.push_str(&format!("-> long    => {}\n", summary));
-    }
+    out.push_str(&format!("-> long    => {}\n", long_desc));
     out.push_str("\n[sandbox]\n");
     out.push_str(&format!("-> network  => {}\n", needs_network));
     out.push_str(&format!("-> gui      => {}\n", is_gui));
@@ -223,62 +201,39 @@ fn generate_info_hk(
 
     if is_gui {
         out.push_str("\n[desktop]\n");
-        out.push_str(&format!("-> display_name => {}\n",
-                              {
-                                  let mut c = name.chars();
-                                  c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str())
-                                  .unwrap_or_default()
-                              }
-        ));
+        let display = {
+            let mut c = name.chars();
+            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        };
+        out.push_str(&format!("-> display_name => {}\n", display));
         out.push_str(&format!("-> icon         => icons/{}.svg\n", name));
         out.push_str(&format!("-> categories   => {}\n",
-                              if categories.is_empty() { "Utility;" } else { categories }
-        ));
+            if categories.is_empty() { "Utility;" } else { categories }));
         out.push_str(&format!("-> comment      => {}\n", summary));
     }
-
     out
 }
 
 fn generate_build_toml(pkg_name: &str, bin_name: &str, build_type: &str) -> String {
     if build_type.contains("Download") {
         format!(
-            r#"! build.toml for {}
-            ! Set the correct URL — {{version}} is replaced with the git tag version
-
-            type         = "download"
-            url          = "https://github.com/YOUR_GITHUB_USER/{}/releases/download/v{{version}}/{}-linux-x86_64"
-            install_path = "bin/{}"
-
-            ! For tar.gz archives, use:
-            ! type             = "download"
-            ! url              = "https://github.com/USER/REPO/releases/download/v{{version}}/tool-linux.tar.gz"
-            ! binary_path      = "tool/bin/tool"
-            ! strip_components = 1
-            ! install_path     = "bin/{}"
-
-            runtime_deps = []
-            "#,
-            pkg_name, pkg_name, pkg_name, bin_name, bin_name
+            "! build.toml for {}\n\
+             type         = \"download\"\n\
+             url          = \"https://github.com/YOUR_USER/{}/releases/download/v{{version}}/{}-linux-x86_64\"\n\
+             install_path = \"bin/{}\"\n\
+             runtime_deps = []\n",
+            pkg_name, pkg_name, pkg_name, bin_name
         )
     } else {
         format!(
-            r#"! build.toml for {}
-            ! Adjust commands to match your build system
-
-            type         = "build"
-            commands     = [
-            "cargo build --release",
-            ]
-            output       = "target/release/{}"
-            install_path = "bin/{}"
-
-            build_deps   = ["build-essential"]
-            runtime_deps = []
-
-            [env]
-            ! CARGO_PROFILE_RELEASE_LTO = "true"
-            "#,
+            "! build.toml for {}\n\
+             type         = \"build\"\n\
+             commands     = [\"cargo build --release\"]\n\
+             output       = \"target/release/{}\"\n\
+             install_path = \"bin/{}\"\n\
+             build_deps   = [\"build-essential\"]\n\
+             runtime_deps = []\n",
             pkg_name, bin_name, bin_name
         )
     }
@@ -286,107 +241,50 @@ fn generate_build_toml(pkg_name: &str, bin_name: &str, build_type: &str) -> Stri
 
 fn generate_readme(name: &str, summary: &str, authors: &str, license: &str, is_gui: bool) -> String {
     format!(
-        r#"# {}
-
-        {}
-
-        ## Installation
-
-        ```sh
-        sudo hpm install {}
-        ```
-
-        ## Usage
-
-        ```sh
-        {}{}
-        ```
-
-        ## Building from source
-
-        This package uses the [HPM package format](https://github.com/HackerOS-Linux-System/HackerOS-Package-Manager).
-
-    ```sh
-    git clone https://github.com/YOUR_USER/{}
-    cd {}
-    # edit contents/bin/{} or build.toml as needed
-    git tag v1.0.0
-    git push origin main --tags
-    ```
-
-    ## Authors
-
-    {}
-
-    ## License
-
-    {}
-    "#,
-    name, summary, name,
-    name,
-    if is_gui { " &" } else { " --help" },
-        name, name, name,
+        "# {}\n\n{}\n\n## Installation\n\n```sh\nsudo hpm install {}\n```\n\n\
+         ## Usage\n\n```sh\n{}{}\n```\n\n## Authors\n\n{}\n\n## License\n\n{}\n",
+        name, summary, name, name,
+        if is_gui { " &" } else { " --help" },
         authors, license
     )
 }
 
-fn generate_ci_workflow(pkg_name: &str) -> String {
-    format!(
-        r#"# .github/workflows/hpm-validate.yml
-        # Validates that the HPM package manifest is well-formed.
+fn generate_ci_workflow() -> String {
+    r#"name: Validate HPM Package
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
 
-        name: Validate HPM Package
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-        on:
-        push:
-        branches: [main]
-        tags: ['v*']
-        pull_request:
-        branches: [main]
+      - name: Check info.hk exists
+        run: test -f info.hk || (echo "ERROR: info.hk missing"; exit 1)
 
-        jobs:
-        validate:
-        runs-on: ubuntu-latest
-        steps:
-        - uses: actions/checkout@v4
-
-        - name: Check info.hk exists
-        run: test -f info.hk && echo "info.hk found" || (echo "ERROR: info.hk missing"; exit 1)
-
-        - name: Check version matches tag
+      - name: Check version matches tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-        TAG="${{github.ref_name}}"
-        TAG_VER="${{TAG#v}}"
-        HK_VER=$(grep -E '-> version =>' info.hk | head -1 | sed 's/.*=> //' | tr -d ' ')
-        if [ "$TAG_VER" != "$HK_VER" ]; then
-            echo "ERROR: Tag version ($TAG_VER) does not match info.hk version ($HK_VER)"
-            exit 1
-            fi
-            echo "Version OK: $HK_VER"
+          TAG="${GITHUB_REF_NAME#v}"
+          HK_VER=$(grep -E '-> version =>' info.hk | head -1 | sed 's/.*=> //' | tr -d ' ')
+          [ "$TAG" = "$HK_VER" ] || (echo "ERROR: tag $TAG != info.hk $HK_VER"; exit 1)
 
-            - name: Check contents/ or build.toml exists
-            run: |
-            if [ -d contents ] || [ -f build.toml ]; then
-                echo "Package source OK"
-                else
-                    echo "ERROR: Package must have contents/ directory or build.toml"
-                    exit 1
-                    fi
+      - name: Check package source exists
+        run: |
+          [ -d contents ] || [ -f build.toml ] || (echo "ERROR: need contents/ or build.toml"; exit 1)
 
-                    - name: Check binary is executable
-                    run: |
-                    for f in contents/bin/*; do
-                        if [ -f "$f" ]; then
-                            if [ ! -x "$f" ]; then
-                                echo "WARNING: $f is not executable. Run: git update-index --chmod=+x $f"
-                                else
-                                    echo "OK: $f is executable"
-                                    fi
-                                    fi
-                                    done
-                                    "#
-    )
+      - name: Check binaries are executable
+        run: |
+          for f in contents/bin/*; do
+            [ -f "$f" ] && [ ! -x "$f" ] && echo "WARNING: $f not executable (git update-index --chmod=+x $f)"
+          done
+          exit 0
+"#.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -400,11 +298,7 @@ fn prompt(label: &str, default: Option<&str>) -> Result<String> {
     let mut input = String::new();
     io::stdin().read_line(&mut input).into_diagnostic()?;
     let input = input.trim().to_string();
-    Ok(if input.is_empty() {
-        default.unwrap_or("").to_string()
-    } else {
-        input
-    })
+    Ok(if input.is_empty() { default.unwrap_or("").to_string() } else { input })
 }
 
 fn prompt_bool(label: &str, default: bool) -> Result<bool> {
@@ -413,12 +307,10 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     io::stdout().flush().into_diagnostic()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input).into_diagnostic()?;
-    let input = input.trim().to_lowercase();
-    Ok(match input.as_str() {
+    Ok(match input.trim().to_lowercase().as_str() {
         "y" | "yes" => true,
-       "n" | "no"  => false,
-       ""           => default,
-       _            => default,
+        "n" | "no"  => false,
+        _            => default,
     })
 }
 
@@ -435,12 +327,7 @@ fn prompt_choice(label: &str, choices: &[&str], default_idx: usize) -> Result<St
     io::stdout().flush().into_diagnostic()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input).into_diagnostic()?;
-    let input = input.trim();
-    let idx: usize = if input.is_empty() {
-        default_idx
-    } else {
-        input.parse().unwrap_or(default_idx)
-    };
+    let idx = input.trim().parse::<usize>().unwrap_or(default_idx);
     Ok(choices.get(idx).unwrap_or(&choices[default_idx]).to_string())
 }
 
@@ -451,8 +338,7 @@ fn validate_pkg_name(name: &str) -> Result<()> {
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(miette::miette!(
             "Package name '{}' contains invalid characters.\n\
-Only letters, digits, hyphens and underscores are allowed.",
-name
+             Only letters, digits, hyphens and underscores are allowed.", name
         ));
     }
     if name.starts_with('-') || name.starts_with('_') {
