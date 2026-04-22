@@ -3,7 +3,7 @@
 -> version => 1.0.0
 -> authors => HackerOS Team
 -> license => MIT
--> bins.hello-hpm => ""
+-> bins.hello-hpm => "bin/hello"
 
 [description]
 -> summary => A minimal example package for the HackerOS Package Manager
