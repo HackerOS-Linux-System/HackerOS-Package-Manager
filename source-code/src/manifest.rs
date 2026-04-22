@@ -17,21 +17,13 @@ pub struct RuntimeInfo {
 /// Desktop integration metadata (for GUI apps).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DesktopInfo {
-    /// Display name shown in app menu (falls back to name).
     pub display_name: String,
-    /// Icon name or path inside contents/ (e.g. "icons/myapp.png").
     pub icon: String,
-    /// XDG categories (e.g. "Graphics;Viewer").
     pub categories: String,
-    /// Comment shown in .desktop file.
     pub comment: String,
-    /// Whether to show in application menu.
     pub nodisplay: bool,
-    /// Custom .desktop file path inside contents/ (overrides auto-generation).
     pub desktop_file: String,
-    /// MIME types handled by this app.
     pub mime_types: String,
-    /// Keywords for search.
     pub keywords: String,
 }
 
@@ -48,11 +40,20 @@ pub struct Manifest {
     pub system_specs: IndexMap<String, String>,
     #[serde(default)]
     pub deps: IndexMap<String, String>,
+
+    /// Binary names declared in metadata.bins.
+    /// These become /usr/bin/<name> wrappers.
     #[serde(default)]
     pub bins: Vec<String>,
+
+    /// Explicit binary paths inside contents/, keyed by binary name.
+    /// Example: bin_paths["hello"] = "bin/hello"
+    /// If absent for a bin, hpm searches recursively.
+    #[serde(default)]
+    pub bin_paths: IndexMap<String, String>,
+
     #[serde(default)]
     pub sandbox: Sandbox,
-    /// If true, run the binary directly with no sandbox at all.
     #[serde(default)]
     pub sandbox_disabled: bool,
     #[serde(default)]
@@ -63,9 +64,13 @@ pub struct Manifest {
     pub runtime: RuntimeInfo,
     #[serde(default)]
     pub desktop: DesktopInfo,
-    /// Whether this is a GUI application (shorthand that sets sandbox.gui=true).
     #[serde(default)]
     pub is_gui: bool,
+
+    /// Packages that cannot be installed alongside this one.
+    /// Each entry is a package name (optionally "name@version").
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,31 +107,39 @@ impl Manifest {
     pub fn load_from_path(path: &str) -> Result<Self> {
         let info_path = format!("{}/info.hk", path);
         let mut config = hk_parser::load_hk_file(&info_path)
-        .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
+            .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
         hk_parser::resolve_interpolations(&mut config)
-        .map_err(|e| miette!("Failed to resolve interpolations: {}", e))?;
+            .map_err(|e| miette!("Failed to resolve interpolations: {}", e))?;
 
         // ── [metadata] ──────────────────────────────────────────────────────
         let metadata = config.get("metadata")
-        .ok_or_else(|| miette!("Missing [metadata] section"))?
-        .as_map().map_err(|_| miette!("Invalid metadata"))?;
+            .ok_or_else(|| miette!("Missing [metadata] section"))?
+            .as_map().map_err(|_| miette!("Invalid metadata"))?;
 
         let name    = get_str(metadata, "name").ok_or_else(|| miette!("Missing name"))?;
         let version = get_str(metadata, "version").ok_or_else(|| miette!("Missing version"))?;
         let authors = get_str(metadata, "authors").unwrap_or_default();
         let license = get_str(metadata, "license").unwrap_or_default();
+        let is_gui  = get_bool(metadata, "gui");
 
-        // bins: map keys where value is empty
+        // bins: map where keys are binary names, value is either "" or the path
+        // Supports two formats:
+        //   -> bins.hello => ""          (hpm searches for 'hello' recursively)
+        //   -> bins.hello => "bin/hello" (explicit path inside contents/)
         let bins_map = metadata.get("bins").and_then(|v| v.as_map().ok());
         let mut bins = Vec::new();
+        let mut bin_paths = IndexMap::new();
         if let Some(bm) = bins_map {
             for (k, v) in bm {
-                if is_empty_value(v) { bins.push(k.clone()); }
+                bins.push(k.clone());
+                // If value is a non-empty string, treat it as explicit path
+                if let Ok(path_val) = v.as_string() {
+                    if !path_val.is_empty() {
+                        bin_paths.insert(k.clone(), path_val);
+                    }
+                }
             }
         }
-
-        // is_gui shorthand
-        let is_gui = get_bool(metadata, "gui");
 
         // ── [description] ───────────────────────────────────────────────────
         let description = config.get("description").and_then(|v| v.as_map().ok());
@@ -144,8 +157,8 @@ impl Manifest {
             }
         }
         let deps = if let Some(d) = specs
-        .and_then(|s| s.get("dependencies"))
-        .and_then(|v| v.as_map().ok())
+            .and_then(|s| s.get("dependencies"))
+            .and_then(|v| v.as_map().ok())
         {
             let mut m = IndexMap::new();
             for (k, v) in d {
@@ -154,18 +167,29 @@ impl Manifest {
             m
         } else { IndexMap::new() };
 
+        // ── [conflicts] ─────────────────────────────────────────────────────
+        let conflicts_sec = config.get("conflicts").and_then(|v| v.as_map().ok());
+        let mut conflicts = Vec::new();
+        if let Some(c) = conflicts_sec {
+            for (k, v) in c {
+                if is_empty_value(v) { conflicts.push(k.clone()); }
+            }
+        }
+
         // ── [sandbox] ───────────────────────────────────────────────────────
         let sandbox_sec = config.get("sandbox").and_then(|v| v.as_map().ok());
-        let (network, gui, dev, full_gui, filesystem, sandbox_disabled) = if let Some(s) = sandbox_sec {
-            let disabled = get_bool(s, "disabled");
-            let fs_map = s.get("filesystem").and_then(|v| v.as_map().ok());
-            let mut filesystem = Vec::new();
-            if let Some(fm) = fs_map {
-                for (k, v) in fm { if is_empty_value(v) { filesystem.push(k.clone()); } }
-            }
-            (get_bool(s, "network"), get_bool(s, "gui") || is_gui, get_bool(s, "dev"),
-             get_bool(s, "full_gui"), filesystem, disabled)
-        } else { (false, is_gui, false, false, Vec::new(), false) };
+        let (network, gui, dev, full_gui, filesystem, sandbox_disabled) =
+            if let Some(s) = sandbox_sec {
+                let disabled = get_bool(s, "disabled");
+                let fs_map = s.get("filesystem").and_then(|v| v.as_map().ok());
+                let mut filesystem = Vec::new();
+                if let Some(fm) = fs_map {
+                    for (k, v) in fm { if is_empty_value(v) { filesystem.push(k.clone()); } }
+                }
+                (get_bool(s, "network"), get_bool(s, "gui") || is_gui,
+                 get_bool(s, "dev"), get_bool(s, "full_gui"),
+                 filesystem, disabled)
+            } else { (false, is_gui, false, false, Vec::new(), false) };
 
         // ── [install] ───────────────────────────────────────────────────────
         let install_sec = config.get("install").and_then(|v| v.as_map().ok());
@@ -215,7 +239,7 @@ impl Manifest {
 
         Ok(Manifest {
             name, version, authors, license, summary, long,
-            system_specs, deps, bins, is_gui,
+            system_specs, deps, bins, bin_paths, is_gui, conflicts,
             sandbox: Sandbox { network, filesystem, gui, dev, full_gui },
             sandbox_disabled,
             install_commands,
