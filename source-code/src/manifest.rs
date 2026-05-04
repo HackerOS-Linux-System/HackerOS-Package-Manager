@@ -107,14 +107,14 @@ impl Manifest {
     pub fn load_from_path(path: &str) -> Result<Self> {
         let info_path = format!("{}/info.hk", path);
         let mut config = hk_parser::load_hk_file(&info_path)
-            .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
+        .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
         hk_parser::resolve_interpolations(&mut config)
-            .map_err(|e| miette!("Failed to resolve interpolations: {}", e))?;
+        .map_err(|e| miette!("Failed to resolve interpolations: {}", e))?;
 
         // ── [metadata] ──────────────────────────────────────────────────────
         let metadata = config.get("metadata")
-            .ok_or_else(|| miette!("Missing [metadata] section"))?
-            .as_map().map_err(|_| miette!("Invalid metadata"))?;
+        .ok_or_else(|| miette!("Missing [metadata] section"))?
+        .as_map().map_err(|_| miette!("Invalid metadata"))?;
 
         let name    = get_str(metadata, "name").ok_or_else(|| miette!("Missing name"))?;
         let version = get_str(metadata, "version").ok_or_else(|| miette!("Missing version"))?;
@@ -157,8 +157,8 @@ impl Manifest {
             }
         }
         let deps = if let Some(d) = specs
-            .and_then(|s| s.get("dependencies"))
-            .and_then(|v| v.as_map().ok())
+        .and_then(|s| s.get("dependencies"))
+        .and_then(|v| v.as_map().ok())
         {
             let mut m = IndexMap::new();
             for (k, v) in d {
@@ -179,17 +179,17 @@ impl Manifest {
         // ── [sandbox] ───────────────────────────────────────────────────────
         let sandbox_sec = config.get("sandbox").and_then(|v| v.as_map().ok());
         let (network, gui, dev, full_gui, filesystem, sandbox_disabled) =
-            if let Some(s) = sandbox_sec {
-                let disabled = get_bool(s, "disabled");
-                let fs_map = s.get("filesystem").and_then(|v| v.as_map().ok());
-                let mut filesystem = Vec::new();
-                if let Some(fm) = fs_map {
-                    for (k, v) in fm { if is_empty_value(v) { filesystem.push(k.clone()); } }
-                }
-                (get_bool(s, "network"), get_bool(s, "gui") || is_gui,
-                 get_bool(s, "dev"), get_bool(s, "full_gui"),
-                 filesystem, disabled)
-            } else { (false, is_gui, false, false, Vec::new(), false) };
+        if let Some(s) = sandbox_sec {
+            let disabled = get_bool(s, "disabled");
+            let fs_map = s.get("filesystem").and_then(|v| v.as_map().ok());
+            let mut filesystem = Vec::new();
+            if let Some(fm) = fs_map {
+                for (k, v) in fm { if is_empty_value(v) { filesystem.push(k.clone()); } }
+            }
+            (get_bool(s, "network"), get_bool(s, "gui") || is_gui,
+             get_bool(s, "dev"), get_bool(s, "full_gui"),
+             filesystem, disabled)
+        } else { (false, is_gui, false, false, Vec::new(), false) };
 
         // ── [install] ───────────────────────────────────────────────────────
         let install_sec = config.get("install").and_then(|v| v.as_map().ok());
