@@ -31,23 +31,23 @@ pub fn rollback(package: Option<String>) -> Result<()> {
 
 fn rollback_single_package(pkg_name: &str, state: &mut State) -> Result<()> {
     let prev_ver = state.get_previous_version(pkg_name)
-        .ok_or_else(|| miette::miette!(
-            "No previous version found for '{}'.\n\
-             Only one version is installed — nothing to roll back to.",
-            pkg_name
-        ))?;
+    .ok_or_else(|| miette::miette!(
+        "No previous version found for '{}'.\n\
+Only one version is installed — nothing to roll back to.",
+pkg_name
+    ))?;
 
     let current_ver = state.get_current_version(pkg_name).unwrap_or_default();
 
     println!("{} Rolling back {} from {} to {}",
-        "→".yellow(), pkg_name.cyan(), current_ver.cyan(), prev_ver.cyan());
+             "→".yellow(), pkg_name.cyan(), current_ver.cyan(), prev_ver.cyan());
 
     let prev_dir = Path::new(STORE_PATH).join(pkg_name).join(&prev_ver);
     if !prev_dir.exists() {
         return Err(miette::miette!(
             "Version {}@{} files not found in store.\n\
-             Run {} to diagnose.",
-            pkg_name, prev_ver, "hpm doctor".yellow()
+Run {} to diagnose.",
+pkg_name, prev_ver, "hpm doctor".yellow()
         ));
     }
 
@@ -71,7 +71,7 @@ fn rollback_single_package(pkg_name: &str, state: &mut State) -> Result<()> {
     }
 
     println!("{} {}@{} is now the current version",
-        "✔".green(), pkg_name.cyan(), prev_ver.cyan());
+             "✔".green(), pkg_name.cyan(), prev_ver.cyan());
     Ok(())
 }
 
@@ -108,7 +108,7 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     }
 
     let index: usize = input.parse()
-        .map_err(|_| miette::miette!("Invalid index: {}", input))?;
+    .map_err(|_| miette::miette!("Invalid index: {}", input))?;
 
     if index >= history.len() {
         return Err(miette::miette!("Index {} out of range (0..{})", index, history.len() - 1));
@@ -126,8 +126,8 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     for (name, vers) in &target_snapshot {
         for ver in vers.keys() {
             let in_current = current_pkgs.get(name)
-                .map(|vs| vs.contains_key(ver))
-                .unwrap_or(false);
+            .map(|vs| vs.contains_key(ver))
+            .unwrap_or(false);
             if !in_current {
                 to_install.push((name.clone(), ver.clone()));
             }
@@ -139,8 +139,8 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     for (name, vers) in &current_pkgs {
         for ver in vers.keys() {
             let in_target = target_snapshot.get(name)
-                .map(|vs| vs.contains_key(ver))
-                .unwrap_or(false);
+            .map(|vs| vs.contains_key(ver))
+            .unwrap_or(false);
             if !in_target {
                 to_remove.push((name.clone(), ver.clone()));
             }
@@ -194,8 +194,8 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
             println!("  {} Restored {}@{} (files in store)", "✔".green(), name.cyan(), ver);
         } else {
             println!("  {} {}@{} not in store — reinstall manually: {}",
-                "⚠".yellow(), name.cyan(), ver,
-                format!("sudo hpm install {}@{}", name, ver).yellow());
+                     "⚠".yellow(), name.cyan(), ver,
+                     format!("sudo hpm install {}@{}", name, ver).yellow());
         }
     }
 
