@@ -1,5 +1,4 @@
 // cargo
 // libseccomp-dev
 
-> cd source-code
 > cargo build --release
