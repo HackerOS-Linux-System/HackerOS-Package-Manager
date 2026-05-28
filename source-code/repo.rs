@@ -10,11 +10,9 @@ use dirs;
 
 const REPO_JSON_URL: &str = "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Package-Manager/main/repo/repo.json";
 
-/// TTL cache metadanych (1 godzina).
 const CACHE_TTL_SECS: u64 = 3600;
 
-/// Maksymalna liczba równoległych zapytań HTTP w search_lightweight.
-/// Zapobiega przeciążeniu przy dużych repozytoriach.
+/// Max równoległych HTTP w search_lightweight — zapobiega przeciążeniu przy 1000+ pakietach.
 const SEARCH_CONCURRENCY: usize = 20;
 
 fn meta_cache_dir() -> PathBuf {
@@ -34,8 +32,9 @@ fn repos_dir() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoIndex {
     pub packages: HashMap<String, PackageEntry>,
-    /// Mapa tagów grupowych: tag → lista nazw pakietów
-    /// Przykład: "development" → ["gcc", "make", "gdb", "rust"]
+    /// Mapa tagów grupowych: tag → lista nazw pakietów.
+    /// Przykład w repo.json:
+    ///   "tags": { "development": ["gcc","make","gdb"], "cli": ["htop","bat"] }
     #[serde(default)]
     pub tags: HashMap<String, Vec<String>>,
 }
@@ -45,7 +44,9 @@ pub struct PackageEntry {
     pub repo: String,
     #[serde(default)]
     pub versions: Vec<String>,
-    /// Tagi grupowe do których należy pakiet (np. "development", "cli")
+    /// Tagi grupowe do których należy ten pakiet (uzupełnienie globalnej mapy tags).
+    /// Przykład w repo.json:
+    ///   "packages": { "gcc": { "repo": "...", "tags": ["development","compilers"] } }
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -64,7 +65,7 @@ pub struct PackageVersion {
     pub deps: HashMap<String, String>,
 }
 
-/// Lekkie metadane (wyszukiwanie i podgląd info).
+/// Lekkie metadane (wyszukiwanie i podgląd).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageMeta {
     pub name: String,
@@ -75,7 +76,6 @@ pub struct PackageMeta {
     /// Tagi grupowe pakietu.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Unix timestamp pobrania.
     #[serde(default)]
     pub fetched_at: u64,
 }
@@ -164,6 +164,11 @@ fn load_cached_meta(pkg_name: &str) -> Option<PackageMeta> {
     serde_json::from_slice(&data).ok()
 }
 
+/// Publiczne API cache — używane przez install.rs.
+pub fn load_cached_meta_pub(pkg_name: &str) -> Option<PackageMeta> {
+    load_cached_meta(pkg_name)
+}
+
 fn save_cached_meta(meta: &PackageMeta) {
     let dir = meta_cache_dir();
     if fs::create_dir_all(&dir).is_err() { return; }
@@ -173,6 +178,7 @@ fn save_cached_meta(meta: &PackageMeta) {
     }
 }
 
+/// Unieważnij cache (wywoływane przez `hpm refresh`).
 pub fn invalidate_meta_cache() {
     let dir = meta_cache_dir();
     if !dir.exists() { return; }
@@ -238,18 +244,17 @@ impl RepoManager {
     // ── Tagi grupowe ─────────────────────────────────────────────────────────
 
     /// Zwróć listę nazw pakietów należących do danego tagu.
-    /// Przeszukuje zarówno globalną mapę `tags` w repo.json jak i
-    /// pole `tags` w każdym PackageEntry.
+    /// Łączy dwa źródła: globalną mapę `index.tags` i pole `tags` w PackageEntry.
     pub fn packages_for_tag(&self, tag: &str) -> Vec<String> {
         let tag_lower = tag.to_lowercase();
         let mut result = std::collections::HashSet::new();
 
-        // 1. Globalna mapa tagów w repo.json
+        // Źródło 1: globalna mapa tagów w repo.json
         if let Some(list) = self.index.tags.get(&tag_lower) {
             for name in list { result.insert(name.clone()); }
         }
 
-        // 2. Pole tags w każdym PackageEntry
+        // Źródło 2: pole tags w każdym PackageEntry
         for (name, entry) in &self.index.packages {
             if entry.tags.iter().any(|t| t.to_lowercase() == tag_lower) {
                 result.insert(name.clone());
@@ -315,7 +320,7 @@ impl RepoManager {
             let info_path = tmp.path().join("info.hk");
             if fs::write(&info_path, content).is_ok() {
                 if let Ok(manifest) = Manifest::load_from_path(tmp.path().to_str().unwrap()) {
-                    // Merge tagów: z manifestu + z PackageEntry
+                    // Merge: tagi z manifestu + tagi z PackageEntry
                     let mut merged_tags = manifest.tags.clone();
                     for t in entry_tags {
                         if !merged_tags.contains(t) { merged_tags.push(t.clone()); }
@@ -333,7 +338,7 @@ impl RepoManager {
             }
         }
 
-        // Fallback — prosta ekstrakcja z tekstu
+        // Fallback — prosta ekstrakcja linii
         let mut version = String::from("unknown");
         let mut summary = String::from("No description available");
         let mut authors = String::new();
@@ -352,6 +357,7 @@ impl RepoManager {
         }
     }
 
+    /// Pobierz metadane z cache lub sieci.
     pub async fn fetch_package_meta(&self, name: &str) -> Result<PackageMeta> {
         if let Some(cached) = load_cached_meta(name) {
             if !cached.is_stale() { return Ok(cached); }
@@ -365,10 +371,10 @@ impl RepoManager {
     }
 
     /// Wyszukiwanie z throttlingiem — max SEARCH_CONCURRENCY równoległych żądań.
-    /// Zapobiega OOM i przeciążeniu serwera przy 1000+ pakietach.
     pub async fn search_lightweight(&self, query: &str) -> Result<Vec<PackageMeta>> {
         let query_lower = query.to_lowercase();
 
+        // Kandydaci: filtruj po nazwie lub tagu już na etapie indeksu
         let candidates: Vec<(String, String, Vec<String>)> = if query_lower.is_empty() {
             self.index.packages.iter()
                 .map(|(n, e)| (n.clone(), e.repo.clone(), e.tags.clone()))
@@ -383,9 +389,9 @@ impl RepoManager {
                 .collect()
         };
 
-        // Throttling: podziel na chunki po SEARCH_CONCURRENCY
         let mut all_results: Vec<PackageMeta> = Vec::new();
 
+        // Przetwarzaj chunkami po SEARCH_CONCURRENCY
         for chunk in candidates.chunks(SEARCH_CONCURRENCY) {
             let futures_chunk: Vec<_> = chunk.iter().map(|(name, repo_url, entry_tags)| {
                 let client     = self.client.clone();
@@ -395,7 +401,7 @@ impl RepoManager {
                 let entry_tags = entry_tags.clone();
 
                 async move {
-                    // Sprawdź cache najpierw
+                    // Cache first
                     if let Some(cached) = load_cached_meta(&name) {
                         if !cached.is_stale() {
                             let matches = ql.is_empty()
@@ -405,8 +411,7 @@ impl RepoManager {
                             return if matches { Some(cached) } else { None };
                         }
                     }
-
-                    // Pobierz z sieci
+                    // Network fetch
                     match Self::fetch_raw_file(&client, &repo_url, "info.hk").await {
                         Ok(content) => {
                             let meta = Self::parse_meta_from_content(&name, &content, &entry_tags);
@@ -544,8 +549,8 @@ impl RepoManager {
     pub async fn refresh(&self) -> Result<()> { Ok(()) }
 
     pub fn build_index(&self) -> Result<HashMap<String, RepoPackage>> {
-        let repos_dir  = repos_dir();
-        let mut index  = HashMap::new();
+        let repos_dir = repos_dir();
+        let mut index = HashMap::new();
         for (name, _entry) in &self.index.packages {
             let repo_path = repos_dir.join(name);
             if !repo_path.exists() { continue; }
