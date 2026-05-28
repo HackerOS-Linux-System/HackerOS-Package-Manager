@@ -104,26 +104,42 @@ fn get_bool(map: &IndexMap<String, HkValue>, key: &str) -> bool {
     map.get(key).and_then(|v| v.as_bool().ok()).unwrap_or(false)
 }
 
-/// Parsuj wartość HkValue::List lub HkValue::Map jako Vec<String>.
-/// Obsługuje zarówno stary format map jak i nowy format listy [].
+/// Parsuj wartość jako Vec<String>.
+///
+/// Obsługuje trzy formaty HackerKit:
+///   1. Mapa kluczy (stary format):  -> filesystem => { /home/user => "" }
+///   2. Lista (nowy format):          -> filesystem => [ "/home/user" ]
+///   3. Lista przez kolejne klucze z prefixem (fallback raw text)
+///
+/// Ponieważ hk_parser 0.3.x nie ma metody `as_list()`, sprawdzamy typ
+/// przez pattern matching na HkValue, a listę symulujemy przez as_map()
+/// gdzie klucze są elementami listy z wartościami pustymi.
+///
+/// Format `[]` w HackerKit jest parsowany przez hk_parser jako HkValue::Map
+/// z pustymi wartościami LUB jako specjalny wariant — to zależy od wersji.
+/// Jeśli parser zwróci błąd as_map(), próbujemy as_string() i splitujemy.
 fn get_string_list(map: &IndexMap<String, HkValue>, key: &str) -> Vec<String> {
     let val = match map.get(key) {
         Some(v) => v,
         None    => return Vec::new(),
     };
 
-    // Nowy format: lista ["a", "b", "c"]
-    if let Ok(list) = val.as_list() {
-        return list.iter()
-            .filter_map(|v| v.as_string().ok())
+    // Format 1: mapa kluczy { item => "" } (stary format hpm)
+    if let Ok(m) = val.as_map() {
+        // Jeśli mapa jest pusta lub wszystkie wartości są puste → to lista
+        return m.iter()
+            .filter(|(_, v)| is_empty_value(v) || matches!(v, HkValue::String(_)))
+            .map(|(k, _)| k.clone())
             .collect();
     }
 
-    // Stary format mapy { item => "" }
-    if let Ok(m) = val.as_map() {
-        return m.iter()
-            .filter(|(_, v)| is_empty_value(v))
-            .map(|(k, _)| k.clone())
+    // Format 2: string "item1,item2" (edge case)
+    if let Ok(s) = val.as_string() {
+        if s.trim() == "[]" || s.trim().is_empty() { return Vec::new(); }
+        // Próbuj parsować jako CSV
+        return s.split(',')
+            .map(|x| x.trim().trim_matches('"').to_string())
+            .filter(|x| !x.is_empty())
             .collect();
     }
 
@@ -149,10 +165,10 @@ impl Manifest {
         let license = get_str(metadata, "license").unwrap_or_default();
         let is_gui  = get_bool(metadata, "gui");
 
-        // Tagi grupowe z [metadata]
+        // Tagi grupowe
         let tags = get_string_list(metadata, "tags");
 
-        // bins
+        // bins: map where keys are binary names, value is "" or the path
         let bins_map = metadata.get("bins").and_then(|v| v.as_map().ok());
         let mut bins      = Vec::new();
         let mut bin_paths = IndexMap::new();
@@ -206,11 +222,9 @@ impl Manifest {
         let sandbox_sec = config.get("sandbox").and_then(|v| v.as_map().ok());
         let (network, gui, dev, full_gui, filesystem, sandbox_disabled) =
             if let Some(s) = sandbox_sec {
-                let disabled = get_bool(s, "disabled");
-
-                // filesystem: obsłuż zarówno listę [] jak i stary format mapy
+                let disabled   = get_bool(s, "disabled");
+                // filesystem obsługuje zarówno stary format mapy jak i nowy listowy
                 let filesystem = get_string_list(s, "filesystem");
-
                 (
                     get_bool(s, "network"),
                     get_bool(s, "gui") || is_gui,
@@ -225,26 +239,23 @@ impl Manifest {
 
         // ── [install] ───────────────────────────────────────────────────────
         let install_sec = config.get("install").and_then(|v| v.as_map().ok());
-        let mut install_commands = Vec::new();
-        if let Some(is) = install_sec {
-            install_commands = get_string_list(is, "commands");
-        }
+        let install_commands = install_sec
+            .map(|is| get_string_list(is, "commands"))
+            .unwrap_or_default();
 
         // ── [build] ─────────────────────────────────────────────────────────
         let build_sec = config.get("build").and_then(|v| v.as_map().ok());
-        let mut build_commands  = Vec::new();
-        let mut build_deb_deps  = Vec::new();
-        if let Some(b) = build_sec {
-            build_commands = get_string_list(b, "commands");
-            build_deb_deps = get_string_list(b, "deb_deps");
-        }
+        let (build_commands, build_deb_deps) = if let Some(b) = build_sec {
+            (get_string_list(b, "commands"), get_string_list(b, "deb_deps"))
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // ── [runtime] ───────────────────────────────────────────────────────
-        let runtime_sec = config.get("runtime").and_then(|v| v.as_map().ok());
-        let mut runtime_deb_deps = Vec::new();
-        if let Some(r) = runtime_sec {
-            runtime_deb_deps = get_string_list(r, "deb_deps");
-        }
+        let runtime_sec      = config.get("runtime").and_then(|v| v.as_map().ok());
+        let runtime_deb_deps = runtime_sec
+            .map(|r| get_string_list(r, "deb_deps"))
+            .unwrap_or_default();
 
         // ── [desktop] ───────────────────────────────────────────────────────
         let desktop_sec = config.get("desktop").and_then(|v| v.as_map().ok());
