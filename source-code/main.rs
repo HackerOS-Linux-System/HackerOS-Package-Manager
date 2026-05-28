@@ -104,7 +104,7 @@ fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// hpm tags — wypisz dostępne tagi grupowe
+// hpm tags
 // ---------------------------------------------------------------------------
 
 fn cmd_tags() -> Result<()> {
@@ -116,13 +116,21 @@ fn cmd_tags() -> Result<()> {
     }
     println!("{} Available group tags:\n", "→".blue());
     for tag in &tags {
-        let pkgs = repo_mgr.packages_for_tag(tag);
-        println!("  {} {:20} {} package(s): {}",
+        let pkgs  = repo_mgr.packages_for_tag(tag);
+        let count = pkgs.len();
+        // FIXED: avoid temporary value dropped while borrowed
+        let preview: Vec<&str> = pkgs.iter().take(5).map(|p| p.as_str()).collect();
+        let suffix = if count > 5 {
+            format!(" +{} more", count - 5)
+        } else {
+            String::new()
+        };
+        println!("  {} {:20} {} package(s): {}{}",
             "◆".cyan(),
             format!("@{}", tag).green(),
-            pkgs.len(),
-            pkgs.iter().take(5).map(|p| p.as_str()).collect::<Vec<_>>().join(", ")
-            + if pkgs.len() > 5 { &format!(" +{} more", pkgs.len() - 5) } else { "" }
+            count,
+            preview.join(", "),
+            suffix
         );
     }
     println!();
@@ -140,52 +148,51 @@ fn print_help() {
     println!("{}  hpm {} [options]\n", "Usage:".bold(), "<command>".yellow());
 
     println!("{}", "Package Commands:".bold().underline());
-    println!("  {:<36} {}", "refresh".green(),                          "Update index and pre-fetch metadata");
-    println!("  {:<36} {}", "install <pkg>[@<ver>]...".green(),         "Install packages (atomic, resolves deps)");
-    println!("  {:<36} {}", "install @<tag>".green(),                   "Install all packages with group tag");
-    println!("  {:<36} {}", "remove <pkg>[@<ver>]".green(),             "Remove package (warns on reverse deps)");
-    println!("  {:<36} {}", "autoremove".green(),                       "Remove orphaned auto-installed packages");
-    println!("  {:<36} {}", "update".green(),                           "Update all packages (incremental fetch)");
-    println!("  {:<36} {}", "upgrade".green(),                          "Upgrade hpm itself");
-    println!("  {:<36} {}", "switch <pkg> <ver>".green(),               "Switch active version of a package");
-    println!("  {:<36} {}", "rollback [<pkg>]".green(),                 "Restore previous state or package version");
+    println!("  {:<36} {}", "refresh".green(),                    "Update index and pre-fetch metadata");
+    println!("  {:<36} {}", "install <pkg>[@<ver>]...".green(),   "Install packages (atomic, resolves deps)");
+    println!("  {:<36} {}", "install @<tag>".green(),             "Install all packages with group tag");
+    println!("  {:<36} {}", "remove <pkg>[@<ver>]".green(),       "Remove package (warns on reverse deps)");
+    println!("  {:<36} {}", "autoremove".green(),                 "Remove orphaned auto-installed packages");
+    println!("  {:<36} {}", "update".green(),                     "Update all packages (incremental fetch)");
+    println!("  {:<36} {}", "upgrade".green(),                    "Upgrade hpm itself");
+    println!("  {:<36} {}", "switch <pkg> <ver>".green(),         "Switch active version of a package");
+    println!("  {:<36} {}", "rollback [<pkg>]".green(),           "Restore previous state or package version");
 
     println!();
     println!("{}", "Query Commands:".bold().underline());
-    println!("  {:<36} {}", "search <query>".green(),                   "Search by name/description (cached HTTP)");
-    println!("  {:<36} {}", "info <package>".green(),                   "Show package details");
-    println!("  {:<36} {}", "list".green(),                             "List all installed packages");
-    println!("  {:<36} {}", "outdated".green(),                         "Show packages with updates available");
-    println!("  {:<36} {}", "deps <pkg>[@<ver>]".green(),               "Show full dependency tree");
-    println!("  {:<36} {}", "tags".green(),                             "List available group tags");
+    println!("  {:<36} {}", "search <query|@tag>".green(),        "Search by name/tag/description");
+    println!("  {:<36} {}", "info <package>".green(),             "Show package details");
+    println!("  {:<36} {}", "list".green(),                       "List all installed packages");
+    println!("  {:<36} {}", "outdated".green(),                   "Show packages with updates available");
+    println!("  {:<36} {}", "deps <pkg>[@<ver>]".green(),         "Show full dependency tree");
+    println!("  {:<36} {}", "tags".green(),                       "List available group tags");
 
     println!();
     println!("{}", "Maintenance Commands:".bold().underline());
-    println!("  {:<36} {}", "run <pkg> <bin> [args]".green(),           "Run a binary (sandboxed)");
-    println!("  {:<36} {}", "build <name>".green(),                     "Package current directory");
-    println!("  {:<36} {}", "clean".green(),                            "Remove cached git repos + temp files");
-    println!("  {:<36} {}", "verify <package>".green(),                 "Verify package integrity (SHA-256)");
-    println!("  {:<36} {}", "pin <pkg> <ver>".green(),                  "Pin a package version");
-    println!("  {:<36} {}", "unpin <pkg>".green(),                      "Unpin current version");
-    println!("  {:<36} {}", "doctor".green(),                           "Diagnose store/state/wrapper consistency");
-    println!("  {:<36} {}", "repair".green(),                           "Auto-fix issues found by doctor");
+    println!("  {:<36} {}", "run <pkg> <bin> [args]".green(),     "Run a binary (sandboxed)");
+    println!("  {:<36} {}", "build <name>".green(),               "Package current directory");
+    println!("  {:<36} {}", "clean".green(),                      "Remove cached git repos + temp files");
+    println!("  {:<36} {}", "verify <package>".green(),           "Verify package integrity (SHA-256)");
+    println!("  {:<36} {}", "pin <pkg> <ver>".green(),            "Pin a package version");
+    println!("  {:<36} {}", "unpin <pkg>".green(),                "Unpin current version");
+    println!("  {:<36} {}", "doctor".green(),                     "Diagnose store/state/wrapper consistency");
+    println!("  {:<36} {}", "repair".green(),                     "Auto-fix issues found by doctor");
 
     println!();
     println!("{}", "Development Commands:".bold().underline());
-    println!("  {:<36} {}", "create [<name>]".green(),                  "Interactive package creation wizard");
+    println!("  {:<36} {}", "create [<name>]".green(),            "Interactive package creation wizard");
 
     println!();
     println!("{}", "Options:".bold().underline());
-    println!("  {}, {:<26} {}", "-h".yellow(), "--help".yellow(),       "Show this help");
-    println!("  {}, {:<26} {}", "-V".yellow(), "--version".yellow(),    "Show version");
+    println!("  {}, {:<26} {}", "-h".yellow(), "--help".yellow(),    "Show this help");
+    println!("  {}, {:<26} {}", "-V".yellow(), "--version".yellow(), "Show version");
 
     println!();
     println!("{}", "Group tags:".bold().underline());
-    println!("  Install all packages in a category:");
-    println!("    {}", "hpm install @development".yellow());
-    println!("    {}", "hpm install @cli @tools".yellow());
-    println!("  List available tags:");
-    println!("    {}", "hpm tags".yellow());
+    println!("  {}", "hpm install @development".yellow());
+    println!("  {}", "hpm install @cli @tools".yellow());
+    println!("  {}", "hpm search @development".yellow());
+    println!("  {}", "hpm tags".yellow());
 
     println!();
     println!("{}", "Package repository format:".bold().underline());
