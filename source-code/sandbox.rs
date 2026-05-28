@@ -1,5 +1,6 @@
 use crate::manifest::{Manifest, Sandbox};
 use miette::{Result, bail, miette, IntoDiagnostic};
+use colored::Colorize;
 use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
     RulesetStatus, ABI,
@@ -16,7 +17,7 @@ use seccomp::{Action, Context as SeccompContext, Rule, Compare, Op};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{create_dir_all, File};
-use std::io::Write;
+use std::io::Write as IoWrite;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -89,20 +90,17 @@ fn pick_mode(manifest: &Manifest) -> SandboxMode {
     if s.gui || s.full_gui || s.network || !s.filesystem.is_empty() {
         return SandboxMode::Compat;
     }
-    // Sprawdź czy mamy uprawnienia do tworzenia user namespace
     if !can_use_user_ns() {
         return SandboxMode::Compat;
     }
     SandboxMode::Full
 }
 
-/// Sprawdź czy user namespaces są dostępne (kernel ≥ 3.8, odpowiednie uprawnienia).
+/// Sprawdź czy user namespaces są dostępne.
 fn can_use_user_ns() -> bool {
-    // Sprawdź /proc/sys/kernel/unprivileged_userns_clone (Debian/Ubuntu)
     if let Ok(v) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
         if v.trim() == "0" { return false; }
     }
-    // Sprawdź /proc/sys/user/max_user_namespaces
     if let Ok(v) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
         if v.trim() == "0" { return false; }
     }
@@ -134,7 +132,7 @@ fn exec_direct(
 }
 
 // ---------------------------------------------------------------------------
-// Compat mode — mount namespace only
+// Compat mode
 // ---------------------------------------------------------------------------
 
 fn run_compat(
@@ -167,16 +165,12 @@ fn compat_setup(
     extra_args: Vec<String>,
     test: bool,
 ) -> Result<()> {
-    // CLONE_NEWNS wymaga CAP_SYS_ADMIN lub uprawnień do tworzenia namespace
-    // Jeśli zawiedzie, fallback do bezpośredniego exec
     if unshare(CloneFlags::CLONE_NEWNS).is_ok() {
         let _ = mount(None::<&str>, "/", None::<&str>,
                       MsFlags::MS_PRIVATE | MsFlags::MS_REC, None::<&str>);
     }
-
     apply_resource_limits(ResourceLimits::for_run())?;
     setup_seccomp()?;
-
     if test { return Ok(()); }
     exec_from_path(path, is_install, &manifest.install_commands, bin, extra_args)
 }
@@ -242,19 +236,19 @@ fn full_setup(
     let display = env::var("DISPLAY").ok();
     setup_mounts(&new_root, path, &manifest.sandbox, display.as_ref())?;
 
-    // pivot_root — z fallbackiem dla systemów bez /sbin/pivot_root
+    // pivot_root z fallbackiem do chroot
     if let Err(e) = pivot_and_chdir(&new_root) {
-        // Fallback: chroot zamiast pivot_root
-        eprintln!("  {} pivot_root failed ({}), falling back to chroot", "⚠".yellow(), e);
+        eprintln!("  {} pivot_root failed ({}), falling back to chroot",
+                  "⚠".yellow(), e);
         nix::unistd::chroot(&new_root).into_diagnostic()?;
         chdir("/").into_diagnostic()?;
     }
 
     apply_resource_limits(limits)?;
 
-    // Landlock z fallbackiem dla starszych kerneli
+    // Landlock z fallbackiem dla starszych kerneli (< 5.13)
     if let Err(e) = setup_landlock(manifest) {
-        eprintln!("  {} Landlock unavailable ({}), continuing without filesystem restrictions",
+        eprintln!("  {} Landlock unavailable ({}), continuing without fs restrictions",
                   "⚠".yellow(), e);
     }
 
@@ -279,23 +273,20 @@ fn wait_child(child: nix::unistd::Pid, read_fd: OwnedFd) -> Result<()> {
         let mut buf = vec![0u8; 4096];
         let n   = read(read_fd.as_raw_fd(), &mut buf).unwrap_or(0);
         let msg = String::from_utf8_lossy(&buf[0..n]);
-        if msg.is_empty() {
-            bail!("Process exited with code {}", code);
-        }
+        if msg.is_empty() { bail!("Process exited with code {}", code); }
         bail!("Sandbox error: {}", msg.trim());
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// User mapping — z weryfikacją uprawnień
+// User mapping
 // ---------------------------------------------------------------------------
 
 fn setup_user_mapping() -> Result<()> {
     let uid = Uid::current();
     let gid = Gid::current();
 
-    // Sprawdź czy możemy pisać do uid_map (wymaga CLONE_NEWUSER)
     let uid_map_path = "/proc/self/uid_map";
     if !Path::new(uid_map_path).exists() {
         bail!("User namespace not available — /proc/self/uid_map missing");
@@ -318,7 +309,7 @@ fn setup_user_mapping() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Mounts (full mode)
+// Mounts
 // ---------------------------------------------------------------------------
 
 fn setup_mounts(new_root: &Path, path: &str, sandbox: &Sandbox, display: Option<&String>) -> Result<()> {
@@ -350,9 +341,7 @@ fn setup_mounts(new_root: &Path, path: &str, sandbox: &Sandbox, display: Option<
         }
     }
 
-    if sandbox.gui || sandbox.full_gui {
-        bind_gui_sockets(new_root)?;
-    }
+    if sandbox.gui || sandbox.full_gui { bind_gui_sockets(new_root)?; }
 
     if sandbox.dev || sandbox.gui || sandbox.full_gui {
         setup_dev(new_root, sandbox.full_gui)?;
@@ -361,8 +350,11 @@ fn setup_mounts(new_root: &Path, path: &str, sandbox: &Sandbox, display: Option<
         create_dir_all(&dev).into_diagnostic()?;
         mount(Some("tmpfs"), dev.to_str().unwrap(), Some("tmpfs"), MsFlags::empty(), None::<&str>)
             .into_diagnostic()?;
-        for (name, maj, min) in &[("null",1u64,3u64),("zero",1,5),("random",1,8),("urandom",1,9),("tty",5,0)] {
-            let _ = mknod(&dev.join(name), SFlag::S_IFCHR, MkMode::from_bits_truncate(0o666), makedev(*maj, *min));
+        for (name, maj, min) in &[
+            ("null",1u64,3u64),("zero",1,5),("random",1,8),("urandom",1,9),("tty",5,0)
+        ] {
+            let _ = mknod(&dev.join(name), SFlag::S_IFCHR,
+                          MkMode::from_bits_truncate(0o666), makedev(*maj, *min));
         }
     }
 
@@ -396,10 +388,10 @@ fn bind_gui_sockets(new_root: &Path) -> Result<()> {
               MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>).into_diagnostic()?;
     }
     if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-        bind_socket_if_exists(&format!("{}/wayland-0", runtime_dir), new_root)?;
-        bind_socket_if_exists(&format!("{}/bus",       runtime_dir), new_root)?;
-        bind_socket_if_exists(&format!("{}/pipewire-0",runtime_dir), new_root)?;
-        bind_dir_if_exists   (&format!("{}/pulse",     runtime_dir), new_root)?;
+        bind_socket_if_exists(&format!("{}/wayland-0",  runtime_dir), new_root)?;
+        bind_socket_if_exists(&format!("{}/bus",        runtime_dir), new_root)?;
+        bind_socket_if_exists(&format!("{}/pipewire-0", runtime_dir), new_root)?;
+        bind_dir_if_exists   (&format!("{}/pulse",      runtime_dir), new_root)?;
     }
     if Path::new("/dev/dri").exists() {
         let dri = new_root.join("dev/dri");
@@ -451,7 +443,7 @@ fn setup_dev(new_root: &Path, full_gui: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// pivot_root — z fallbackiem
+// pivot_root z fallbackiem
 // ---------------------------------------------------------------------------
 
 fn pivot_and_chdir(new_root: &Path) -> Result<()> {
@@ -479,17 +471,12 @@ fn apply_resource_limits(limits: ResourceLimits) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Landlock — z fallbackiem dla starszych kerneli (< 5.13)
+// Landlock z fallbackiem dla starszych kerneli
 // ---------------------------------------------------------------------------
 
 fn setup_landlock(manifest: &Manifest) -> Result<()> {
-    // Sprawdź dostępność Landlock przez próbę tworzenia ruleset z najwyższym ABI
-    // i degraduj do niższego jeśli nie działa.
-    let abi = best_landlock_abi();
-    if abi.is_none() {
-        bail!("Landlock not supported by this kernel (requires Linux 5.13+)");
-    }
-    let abi = abi.unwrap();
+    let abi = best_landlock_abi()
+        .ok_or_else(|| miette!("Landlock not supported (requires Linux 5.13+)"))?;
 
     let mut ruleset = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
@@ -504,59 +491,67 @@ fn setup_landlock(manifest: &Manifest) -> Result<()> {
         if !Path::new(path).exists() { continue; }
         ruleset = ruleset.add_rule(
             PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?, ro)
-        ).map_err(|e| miette!("Landlock: {}", e))?;
+        ).map_err(|e| miette!("Landlock add_rule: {}", e))?;
     }
     for path in &["/proc", "/sys"] {
         if !Path::new(path).exists() { continue; }
         ruleset = ruleset.add_rule(
-            PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?,
-                             AccessFs::ReadFile | AccessFs::ReadDir)
-        ).map_err(|e| miette!("Landlock: {}", e))?;
+            PathBeneath::new(
+                PathFd::new(path).map_err(|e| miette!("{}", e))?,
+                AccessFs::ReadFile | AccessFs::ReadDir,
+            )
+        ).map_err(|e| miette!("Landlock add_rule: {}", e))?;
     }
     for path in &["/app", "/tmp"] {
         if !Path::new(path).exists() { continue; }
         ruleset = ruleset.add_rule(
             PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?, rw)
-        ).map_err(|e| miette!("Landlock: {}", e))?;
+        ).map_err(|e| miette!("Landlock add_rule: {}", e))?;
     }
     if let Ok(home) = env::var("HOME") {
         if Path::new(&home).exists() {
             ruleset = ruleset.add_rule(
                 PathBeneath::new(PathFd::new(&home).map_err(|e| miette!("{}", e))?, rw)
-            ).map_err(|e| miette!("Landlock: {}", e))?;
+            ).map_err(|e| miette!("Landlock add_rule: {}", e))?;
         }
     }
     if manifest.sandbox.dev && Path::new("/dev").exists() {
         ruleset = ruleset.add_rule(
             PathBeneath::new(PathFd::new("/dev").map_err(|e| miette!("{}", e))?, rw)
-        ).map_err(|e| miette!("Landlock: {}", e))?;
+        ).map_err(|e| miette!("Landlock add_rule: {}", e))?;
     }
     for fs_p in &manifest.sandbox.filesystem {
         if !Path::new(fs_p).exists() { continue; }
         ruleset = ruleset.add_rule(
             PathBeneath::new(PathFd::new(fs_p).map_err(|e| miette!("{}", e))?, rw)
-        ).map_err(|e| miette!("Landlock: {}", e))?;
+        ).map_err(|e| miette!("Landlock add_rule: {}", e))?;
     }
 
     let status = ruleset.restrict_self()
         .map_err(|e| miette!("Landlock restrict_self: {}", e))?;
 
-    // Sprawdź czy reguły zostały faktycznie zastosowane
     if status.ruleset == RulesetStatus::NotEnforced {
-        bail!("Landlock rules were not enforced (kernel too old or disabled)");
+        bail!("Landlock rules not enforced (kernel too old or disabled)");
     }
-
     Ok(())
 }
 
-/// Zwróć najlepsze dostępne ABI Landlock lub None jeśli nieobsługiwane.
+/// Wykryj najlepsze dostępne ABI Landlock.
 fn best_landlock_abi() -> Option<ABI> {
-    // Próbuj od najwyższego do najniższego
+    // Sprawdź przez /proc/sys/kernel/landlock/abi jeśli dostępny
+    if let Ok(v) = std::fs::read_to_string("/proc/sys/kernel/landlock/abi") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            return match n {
+                0         => None,
+                1         => Some(ABI::V1),
+                2         => Some(ABI::V2),
+                _         => Some(ABI::V3),
+            };
+        }
+    }
+    // Fallback: próbuj od najwyższego
     for abi in [ABI::V3, ABI::V2, ABI::V1] {
-        // Sprawdź przez probe — utwórz tymczasowy ruleset
-        let probe = Ruleset::default()
-            .handle_access(AccessFs::from_all(abi));
-        if probe.is_ok() {
+        if Ruleset::default().handle_access(AccessFs::from_all(abi)).is_ok() {
             return Some(abi);
         }
     }
@@ -564,16 +559,22 @@ fn best_landlock_abi() -> Option<ABI> {
 }
 
 // ---------------------------------------------------------------------------
-// Seccomp — FIXED: poprawny comparator zamiast hacka "zawsze prawda"
+// Seccomp — FIXED
+//
+// seccomp 0.1.2 nie ma Op::MaskedEq.
+// Poprawne podejście: używamy dwóch reguł dla każdego syscalla pokrywających
+// arg0 == 0 i arg0 != 0 (czyli cały zakres), albo jeszcze prościej:
+// używamy Op::Ge z wartością 0 dla u64 (co jest faktycznie zawsze true dla
+// unsigned) — to był oryginalny kod. Zostawiamy ten idiom jako jedyny
+// działający w 0.1.2, z komentarzem wyjaśniającym.
+//
+// Alternatywa: upgrade seccomp do 0.1.3+ lub użycie libseccomp-sys bezpośrednio.
 // ---------------------------------------------------------------------------
 
 fn setup_seccomp() -> Result<()> {
     let mut ctx = SeccompContext::default(Action::Allow)
         .map_err(|e| miette!("Seccomp context: {}", e))?;
 
-    // Deny bez dodatkowych warunków — Action::Errno bez Rule::new (używamy globalnego deny)
-    // seccomp 0.1.2 API: Rule::new(syscall_nr, comparator, action)
-    // Używamy prostego warunku: arg0 == arg0 (zawsze true) ale poprawnie zbudowanego
     for &nr in &[
         libc::SYS_kexec_load,
         libc::SYS_kexec_file_load,
@@ -597,30 +598,29 @@ fn setup_seccomp() -> Result<()> {
         libc::SYS_bpf,
         libc::SYS_userfaultfd,
     ] {
-        deny_syscall_unconditional(&mut ctx, nr)?;
+        deny_syscall(&mut ctx, nr)?;
     }
 
     ctx.load().map_err(|e| miette!("Seccomp load: {}", e))?;
     Ok(())
 }
 
-/// Odrzuć syscall bezwarunkowo — używa najniższej wartości arg jako zawsze-true comparatora.
-/// FIXED: zamiast `Compare::arg(0).using(Op::Ge).with(0)` (hack) używamy właściwego podejścia.
-fn deny_syscall_unconditional(ctx: &mut SeccompContext, nr: i64) -> Result<()> {
-    // Comparator: arg0 >= 0 jest zawsze prawdziwy dla u64, ale to był hack.
-    // Poprawne podejście w seccomp 0.1.2: Compare::arg(0).using(Op::Eq).with(0)
-    // z Op::MaskedEq mask=0 — cokolwiek & 0 == 0, zawsze true.
-    // Alternatywnie: użyj dwóch reguł pokrywających obie gałęzie (== 0 i != 0).
-    // Najprostsze rozwiązanie kompatybilne z 0.1.2: unconditional poprzez dodanie
-    // reguły dla każdej wartości jest niemożliwe, więc używamy MaskedEq z maską 0.
+/// Odrzuć syscall bezwarunkowo.
+///
+/// W seccomp 0.1.2 jedynym działającym "always true" comparatorem jest
+/// `Op::Ge` z wartością 0 — dla u64 każda wartość >= 0, więc reguła zawsze
+/// pasuje. To jest znane ograniczenie tej wersji crate.
+/// Upgrade do libseccomp-sys dałby `SCMP_A_LAST` (brak warunku).
+fn deny_syscall(ctx: &mut SeccompContext, nr: i64) -> Result<()> {
+    // arg0 >= 0 — always true for u64, działa jako unconditional w 0.1.2
     let cmp = Compare::arg(0)
-        .using(Op::MaskedEq(0))
+        .using(Op::Ge)
         .with(0)
         .build()
         .ok_or_else(|| miette!("Failed to build seccomp comparator for syscall {}", nr))?;
 
     let rule = Rule::new(nr as usize, cmp, Action::Errno(libc::EPERM));
-    ctx.add_rule(rule).map_err(|e| miette!("seccomp add_rule for {}: {}", nr, e))
+    ctx.add_rule(rule).map_err(|e| miette!("seccomp add_rule {}: {}", nr, e))
 }
 
 // ---------------------------------------------------------------------------
