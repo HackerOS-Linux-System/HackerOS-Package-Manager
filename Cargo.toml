@@ -1,10 +1,10 @@
 [package]
-name = "hpm"
-version = "0.8.0"
-edition = "2021"
-authors = ["HackerOS Team <hackeros068@gmail.com>"]
+name        = "hpm"
+version     = "0.8.0"
+edition     = "2021"
+authors     = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "Hacker Package Manager – nowoczesny menedżer pakietów oparty na repozytoriach git"
-license = "GPL-3.0"
+license     = "GPL-3.0"
 
 [[bin]]
 name = "hpm"
@@ -25,13 +25,13 @@ hex          = "0.4"
 walkdir      = "2"
 landlock     = "0.3"
 nix          = { version = "0.29", features = [
-  "fs", "mount", "process", "sched", "user",
-  "resource", "ioctl", "term", "hostname", "signal"
+    "fs", "mount", "process", "sched", "user",
+    "resource", "ioctl", "term", "hostname", "signal"
 ] }
-seccomp      = "0.1.2"
+# libseccomp-sys zamiast seccomp 0.1.2 — daje pełną kontrolę (unconditional deny, MaskedEq itp.)
+libseccomp   = "0.3"
 libc         = "0.2"
 scopeguard   = "1.2"
-chrono       = "0.4"
 fs2          = "0.4"
 tempfile     = "3.8"
 tokio        = { version = "1", features = ["rt", "macros"] }
@@ -39,10 +39,11 @@ futures      = "0.3"
 dirs         = "5.0"
 miette       = { version = "5.10", features = ["fancy"] }
 thiserror    = "1.0"
-
-# native-tls uses the system OpenSSL — no gcc/ring compilation needed.
-# If SSL errors appear: sudo apt install ca-certificates && sudo update-ca-certificates
+gpgme        = "0.11"
 reqwest = { version = "0.11", default-features = false, features = [
-  "json",
-  "native-tls",
+    "json",
+    "native-tls",
 ] }
+
+[dev-dependencies]
+tempfile = "3.8"
