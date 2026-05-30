@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.hackeros.GlyphEditor" path="/io/hackeros/GlyphEditor/">
+
+    <key name="font-family" type="s">
+      <default>'JetBrains Mono'</default>
+      <summary>Editor font family</summary>
+    </key>
+
+    <key name="font-size" type="i">
+      <default>13</default>
+      <range min="8" max="32"/>
+      <summary>Editor font size in points</summary>
+    </key>
+
+    <key name="tab-width" type="i">
+      <default>4</default>
+      <range min="2" max="8"/>
+      <summary>Number of spaces per tab stop</summary>
+    </key>
+
+    <key name="use-spaces" type="b">
+      <default>true</default>
+      <summary>Insert spaces instead of tabs</summary>
+    </key>
+
+    <key name="show-line-numbers" type="b">
+      <default>true</default>
+      <summary>Show line numbers in the gutter</summary>
+    </key>
+
+    <key name="highlight-current-line" type="b">
+      <default>true</default>
+      <summary>Highlight the line containing the cursor</summary>
+    </key>
+
+    <key name="color-scheme" type="s">
+      <default>'Adwaita-dark'</default>
+      <summary>GtkSourceView color scheme ID</summary>
+    </key>
+
+    <key name="window-width" type="i">
+      <default>900</default>
+      <summary>Last window width</summary>
+    </key>
+
+    <key name="window-height" type="i">
+      <default>650</default>
+      <summary>Last window height</summary>
+    </key>
+
+    <key name="window-maximized" type="b">
+      <default>false</default>
+      <summary>Whether the window is maximized</summary>
+    </key>
+
+  </schema>
+</schemalist>
