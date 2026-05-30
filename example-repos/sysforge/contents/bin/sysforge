@@ -1,0 +1,548 @@
+#!/bin/sh
+# sysforge — Advanced system profiler, monitor and security auditor
+# HackerOS Package Manager example — advanced package
+# Real implementation would be a statically-linked Rust binary.
+# This shell script demonstrates the full CLI surface.
+
+set -e
+
+VERSION="2.1.0"
+DAEMON_SOCKET="/run/sysforge/sysforge.sock"
+CONFIG_DIR="/etc/sysforge"
+DATA_DIR="/var/lib/sysforge"
+LOG_DIR="/var/log/sysforge"
+
+# ── ANSI colors ──────────────────────────────────────────────────────────────
+R="\033[0;31m"   B="\033[0;34m"   G="\033[0;32m"
+Y="\033[0;33m"   C="\033[0;36m"   M="\033[0;35m"
+W="\033[0;37m"   BOLD="\033[1m"   DIM="\033[2m"   RESET="\033[0m"
+
+die()  { printf "${R}✗${RESET} %s\n" "$*" >&2; exit 1; }
+info() { printf "${C}→${RESET} %s\n" "$*"; }
+ok()   { printf "${G}✔${RESET} %s\n" "$*"; }
+warn() { printf "${Y}⚠${RESET} %s\n" "$*"; }
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+require_root() {
+    [ "$(id -u)" = "0" ] || die "This operation requires root privileges"
+}
+
+require_kernel() {
+    local min="$1"
+    local cur
+    cur=$(uname -r | cut -d. -f1-2 | tr -d '.')
+    local min_n
+    min_n=$(echo "$min" | tr -d '.')
+    [ "$cur" -ge "$min_n" ] || die "Kernel $min+ required (current: $(uname -r))"
+}
+
+check_ebpf() {
+    [ -d /sys/kernel/debug/tracing ] || die "eBPF tracing requires debugfs mounted and kernel 5.15+"
+    [ -f /proc/sys/kernel/perf_event_paranoid ] || die "perf_event not available"
+    local paranoid
+    paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)
+    [ "$paranoid" -le 1 ] || warn "perf_event_paranoid=$paranoid — some traces may be restricted"
+}
+
+human_bytes() {
+    local b="$1"
+    if   [ "$b" -gt 1073741824 ]; then printf "%.1f GiB" "$(echo "$b / 1073741824" | awk '{printf "%.1f", $1}')";
+    elif [ "$b" -gt 1048576 ];    then printf "%.1f MiB" "$(echo "$b / 1048576"    | awk '{printf "%.1f", $1}')";
+    elif [ "$b" -gt 1024 ];       then printf "%.1f KiB" "$(echo "$b / 1024"       | awk '{printf "%.1f", $1}')";
+    else printf "%d B" "$b"; fi
+}
+
+# ── CPU monitoring ───────────────────────────────────────────────────────────
+
+cmd_cpu() {
+    local interval="${1:-1}" count="${2:-5}"
+    info "CPU monitoring (interval=${interval}s, samples=${count})"
+    printf "${BOLD}%-8s %-8s %-8s %-8s %-8s %-8s${RESET}\n" \
+           "user%" "nice%" "system%" "idle%" "iowait%" "steal%"
+    printf "%s\n" "$(printf '─%.0s' $(seq 1 50))"
+
+    i=0
+    while [ "$i" -lt "$count" ]; do
+        local line
+        line=$(grep '^cpu ' /proc/stat)
+        # shellcheck disable=SC2086
+        set -- $line
+        local user=$2 nice=$3 sys=$4 idle=$5 iowait=$6 irq=$7 softirq=$8 steal=$9
+        local total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
+        local active=$((total - idle - iowait))
+        printf "${G}%-8s${RESET} ${Y}%-8s${RESET} ${R}%-8s${RESET} ${DIM}%-8s${RESET} ${M}%-8s${RESET} ${B}%-8s${RESET}\n" \
+            "$(echo "$user $total" | awk '{printf "%.1f%%", $1/$2*100}')" \
+            "$(echo "$nice $total" | awk '{printf "%.1f%%", $1/$2*100}')" \
+            "$(echo "$sys  $total" | awk '{printf "%.1f%%", $1/$2*100}')" \
+            "$(echo "$idle $total" | awk '{printf "%.1f%%", $1/$2*100}')" \
+            "$(echo "$iowait $total" | awk '{printf "%.1f%%", $1/$2*100}')" \
+            "$(echo "$steal $total" | awk '{printf "%.1f%%", $1/$2*100}')"
+        sleep "$interval"
+        i=$((i + 1))
+    done
+}
+
+# ── Memory analysis ──────────────────────────────────────────────────────────
+
+cmd_mem() {
+    info "Memory analysis"
+    printf "\n${BOLD}  Physical Memory:${RESET}\n"
+
+    while IFS=: read -r key val; do
+        val=$(echo "$val" | tr -d ' kB')
+        case "$key" in
+            MemTotal)    total="$val" ;;
+            MemFree)     free="$val" ;;
+            MemAvailable) avail="$val" ;;
+            Buffers)     buf="$val" ;;
+            Cached)      cached="$val" ;;
+            SwapTotal)   stotal="$val" ;;
+            SwapFree)    sfree="$val" ;;
+        esac
+    done < /proc/meminfo
+
+    local used=$((total - free - buf - cached))
+    local pct
+    pct=$(echo "$used $total" | awk '{printf "%d", $1/$2*100}')
+
+    printf "  %-20s %s\n" "Total:"     "$(human_bytes $((total * 1024)))"
+    printf "  %-20s %s\n" "Used:"      "${R}$(human_bytes $((used  * 1024)))${RESET} (${pct}%)"
+    printf "  %-20s %s\n" "Available:" "${G}$(human_bytes $((avail * 1024)))${RESET}"
+    printf "  %-20s %s\n" "Buffers:"   "$(human_bytes $((buf    * 1024)))"
+    printf "  %-20s %s\n" "Cached:"    "$(human_bytes $((cached * 1024)))"
+
+    # Memory bar
+    local bar_width=40
+    local filled=$((pct * bar_width / 100))
+    local empty=$((bar_width - filled))
+    printf "\n  ["
+    printf "${R}%${filled}s${RESET}" | tr ' ' '█'
+    printf "${DIM}%${empty}s${RESET}" | tr ' ' '░'
+    printf "] %d%%\n" "$pct"
+
+    if [ -n "$stotal" ] && [ "$stotal" -gt 0 ]; then
+        local sused=$((stotal - sfree))
+        printf "\n${BOLD}  Swap:${RESET}\n"
+        printf "  %-20s %s\n" "Total:" "$(human_bytes $((stotal * 1024)))"
+        printf "  %-20s %s\n" "Used:"  "$(human_bytes $((sused  * 1024)))"
+    fi
+    printf "\n"
+}
+
+# ── Process profiling ─────────────────────────────────────────────────────────
+
+cmd_proc() {
+    local pid="${1:-}"
+    if [ -z "$pid" ]; then
+        info "Top 15 processes by CPU"
+        printf "\n${BOLD}%-7s %-6s %-6s %-8s %s${RESET}\n" \
+               "PID" "CPU%" "MEM%" "RSS" "COMMAND"
+        printf "%s\n" "$(printf '─%.0s' $(seq 1 60))"
+        ps aux --sort=-%cpu | tail -n +2 | head -15 | \
+        awk '{printf "%-7s %-6s %-6s %-8s %s\n", $2, $3, $4, $6"K", $11}'
+        return
+    fi
+
+    [ -d "/proc/$pid" ] || die "Process $pid not found"
+    info "Process profile: PID $pid"
+
+    # Status
+    printf "\n${BOLD}  Status:${RESET}\n"
+    while IFS=: read -r k v; do
+        case "$k" in
+            Name|State|Pid|PPid|Threads|VmRSS|VmPeak|VmSize)
+                printf "  %-20s %s\n" "$k:" "$(echo "$v" | xargs)"
+                ;;
+        esac
+    done < "/proc/$pid/status"
+
+    # Open files
+    printf "\n${BOLD}  Open file descriptors:${RESET} "
+    ls "/proc/$pid/fd" 2>/dev/null | wc -l
+    printf "\n${BOLD}  Memory maps (top 10):${RESET}\n"
+    head -10 "/proc/$pid/maps" 2>/dev/null | \
+        awk '{printf "  %-30s %s\n", $1, $NF}'
+
+    # Cmdline
+    printf "\n${BOLD}  Command line:${RESET}\n"
+    cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' '
+    printf "\n\n"
+}
+
+# ── Network monitoring ────────────────────────────────────────────────────────
+
+cmd_net() {
+    info "Network interface statistics"
+    printf "\n${BOLD}%-12s %-15s %-15s %-10s %-10s${RESET}\n" \
+           "Interface" "RX bytes" "TX bytes" "RX pkts" "TX pkts"
+    printf "%s\n" "$(printf '─%.0s' $(seq 1 65))"
+
+    while IFS=: read -r iface stats; do
+        [ -z "$iface" ] && continue
+        iface=$(echo "$iface" | xargs)
+        [ "$iface" = "Inter" ] && continue
+        [ "$iface" = "face" ]  && continue
+        # shellcheck disable=SC2086
+        set -- $stats
+        local rx_bytes=$1 rx_pkts=$2 tx_bytes=$9 tx_pkts=$10
+        printf "  %-10s ${G}%-15s${RESET} ${B}%-15s${RESET} %-10s %-10s\n" \
+            "$iface" \
+            "$(human_bytes "${rx_bytes:-0}")" \
+            "$(human_bytes "${tx_bytes:-0}")" \
+            "${rx_pkts:-0}" \
+            "${tx_pkts:-0}"
+    done < /proc/net/dev
+
+    printf "\n${BOLD}  Active connections:${RESET}\n"
+    ss -tunp 2>/dev/null | head -20 | \
+        awk 'NR>1 {printf "  %-6s %-25s %-25s %s\n", $1, $5, $6, $7}'
+    printf "\n"
+}
+
+# ── Disk I/O ─────────────────────────────────────────────────────────────────
+
+cmd_disk() {
+    info "Disk I/O statistics"
+    printf "\n${BOLD}%-12s %-12s %-12s %-12s %-12s${RESET}\n" \
+           "Device" "Read MB/s" "Write MB/s" "Read ops" "Write ops"
+    printf "%s\n" "$(printf '─%.0s' $(seq 1 65))"
+
+    awk 'NF>=14 {
+        dev=$3; rd=$6; wr=$10; rops=$4; wops=$8
+        if (dev !~ /^(loop|ram|dm-)/) {
+            printf "  %-12s %-12.2f %-12.2f %-12s %-12s\n",
+                dev, rd*512/1048576, wr*512/1048576, rops, wops
+        }
+    }' /proc/diskstats
+
+    printf "\n${BOLD}  Filesystem usage:${RESET}\n"
+    df -h 2>/dev/null | awk 'NR==1 || /^\// {
+        printf "  %-20s %-8s %-8s %-8s %s\n", $1, $2, $3, $4, $6
+    }'
+    printf "\n"
+}
+
+# ── eBPF syscall tracing ─────────────────────────────────────────────────────
+
+cmd_trace() {
+    local pid="${1:-}" duration="${2:-5}"
+    require_root
+    check_ebpf
+
+    info "eBPF syscall trace (duration=${duration}s, pid=${pid:-all})"
+    warn "Requires kernel 5.15+ with BTF and debugfs mounted"
+
+    # In real sysforge this would use libbpf/bpftrace
+    # Demonstrating the interface — real binary uses Rust + libbpf
+    if command -v bpftrace >/dev/null 2>&1; then
+        local filter=""
+        [ -n "$pid" ] && filter="/ pid == $pid /"
+        timeout "$duration" bpftrace -e "
+            tracepoint:raw_syscalls:sys_enter $filter {
+                @syscalls[comm, args->id] = count();
+            }
+            END {
+                print(@syscalls);
+            }
+        " 2>/dev/null || true
+    else
+        warn "bpftrace not found — install via: sudo apt install bpfcc-tools"
+        info "Falling back to strace-based monitoring..."
+        if [ -n "$pid" ]; then
+            timeout "$duration" strace -p "$pid" -c 2>&1 || true
+        else
+            info "Specify a PID: sysforge trace <pid> [duration]"
+        fi
+    fi
+}
+
+# ── Security audit ────────────────────────────────────────────────────────────
+
+cmd_audit() {
+    info "Security audit"
+    local issues=0
+
+    printf "\n${BOLD}  Kernel security parameters:${RESET}\n"
+
+    check_sysctl() {
+        local param="$1" expected="$2" desc="$3"
+        local val
+        val=$(sysctl -n "$param" 2>/dev/null || echo "N/A")
+        if [ "$val" = "$expected" ]; then
+            printf "  ${G}✔${RESET} %-45s %s\n" "$param" "$val"
+        else
+            printf "  ${R}✗${RESET} %-45s %s (expected: %s)\n" "$param" "$val" "$expected"
+            issues=$((issues + 1))
+        fi
+        printf "    ${DIM}%s${RESET}\n" "$desc"
+    }
+
+    check_sysctl "kernel.dmesg_restrict"        "1" "Restrict dmesg to root"
+    check_sysctl "kernel.kptr_restrict"         "2" "Hide kernel pointers"
+    check_sysctl "kernel.perf_event_paranoid"   "3" "Restrict perf to root"
+    check_sysctl "kernel.yama.ptrace_scope"     "1" "Restrict ptrace"
+    check_sysctl "net.ipv4.conf.all.rp_filter"  "1" "Reverse path filtering"
+    check_sysctl "net.ipv4.tcp_syncookies"      "1" "TCP SYN cookie protection"
+    check_sysctl "kernel.randomize_va_space"    "2" "Full ASLR"
+    check_sysctl "fs.protected_symlinks"        "1" "Symlink protection"
+    check_sysctl "fs.protected_hardlinks"       "1" "Hardlink protection"
+
+    printf "\n${BOLD}  SUID binaries:${RESET}\n"
+    find /usr/bin /usr/sbin /bin /sbin -perm /4000 2>/dev/null | \
+        while read -r f; do
+            printf "  ${Y}⚠${RESET} %s\n" "$f"
+        done
+
+    printf "\n${BOLD}  World-writable directories:${RESET}\n"
+    find /tmp /var/tmp -maxdepth 2 -type d -perm -0002 2>/dev/null | \
+        head -10 | while read -r d; do
+            printf "  ${DIM}%s${RESET}\n" "$d"
+        done
+
+    printf "\n${BOLD}  Listening services:${RESET}\n"
+    ss -tlnp 2>/dev/null | tail -n +2 | \
+        awk '{printf "  ${B}%-6s${RESET} %-30s %s\n", $1, $4, $7}' | \
+        sed "s|\${B}|\033[0;34m|g; s|\${RESET}|\033[0m|g"
+
+    printf "\n"
+    if [ "$issues" -eq 0 ]; then
+        ok "All security checks passed"
+    else
+        warn "$issues security parameter(s) are not at recommended values"
+        printf "  Apply recommended settings: ${C}sudo sysforge audit --fix${RESET}\n"
+    fi
+    printf "\n"
+}
+
+# ── Container inspection ──────────────────────────────────────────────────────
+
+cmd_container() {
+    local subcmd="${1:-list}"
+    info "Container inspection: $subcmd"
+
+    case "$subcmd" in
+        list)
+            if command -v docker >/dev/null 2>&1; then
+                info "Docker containers:"
+                docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}" 2>/dev/null
+            fi
+            if command -v podman >/dev/null 2>&1; then
+                info "Podman containers:"
+                podman ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" 2>/dev/null
+            fi
+            # Sprawdź namespace'y bezpośrednio przez /proc
+            info "Process namespaces:"
+            ls /proc/*/ns/pid 2>/dev/null | head -5 | while read -r ns; do
+                pid=$(echo "$ns" | cut -d/ -f3)
+                comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+                printf "  PID %-7s %-20s %s\n" "$pid" "$comm" \
+                    "$(readlink "$ns" 2>/dev/null)"
+            done
+            ;;
+        namespaces)
+            info "All namespaces:"
+            lsns 2>/dev/null || warn "lsns not available (install util-linux)"
+            ;;
+        cgroups)
+            info "cgroup v2 resource usage:"
+            find /sys/fs/cgroup -name "memory.current" 2>/dev/null | \
+                head -20 | while read -r f; do
+                    val=$(cat "$f" 2>/dev/null)
+                    dir=$(dirname "$f" | sed 's|/sys/fs/cgroup||')
+                    printf "  %-50s %s\n" "$dir" "$(human_bytes "${val:-0}")"
+                done
+            ;;
+        *)
+            die "Unknown container subcommand: $subcmd (list|namespaces|cgroups)"
+            ;;
+    esac
+}
+
+# ── Dashboard TUI ─────────────────────────────────────────────────────────────
+
+cmd_dashboard() {
+    command -v tput >/dev/null 2>&1 || die "tput required for TUI dashboard"
+    info "Starting interactive dashboard (q to quit, r to refresh)"
+    sleep 1
+
+    tput smcup 2>/dev/null  # Switch to alternate screen
+    trap 'tput rmcup 2>/dev/null; exit 0' INT TERM
+
+    while true; do
+        tput clear
+        tput cup 0 0
+
+        printf "${BOLD}${R}⬡ SysForge Dashboard${RESET}  v${VERSION}"
+        printf "  %s  " "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf "  [${DIM}q=quit r=refresh${RESET}]\n"
+        printf "%s\n" "$(printf '═%.0s' $(seq 1 $(tput cols)))"
+
+        # CPU inline
+        printf "\n${BOLD}CPU:${RESET} "
+        local cpuline
+        cpuline=$(grep '^cpu ' /proc/stat)
+        set -- $cpuline
+        local tot=$(($2+$3+$4+$5+$6+$7+$8)) idle=$5
+        local busy_pct=$(( (tot - idle) * 100 / (tot + 1) ))
+        local bar=$((busy_pct * 30 / 100))
+        printf "[${R}"
+        printf "%${bar}s" | tr ' ' '█'
+        printf "${DIM}"
+        printf "%$((30 - bar))s" | tr ' ' '░'
+        printf "${RESET}] %d%%\n" "$busy_pct"
+
+        # Mem inline
+        printf "${BOLD}MEM:${RESET} "
+        local mtot mfree mbuf mcached
+        mtot=$(grep MemTotal  /proc/meminfo | awk '{print $2}')
+        mfree=$(grep MemFree  /proc/meminfo | awk '{print $2}')
+        mbuf=$(grep Buffers   /proc/meminfo | awk '{print $2}')
+        mcached=$(grep '^Cached:' /proc/meminfo | awk '{print $2}')
+        local mused=$(( mtot - mfree - mbuf - mcached ))
+        local mpct=$(( mused * 100 / (mtot + 1) ))
+        local mbar=$(( mpct * 30 / 100 ))
+        printf "[${G}"
+        printf "%${mbar}s" | tr ' ' '█'
+        printf "${DIM}"
+        printf "%$((30 - mbar))s" | tr ' ' '░'
+        printf "${RESET}] %d%%  ${DIM}$(human_bytes $((mused*1024))) / $(human_bytes $((mtot*1024)))${RESET}\n\n"
+
+        # Top procs
+        printf "${BOLD}Top processes:${RESET}\n"
+        printf "${DIM}%-7s %-6s %-6s %s${RESET}\n" "PID" "CPU%" "MEM%" "COMMAND"
+        ps aux --sort=-%cpu 2>/dev/null | tail -n +2 | head -8 | \
+            awk '{printf "%-7s %-6s %-6s %s\n", $2, $3, $4, $11}'
+
+        printf "\n${BOLD}Network:${RESET}\n"
+        ss -s 2>/dev/null | grep -E 'TCP:|UDP:' | head -4
+
+        # Read key with timeout
+        local key
+        if read -r -t 2 -n 1 key 2>/dev/null; then
+            case "$key" in
+                q|Q) break ;;
+                r|R) continue ;;
+            esac
+        fi
+    done
+
+    tput rmcup 2>/dev/null
+    ok "Dashboard closed"
+}
+
+# ── Export metrics ─────────────────────────────────────────────────────────────
+
+cmd_export() {
+    local format="${1:-json}" outfile="${2:-/tmp/sysforge-metrics.json}"
+    info "Exporting metrics in $format format to $outfile"
+
+    local ts
+    ts=$(date +%s)
+    local load
+    load=$(cat /proc/loadavg)
+    local uptime_s
+    uptime_s=$(awk '{print int($1)}' /proc/uptime)
+
+    case "$format" in
+        json)
+            cat > "$outfile" <<EOF
+{
+  "timestamp": $ts,
+  "uptime_seconds": $uptime_s,
+  "load_avg": {
+    "1m":  $(echo "$load" | cut -d' ' -f1),
+    "5m":  $(echo "$load" | cut -d' ' -f2),
+    "15m": $(echo "$load" | cut -d' ' -f3)
+  },
+  "memory": {
+    "total_kb":   $(grep MemTotal   /proc/meminfo | awk '{print $2}'),
+    "free_kb":    $(grep MemFree    /proc/meminfo | awk '{print $2}'),
+    "avail_kb":   $(grep MemAvailable /proc/meminfo | awk '{print $2}')
+  },
+  "cpu_count": $(nproc),
+  "hostname": "$(hostname)",
+  "kernel": "$(uname -r)",
+  "arch": "$(uname -m)"
+}
+EOF
+            ok "JSON metrics exported to $outfile"
+            ;;
+        prometheus)
+            cat > "$outfile" <<EOF
+# HELP sysforge_uptime_seconds System uptime in seconds
+# TYPE sysforge_uptime_seconds gauge
+sysforge_uptime_seconds{host="$(hostname)"} $uptime_s
+# HELP sysforge_load_avg System load average
+# TYPE sysforge_load_avg gauge
+sysforge_load_avg{host="$(hostname)",interval="1m"}  $(echo "$load" | cut -d' ' -f1)
+sysforge_load_avg{host="$(hostname)",interval="5m"}  $(echo "$load" | cut -d' ' -f2)
+sysforge_load_avg{host="$(hostname)",interval="15m"} $(echo "$load" | cut -d' ' -f3)
+# HELP sysforge_memory_bytes Memory in bytes
+# TYPE sysforge_memory_bytes gauge
+sysforge_memory_bytes{host="$(hostname)",type="total"} $(( $(grep MemTotal /proc/meminfo | awk '{print $2}') * 1024 ))
+sysforge_memory_bytes{host="$(hostname)",type="free"}  $(( $(grep MemFree  /proc/meminfo | awk '{print $2}') * 1024 ))
+EOF
+            ok "Prometheus metrics exported to $outfile"
+            ;;
+        *)
+            die "Unknown format: $format (json|prometheus)"
+            ;;
+    esac
+}
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+print_help() {
+    printf "${BOLD}${R}⬡ SysForge${RESET} v${VERSION} — Advanced System Analysis Suite\n\n"
+    printf "${BOLD}Usage:${RESET}  sysforge <command> [options]\n\n"
+
+    printf "${BOLD}Monitoring:${RESET}\n"
+    printf "  ${C}%-35s${RESET} %s\n" "cpu [interval] [count]"        "Real-time CPU usage"
+    printf "  ${C}%-35s${RESET} %s\n" "mem"                           "Memory breakdown + bar"
+    printf "  ${C}%-35s${RESET} %s\n" "net"                           "Network interface stats + connections"
+    printf "  ${C}%-35s${RESET} %s\n" "disk"                          "Disk I/O + filesystem usage"
+    printf "  ${C}%-35s${RESET} %s\n" "proc [pid]"                    "Process info or top-15 list"
+    printf "  ${C}%-35s${RESET} %s\n" "dashboard"                     "Interactive TUI dashboard"
+
+    printf "\n${BOLD}Tracing (requires root + kernel 5.15+):${RESET}\n"
+    printf "  ${C}%-35s${RESET} %s\n" "trace [pid] [duration]"        "eBPF syscall trace"
+    printf "  ${C}%-35s${RESET} %s\n" "audit"                         "Security audit (sysctl, SUID, ports)"
+    printf "  ${C}%-35s${RESET} %s\n" "container [list|namespaces|cgroups]" "Container/namespace inspection"
+
+    printf "\n${BOLD}Export:${RESET}\n"
+    printf "  ${C}%-35s${RESET} %s\n" "export [json|prometheus] [file]" "Export metrics to file"
+
+    printf "\n${BOLD}Options:${RESET}\n"
+    printf "  ${Y}%-35s${RESET} %s\n" "--version"   "Show version"
+    printf "  ${Y}%-35s${RESET} %s\n" "--help"      "Show this help"
+
+    printf "\n${BOLD}Examples:${RESET}\n"
+    printf "  ${DIM}sysforge cpu 0.5 10${RESET}              # 10 samples at 0.5s interval\n"
+    printf "  ${DIM}sysforge proc 1234${RESET}               # Profile PID 1234\n"
+    printf "  ${DIM}sudo sysforge trace 1234 10${RESET}      # Trace PID 1234 for 10s\n"
+    printf "  ${DIM}sudo sysforge audit${RESET}              # Full security audit\n"
+    printf "  ${DIM}sysforge export prometheus /tmp/m.txt${RESET}\n"
+    printf "  ${DIM}sysforge dashboard${RESET}               # Live TUI\n\n"
+
+    printf "  Installed via: ${C}hpm install sysforge${RESET}\n"
+    printf "  Tags:          ${DIM}@development @system @monitoring @security@advanced${RESET}\n\n"
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    cpu)       shift; cmd_cpu "$@" ;;
+    mem)       shift; cmd_mem "$@" ;;
+    net)       shift; cmd_net "$@" ;;
+    disk)      shift; cmd_disk "$@" ;;
+    proc)      shift; cmd_proc "$@" ;;
+    trace)     shift; cmd_trace "$@" ;;
+    audit)     shift; cmd_audit "$@" ;;
+    container) shift; cmd_container "$@" ;;
+    dashboard) shift; cmd_dashboard "$@" ;;
+    export)    shift; cmd_export "$@" ;;
+    --version|-V) printf "sysforge %s\n" "$VERSION" ;;
+    --help|-h|help|"") print_help ;;
+    *) die "Unknown command: $1  (try: sysforge --help)" ;;
+esac
