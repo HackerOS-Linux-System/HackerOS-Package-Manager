@@ -1,0 +1,69 @@
+! glyph-editor
+! Minimalny edytor tekstu z GTK4, napisany w języku Vala
+! Budowany ze źródeł przez build.toml
+
+[metadata]
+-> name    => glyph-editor
+-> version => 0.3.0
+-> authors => HackerOS Team <hackeros068@gmail.com>
+-> license => GPL-3.0
+-> gui     => true
+-> bins.glyph-editor => ""
+-> tags => [
+    "development"
+    "editors"
+    "gui"
+    "productivity"
+]
+
+[description]
+-> summary => A minimal GTK4 text editor with syntax highlighting, written in Vala
+-> long    => Glyph is a lightweight text editor built with GTK4 and GtkSourceView5.
+              It features syntax highlighting for 200+ languages, a clean distraction-free
+              interface, and integrates natively with the HackerOS desktop environment.
+              Built from source using the Vala compiler and Meson build system.
+
+[specs]
+-> arch       => x86_64
+-> min_kernel => 5.15
+
+[specs.dependencies]
+-> libgtk => ">=4.0"
+
+[sandbox]
+-> network   => false
+-> gui       => true
+-> full_gui  => true
+-> dev       => false
+-> disabled  => false
+-> filesystem => []
+
+[build]
+-> commands => []
+-> deb_deps => [
+    "valac"
+    "meson"
+    "ninja-build"
+    "libgtk-4-dev"
+    "libgtksourceview-5-dev"
+    "libglib2.0-dev"
+    "libadwaita-1-dev"
+    "gettext"
+    "pkg-config"
+]
+
+[runtime]
+-> deb_deps => [
+    "libgtk-4-1"
+    "libgtksourceview-5-0"
+    "libglib2.0-0"
+    "libadwaita-1-0"
+]
+
+[desktop]
+-> display_name => Glyph Editor
+-> icon         => icons/glyph-editor.svg
+-> categories   => Development;TextEditor;
+-> comment      => Minimal GTK4 text editor with syntax highlighting
+-> mime_types   => text/plain;text/x-csrc;text/x-vala;application/x-shellscript;
+-> keywords     => text;editor;code;vala;gtk;
