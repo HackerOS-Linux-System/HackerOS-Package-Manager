@@ -1,0 +1,12 @@
+# build.toml for sysforge
+# Pobiera statycznie skompilowany Rust binary z GitHub Releases
+
+type         = "download"
+url          = "https://github.com/HackerOS-Linux-System/sysforge/releases/download/v{version}/sysforge-{version}-x86_64-linux-musl.tar.gz"
+install_path = "bin/sysforge"
+strip_components = 1
+
+runtime_deps = [
+    "linux-perf",
+    "bpfcc-tools",
+]
