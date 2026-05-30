@@ -1,5 +1,109 @@
 #!/bin/sh
-# hello-hpm — example binary for hpm-example-repo
-echo "Hello from HackerOS Package Manager!"
-echo "Running as: $(whoami)"
-echo "Args: $*"
+# hello-hpm — demo package for HackerOS Package Manager
+# Part of the HackerOS project
+
+VERSION="1.0.0"
+BOLD="\033[1m"
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+CYAN="\033[0;36m"
+YELLOW="\033[0;33m"
+RESET="\033[0m"
+
+print_banner() {
+    printf "${RED}${BOLD}"
+    printf "  _          _ _            _\n"
+    printf " | |__   ___| | | ___      | |__  _ __  _ __ ___\n"
+    printf " | '_ \ / _ \ | |/ _ \ _  | '_ \| '_ \| '_ \` _ \\\n"
+    printf " | | | |  __/ | | (_) | |_| | | | |_) | | | | | |\n"
+    printf " |_| |_|\___|_|_|\___/ \___/ |_|_| .__/|_| |_| |_|\n"
+    printf "                                  |_|\n"
+    printf "${RESET}\n"
+}
+
+print_info() {
+    printf "${CYAN}${BOLD}System info:${RESET}\n"
+    printf "  ${GREEN}▸${RESET} HPM package version : ${YELLOW}%s${RESET}\n" "$VERSION"
+    printf "  ${GREEN}▸${RESET} Running as user     : ${YELLOW}%s${RESET}\n" "$(whoami 2>/dev/null || echo unknown)"
+    printf "  ${GREEN}▸${RESET} Hostname            : ${YELLOW}%s${RESET}\n" "$(hostname 2>/dev/null || echo unknown)"
+    printf "  ${GREEN}▸${RESET} Kernel              : ${YELLOW}%s${RESET}\n" "$(uname -r 2>/dev/null || echo unknown)"
+    printf "  ${GREEN}▸${RESET} Shell               : ${YELLOW}%s${RESET}\n" "${SHELL:-unknown}"
+    printf "  ${GREEN}▸${RESET} Sandbox             : ${YELLOW}hpm sandbox active${RESET}\n"
+    printf "\n"
+}
+
+print_help() {
+    printf "${BOLD}Usage:${RESET} hello-hpm [OPTIONS]\n\n"
+    printf "${BOLD}Options:${RESET}\n"
+    printf "  %-20s %s\n" "--hello <name>"  "Greet someone by name"
+    printf "  %-20s %s\n" "--info"          "Show system info"
+    printf "  %-20s %s\n" "--colors"        "Test terminal color support"
+    printf "  %-20s %s\n" "--version"       "Show version"
+    printf "  %-20s %s\n" "--help"          "Show this help"
+    printf "\n"
+    printf "  Installed via: ${CYAN}hpm install hello-hpm${RESET}\n"
+    printf "  Remove with:   ${CYAN}hpm remove hello-hpm${RESET}\n\n"
+}
+
+print_colors() {
+    printf "${BOLD}Terminal color test:${RESET}\n"
+    for i in 0 1 2 3 4 5 6 7; do
+        printf "  \033[4${i}m   \033[0m "
+    done
+    printf "\n"
+    for i in 0 1 2 3 4 5 6 7; do
+        printf "  \033[3${i}m ██ \033[0m"
+    done
+    printf "\n\n"
+    printf "  ${GREEN}✔${RESET} Color support looks good!\n\n"
+}
+
+# Parse args
+NAME=""
+MODE="hello"
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)     MODE="help" ;;
+        --version|-V)  MODE="version" ;;
+        --info)        MODE="info" ;;
+        --colors)      MODE="colors" ;;
+        --hello)       MODE="greet" ;;
+        *)
+            if [ "$MODE" = "greet" ] && [ -z "$NAME" ]; then
+                NAME="$arg"
+            fi
+            ;;
+    esac
+done
+
+case "$MODE" in
+    help)
+        print_banner
+        print_help
+        ;;
+    version)
+        printf "hello-hpm %s\n" "$VERSION"
+        ;;
+    info)
+        print_banner
+        print_info
+        ;;
+    colors)
+        print_banner
+        print_colors
+        ;;
+    greet)
+        TARGET="${NAME:-World}"
+        print_banner
+        printf "${GREEN}${BOLD}Hello, %s!${RESET}\n" "$TARGET"
+        printf "  Greetings from HackerOS Package Manager v%s\n\n" "$VERSION"
+        ;;
+    *)
+        print_banner
+        printf "${GREEN}${BOLD}Hello from HackerOS Package Manager!${RESET}\n\n"
+        printf "  This is ${CYAN}hello-hpm${RESET} v${YELLOW}%s${RESET} — a demo package.\n" "$VERSION"
+        printf "  Try: ${CYAN}hello-hpm --help${RESET}\n\n"
+        print_info
+        ;;
+esac
