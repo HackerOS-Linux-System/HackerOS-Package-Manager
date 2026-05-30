@@ -1,0 +1,162 @@
+#!/bin/sh
+# sysforge-daemon — Background metrics collection daemon
+# HackerOS Package Manager example — advanced package
+
+VERSION="2.1.0"
+PIDFILE="/run/sysforge/sysforge-daemon.pid"
+SOCKET="/run/sysforge/sysforge.sock"
+LOGFILE="/var/log/sysforge/daemon.log"
+DATADIR="/var/lib/sysforge"
+CONFIG="/etc/sysforge/daemon.conf"
+
+R="\033[0;31m" G="\033[0;32m" Y="\033[0;33m" C="\033[0;36m"
+BOLD="\033[1m" DIM="\033[2m" RESET="\033[0m"
+
+die()  { printf "${R}✗${RESET} %s\n" "$*" >&2; exit 1; }
+info() { printf "${C}→${RESET} %s\n" "$*"; }
+ok()   { printf "${G}✔${RESET} %s\n" "$*"; }
+log()  { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/dev/null; }
+
+require_root() {
+    [ "$(id -u)" = "0" ] || die "sysforge-daemon requires root"
+}
+
+setup_dirs() {
+    mkdir -p /run/sysforge /var/log/sysforge /var/lib/sysforge/metrics
+    chmod 750 /run/sysforge
+}
+
+load_config() {
+    INTERVAL=5
+    RETENTION_DAYS=7
+    EXPORT_FORMAT="json"
+    PROMETHEUS_PORT=9182
+    MAX_METRIC_FILES=1000
+
+    if [ -f "$CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+    fi
+}
+
+collect_snapshot() {
+    local ts
+    ts=$(date +%s)
+    local outfile="$DATADIR/metrics/${ts}.json"
+
+    local load
+    load=$(cat /proc/loadavg)
+    local mtot mfree mavail
+    mtot=$(grep  MemTotal    /proc/meminfo | awk '{print $2}')
+    mfree=$(grep MemFree     /proc/meminfo | awk '{print $2}')
+    mavail=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+
+    cat > "$outfile" <<EOF
+{"ts":$ts,"load1":$(echo "$load"|cut -d' ' -f1),"load5":$(echo "$load"|cut -d' ' -f2),"load15":$(echo "$load"|cut -d' ' -f3),"mem_total_kb":$mtot,"mem_free_kb":$mfree,"mem_avail_kb":$mavail,"cpu_count":$(nproc),"uptime":$(awk '{print int($1)}' /proc/uptime)}
+EOF
+
+    # Rotacja — usuń stare pliki
+    local count
+    count=$(ls "$DATADIR/metrics/" 2>/dev/null | wc -l)
+    if [ "$count" -gt "$MAX_METRIC_FILES" ]; then
+        ls -t "$DATADIR/metrics/"*.json 2>/dev/null | tail -n "+$((MAX_METRIC_FILES+1))" | \
+            xargs rm -f 2>/dev/null || true
+    fi
+}
+
+cmd_start() {
+    require_root
+    setup_dirs
+    load_config
+
+    [ -f "$PIDFILE" ] && {
+        local old_pid
+        old_pid=$(cat "$PIDFILE")
+        kill -0 "$old_pid" 2>/dev/null && die "Daemon already running (PID $old_pid)"
+        rm -f "$PIDFILE"
+    }
+
+    info "Starting sysforge-daemon v${VERSION}..."
+
+    # Fork do tła
+    (
+        printf "%d" "$$" > "$PIDFILE"
+        log "sysforge-daemon started (PID $$, interval=${INTERVAL}s)"
+        trap 'log "Daemon stopping"; rm -f "$PIDFILE" "$SOCKET"; exit 0' TERM INT
+
+        while true; do
+            collect_snapshot
+            log "Snapshot collected"
+            sleep "$INTERVAL"
+        done
+    ) &
+
+    disown $!
+    printf "%d" $! > "$PIDFILE"
+    ok "sysforge-daemon started (PID $!)"
+    info "Collecting every ${INTERVAL}s → $DATADIR/metrics/"
+    info "Log: $LOGFILE"
+}
+
+cmd_stop() {
+    require_root
+    [ -f "$PIDFILE" ] || die "Daemon not running (no PID file)"
+    local pid
+    pid=$(cat "$PIDFILE")
+    kill -TERM "$pid" 2>/dev/null || die "Could not stop PID $pid"
+    rm -f "$PIDFILE" "$SOCKET"
+    ok "sysforge-daemon stopped"
+}
+
+cmd_status() {
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            ok "Running (PID $pid)"
+            local count
+            count=$(ls "$DATADIR/metrics/" 2>/dev/null | wc -l)
+            info "Stored snapshots: $count"
+            info "Latest snapshot:"
+            ls -t "$DATADIR/metrics/"*.json 2>/dev/null | head -1 | \
+                xargs cat 2>/dev/null | python3 -m json.tool 2>/dev/null || \
+                ls -t "$DATADIR/metrics/"*.json 2>/dev/null | head -1 | xargs cat 2>/dev/null
+        else
+            printf "${Y}⚠${RESET} PID file exists but process %s is gone\n" "$pid"
+            rm -f "$PIDFILE"
+        fi
+    else
+        info "Daemon not running"
+    fi
+}
+
+cmd_logs() {
+    local lines="${1:-50}"
+    [ -f "$LOGFILE" ] || { info "No log file yet"; return; }
+    tail -n "$lines" "$LOGFILE"
+}
+
+print_help() {
+    printf "${BOLD}sysforge-daemon${RESET} v${VERSION}\n\n"
+    printf "Background metrics collection daemon for SysForge.\n\n"
+    printf "${BOLD}Usage:${RESET}  sysforge-daemon <command>\n\n"
+    printf "  ${C}start${RESET}          Start the daemon (requires root)\n"
+    printf "  ${C}stop${RESET}           Stop the daemon\n"
+    printf "  ${C}status${RESET}         Show daemon status\n"
+    printf "  ${C}restart${RESET}        Restart the daemon\n"
+    printf "  ${C}logs [N]${RESET}       Show last N log lines (default 50)\n\n"
+    printf "${BOLD}Config:${RESET} $CONFIG\n"
+    printf "${BOLD}Data:${RESET}   $DATADIR/metrics/\n"
+    printf "${BOLD}Log:${RESET}    $LOGFILE\n\n"
+}
+
+case "${1:-}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_stop 2>/dev/null; sleep 1; cmd_start ;;
+    status)  cmd_status ;;
+    logs)    shift; cmd_logs "$@" ;;
+    --version|-V) printf "sysforge-daemon %s\n" "$VERSION" ;;
+    --help|-h|"") print_help ;;
+    *) die "Unknown command: $1" ;;
+esac
