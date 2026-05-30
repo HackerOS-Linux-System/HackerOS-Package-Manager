@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Glyph Editor
+GenericName=Text Editor
+Comment=Minimal GTK4 text editor with syntax highlighting
+Exec=glyph-editor %F
+Icon=io.hackeros.GlyphEditor
+Type=Application
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;text/x-csrc;text/x-chdr;text/x-c++src;text/x-python;text/x-vala;text/x-rust;application/x-shellscript;text/x-makefile;
+Keywords=text;editor;code;vala;gtk;hackeros;
+StartupNotify=true
+StartupWMClass=io.hackeros.GlyphEditor
