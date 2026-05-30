@@ -1,0 +1,5 @@
+#!/bin/sh
+# sfctl — SysForge control utility (short alias)
+# Deleguje do sysforge z wygodniejszym interfejsem
+VERSION="2.1.0"
+exec sysforge "$@"
