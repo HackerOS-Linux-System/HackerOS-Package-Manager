@@ -1,0 +1,62 @@
+[metadata]
+-> name    => sysforge
+-> version => 2.1.0
+-> authors => HackerOS Team <hackeros068@gmail.com>
+-> license => GPL-3.0
+-> bins.sysforge  => "bin/sysforge"
+-> bins.sysforge-daemon => "bin/sysforge-daemon"
+-> bins.sfctl     => "bin/sfctl"
+-> tags => [
+    "development"
+    "system"
+    "cli"
+    "monitoring"
+    "profiling"
+    "security"
+    "advanced"
+]
+
+[description]
+-> summary => Advanced system profiler, monitor, tracer and security auditor for HackerOS
+-> long    => SysForge is a comprehensive system analysis suite combining real-time
+              performance monitoring, eBPF-based syscall tracing, memory profiling,
+              network traffic analysis, container introspection, and security auditing
+              into a single unified CLI tool. It features a daemon mode for continuous
+              monitoring with time-series data export (Prometheus, InfluxDB, JSON),
+              an interactive TUI dashboard, and plugin system for custom metrics.
+              Built as a statically-linked Rust binary for maximum portability.
+
+[specs]
+-> arch       => x86_64
+-> min_kernel => 5.15
+
+[specs.dependencies]
+-> sysforge-daemon => ">=2.0"
+
+[conflicts]
+-> sysdig =>
+-> bpftrace =>
+
+[sandbox]
+-> network   => true
+-> gui       => false
+-> full_gui  => false
+-> dev       => true
+-> disabled  => false
+-> filesystem => [
+    "/proc"
+    "/sys"
+    "/run"
+    "/var/log"
+    "/etc/sysforge"
+]
+
+[build]
+-> commands => []
+-> deb_deps => []
+
+[runtime]
+-> deb_deps => [
+    "linux-perf"
+    "bpfcc-tools"
+]
