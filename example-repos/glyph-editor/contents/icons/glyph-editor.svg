@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Background -->
+  <rect width="64" height="64" rx="14" fill="#1a1a2e"/>
+  <!-- Document shape -->
+  <rect x="12" y="8" width="32" height="42" rx="3" fill="#16213e" stroke="#0f3460" stroke-width="1.5"/>
+  <!-- Folded corner -->
+  <path d="M36 8 L44 16 L36 16 Z" fill="#0f3460"/>
+  <path d="M36 8 L44 16 L36 16" fill="none" stroke="#1a1a2e" stroke-width="1"/>
+  <!-- Text lines — syntax colored -->
+  <rect x="16" y="22" width="8"  height="2.2" rx="1" fill="#e94560"/>
+  <rect x="26" y="22" width="14" height="2.2" rx="1" fill="#4fc3f7"/>
+  <rect x="16" y="27" width="4"  height="2.2" rx="1" fill="#a78bfa"/>
+  <rect x="22" y="27" width="10" height="2.2" rx="1" fill="#e2e8f0"/>
+  <rect x="34" y="27" width="6"  height="2.2" rx="1" fill="#86efac"/>
+  <rect x="16" y="32" width="6"  height="2.2" rx="1" fill="#a78bfa"/>
+  <rect x="24" y="32" width="12" height="2.2" rx="1" fill="#fbbf24"/>
+  <rect x="16" y="37" width="20" height="2.2" rx="1" fill="#4fc3f7" opacity="0.5"/>
+  <!-- Cursor blink line -->
+  <rect x="16" y="42" width="2"  height="4"   rx="1" fill="#e94560"/>
+  <!-- Pen nib accent bottom right -->
+  <circle cx="48" cy="48" r="10" fill="#e94560"/>
+  <path d="M44 52 L48 44 L52 52 L48 50 Z" fill="white"/>
+  <circle cx="48" cy="53" r="1.2" fill="white"/>
+</svg>
