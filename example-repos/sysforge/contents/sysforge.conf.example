@@ -1,0 +1,24 @@
+# /etc/sysforge/daemon.conf
+# SysForge daemon configuration
+# Uncomment and modify as needed
+
+# Collection interval in seconds
+INTERVAL=5
+
+# How many days to retain metric files
+RETENTION_DAYS=7
+
+# Export format for collected metrics: json | prometheus
+EXPORT_FORMAT=json
+
+# Prometheus exporter port (if enabled)
+PROMETHEUS_PORT=9182
+
+# Maximum number of JSON metric files to keep
+MAX_METRIC_FILES=1000
+
+# eBPF features (require root + kernel 5.15+)
+# ENABLE_EBPF=false
+
+# Network monitoring
+# MONITOR_INTERFACES="eth0 lo"
