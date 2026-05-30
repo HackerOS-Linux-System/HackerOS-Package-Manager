@@ -1,0 +1,27 @@
+# build.toml for glyph-editor
+# Buduje aplikację Vala/GTK4 przez Meson + Ninja
+
+type         = "build"
+commands     = [
+    "meson setup _build --prefix=/usr --buildtype=release -Db_lto=true",
+    "ninja -C _build -j$(nproc)",
+]
+output       = "_build/src/glyph-editor"
+install_path = "bin/glyph-editor"
+build_deps   = [
+    "valac",
+    "meson",
+    "ninja-build",
+    "libgtk-4-dev",
+    "libgtksourceview-5-dev",
+    "libadwaita-1-dev",
+    "pkg-config",
+]
+runtime_deps = [
+    "libgtk-4-1",
+    "libgtksourceview-5-0",
+    "libadwaita-1-0",
+]
+
+[env]
+DESTDIR = ""
