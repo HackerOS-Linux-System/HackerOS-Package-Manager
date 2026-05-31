@@ -1,4 +1,8 @@
 // cargo
-// libseccomp-dev
+// rustc
 
 > cargo build --release
+;; install dev dependeces:
+;; > sudo apt install libseccomp-dev
+;; > sudo apt install libgpgme-dev
+;; > sudo apt install libgpg-error-dev
