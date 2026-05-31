@@ -22,6 +22,9 @@ pub mod doctor;
 pub mod repair;
 pub mod rollback;
 pub mod create;
+pub mod lock;
+pub mod diff;
+pub mod dev;
 
 pub use install::install;
 pub use install::install_single;
@@ -46,3 +49,6 @@ pub use doctor::doctor;
 pub use repair::repair;
 pub use rollback::rollback;
 pub use create::create;
+pub use lock::lock;
+pub use diff::diff;
+pub use dev::dev;
