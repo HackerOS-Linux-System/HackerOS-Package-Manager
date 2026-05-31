@@ -1,10 +1,7 @@
 use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use std::path::PathBuf;
-use crate::{
-    repo::RepoManager,
-    state::State,
-};
+use crate::{repo::RepoManager, state::State};
 
 pub fn info(package: String) -> Result<()> {
     if package.is_empty() {
@@ -13,73 +10,53 @@ pub fn info(package: String) -> Result<()> {
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .into_diagnostic()?;
+        .enable_all().build().into_diagnostic()?;
 
     let repo_mgr = rt.block_on(RepoManager::load())?;
     let state    = State::load()?;
 
-    let entry = repo_mgr.index.packages.get(&package)
+    // Sprawdź czy pakiet jest w indeksie
+    let repo_url = repo_mgr.get_package_url(&package)
         .ok_or_else(|| miette::miette!(
             "Package '{}' not found in repository index.\n  Run {} to refresh.",
             package, "hpm refresh".yellow()
-        ))?;
+        ))?
+        .to_string();
 
+    // Pobierz metadane z info.hk (cache lub HTTP)
     let meta      = rt.block_on(repo_mgr.fetch_package_meta(&package))?;
-    let build_cfg = rt.block_on(repo_mgr.fetch_raw_build_config(&entry.repo));
+    let build_cfg = rt.block_on(repo_mgr.fetch_raw_build_config(&repo_url));
 
     let installed_ver = state.get_current_version(&package);
     let pinned = installed_ver.as_ref()
         .and_then(|ver| state.packages.get(&package)?.get(ver))
-        .map(|info| info.pinned)
+        .map(|i| i.pinned)
         .unwrap_or(false);
 
-    // Wersje z lokalnego repo
-    let local_versions: Vec<String> = {
-        let repos_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("hpm/repos")
-            .join(&package);
-
-        if repos_dir.exists() {
-            match git2::Repository::open(&repos_dir) {
-                Ok(repo) => {
-                    let mut vers = Vec::new();
-                    if let Ok(tags) = repo.tag_names(None) {
-                        for tag in tags.iter().flatten() {
-                            vers.push(tag.trim_start_matches('v').to_string());
-                        }
-                    }
-                    vers.sort_by(|a, b| crate::utils::compare_versions(a, b));
-                    vers
-                }
-                Err(_) => Vec::new(),
-            }
-        } else {
-            entry.versions.clone()
-        }
-    };
+    // Wersje z lokalnie sklonowanego repo (tagi git)
+    // ŻADNE wersje nie pochodzą z repo.json
+    let local_versions = crate::repo::load_cached_meta_pub(&package)
+        .map(|m| m.available_versions)
+        .unwrap_or_default();
 
     // ── Wydruk ───────────────────────────────────────────────────────────────
     println!();
     println!("  {} {}", "◆".cyan(), package.bold().cyan());
     println!("  {}", "─".repeat(60).dimmed());
-    println!("  {:<14} {}", "Version:".bold(),    meta.version.green());
-    println!("  {:<14} {}", "Author:".bold(),     meta.authors);
-    println!("  {:<14} {}", "License:".bold(),    meta.license);
-    println!("  {:<14} {}", "Repository:".bold(), entry.repo.dimmed());
+    println!("  {:<16} {}", "Version:".bold(),    meta.version.green());
+    println!("  {:<16} {}", "Author:".bold(),     meta.authors);
+    println!("  {:<16} {}", "License:".bold(),    meta.license);
+    println!("  {:<16} {}", "Repository:".bold(), repo_url.dimmed());
 
-    // Tagi grupowe
+    // Tagi (z info.hk, nie z repo.json)
     if !meta.tags.is_empty() {
         let tags_str = meta.tags.iter()
             .map(|t| format!("@{}", t).cyan().to_string())
-            .collect::<Vec<_>>()
-            .join("  ");
-        println!("  {:<14} {}", "Tags:".bold(), tags_str);
+            .collect::<Vec<_>>().join("  ");
+        println!("  {:<16} {}", "Tags:".bold(), tags_str);
     }
 
-    // Build type
+    // Build type z build.toml
     if let Some(ref cfg) = build_cfg {
         let build_type = match &cfg.source {
             crate::repo::BuildSource::Download { url, .. } => {
@@ -89,9 +66,10 @@ pub fn info(package: String) -> Result<()> {
             crate::repo::BuildSource::Build { .. } => "build from source".to_string(),
             crate::repo::BuildSource::Prebuilt    => "prebuilt (contents/)".to_string(),
         };
-        println!("  {:<14} {}", "Build type:".bold(), build_type);
+        println!("  {:<16} {}", "Build type:".bold(), build_type);
     }
 
+    // Opis
     println!();
     println!("  {}", "Description:".bold());
     for line in wrap_text(&meta.summary, 65) {
@@ -102,85 +80,65 @@ pub fn info(package: String) -> Result<()> {
     println!();
     if let Some(ref ver) = installed_ver {
         let pin_tag = if pinned { format!(" {}", "(pinned)".yellow()) } else { String::new() };
-        println!("  {:<14} {}{}", "Installed:".bold(), ver.cyan(), pin_tag);
+        println!("  {:<16} {}{}", "Installed:".bold(), ver.cyan(), pin_tag);
 
-        // Pokaż zapamiętane nazwy wrapperów (jeśli są niestandardowe)
+        // Pokaż niestandardowe nazwy wrapperów
         let wn = crate::state::WrapperNames::load();
         let store_path = std::path::Path::new(crate::STORE_PATH).join(&package).join(ver);
         if let Ok(manifest) = crate::manifest::Manifest::load_from_path(store_path.to_str().unwrap_or("")) {
-            let mut custom_wrappers = Vec::new();
-            for bin in &manifest.bins {
-                if let Some(custom) = wn.get(&package, bin) {
-                    if custom != bin {
-                        custom_wrappers.push(format!("{} → /usr/bin/{}", bin, custom));
-                    }
-                }
-            }
-            if !custom_wrappers.is_empty() {
-                println!("  {:<14} {}", "Wrappers:".bold(),
-                    custom_wrappers.join(", ").dimmed());
+            let custom: Vec<_> = manifest.bins.iter()
+                .filter_map(|b| wn.get(&package, b).filter(|&w| w != b).map(|w| format!("{} → /usr/bin/{}", b, w)))
+                .collect();
+            if !custom.is_empty() {
+                println!("  {:<16} {}", "Wrappers:".bold(), custom.join(", ").dimmed());
             }
         }
     } else {
-        println!("  {:<14} {}", "Installed:".bold(), "No".red());
+        println!("  {:<16} {}", "Installed:".bold(), "No".red());
     }
 
-    // Dostępne wersje
+    // Wersje z tagów git (sklonowane lokalnie przez hpm install lub hpm refresh)
     if !local_versions.is_empty() {
         println!();
-        println!("  {}", "Available versions (cached):".bold());
+        println!("  {}", "Available versions (from git tags):".bold());
         for v in &local_versions {
             let cur = if installed_ver.as_deref() == Some(v.as_str()) {
                 format!(" {}", "← current".green())
-            } else {
-                String::new()
-            };
+            } else { String::new() };
             println!("    • {}{}", v.cyan(), cur);
-        }
-    } else if !entry.versions.is_empty() {
-        println!();
-        println!("  {}", "Known versions (from index):".bold());
-        for v in &entry.versions {
-            println!("    • {}", v.cyan());
         }
     } else {
         println!();
-        println!(
-            "  {} Version list available after: {}",
-            "ℹ".blue(),
-            format!("hpm install {}@<ver>", package).yellow()
-        );
+        println!("  {} Run {} or {} to see all versions.",
+                 "ℹ".blue(),
+                 "hpm refresh".yellow(),
+                 format!("hpm install {}@<ver>", package).yellow());
     }
 
-    // Install hint
-    println!();
-    if installed_ver.is_none() {
-        println!(
-            "  {} Install: {}",
-            "→".yellow(),
-            format!("hpm install {}", package).bold().yellow()
-        );
-    }
-
-    // Inne pakiety z tych samych tagów
+    // Powiązane pakiety z tych samych tagów
     if !meta.tags.is_empty() {
-        println!();
-        println!("  {} Related (same tags):", "ℹ".blue());
+        let mut any_related = false;
         for tag in &meta.tags {
-            let related: Vec<String> = repo_mgr.packages_for_tag(tag)
-                .into_iter()
-                .filter(|p| p != &package)
-                .take(5)
-                .collect();
+            let related: Vec<_> = repo_mgr.packages_for_tag(tag).into_iter()
+                .filter(|p| p != &package).take(4).collect();
             if !related.is_empty() {
-                println!("    @{}: {}",
-                    tag.cyan(),
-                    related.iter().map(|p| p.magenta().to_string()).collect::<Vec<_>>().join(", ")
-                );
+                if !any_related {
+                    println!();
+                    println!("  {} Related packages (same tags):", "ℹ".blue());
+                    any_related = true;
+                }
+                println!("    @{}: {}", tag.cyan(),
+                    related.iter().map(|p| p.magenta().to_string()).collect::<Vec<_>>().join(", "));
             }
         }
     }
 
+    // Hint instalacji
+    println!();
+    if installed_ver.is_none() {
+        println!("  {} Install: {}", "→".yellow(),
+                 format!("hpm install {}", package).bold().yellow());
+    }
     println!();
     Ok(())
 }
