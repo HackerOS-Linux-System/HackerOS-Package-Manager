@@ -10,16 +10,16 @@ use nix::sched::{unshare, CloneFlags};
 use nix::sys::stat::{mknod, Mode as MkMode, SFlag, makedev};
 use nix::sys::resource::{setrlimit, Resource};
 use nix::unistd::{
-    chdir, fork, getpid, pipe, pivot_root, read, write,
+    chdir, dup2, fork, getpid, pipe, pivot_root, read, write,
     ForkResult, Gid, Uid, sethostname, execve,
 };
-use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall, ScmpArg};
+use libseccomp::{ScmpFilterContext, ScmpAction, ScmpSyscall};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{create_dir_all, File};
 use std::io::Write as IoWrite;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -137,10 +137,40 @@ fn compat_setup(
     if unshare(CloneFlags::CLONE_NEWNS).is_ok() {
         let _ = mount(None::<&str>, "/", None::<&str>, MsFlags::MS_PRIVATE | MsFlags::MS_REC, None::<&str>);
     }
+
+    // FIX: explicit dup2(STDIN_FILENO) — po CLONE_NEWNS stdin może być zamknięty
+    // w potomnym procesie jeśli rodzic zamknie deskryptory. Otwieramy /dev/null
+    // jako fallback jeśli stdin jest zamknięty.
+    ensure_stdin_open();
+
     apply_resource_limits(ResourceLimits::for_run())?;
     setup_seccomp()?;
     if test { return Ok(()); }
     exec_from_path(path, is_install, &manifest.install_commands, bin, extra_args)
+}
+
+/// Upewnij się że stdin (fd=0) jest otwarty.
+/// W CLONE_NEWNS stdin jest dziedziczony, ale gdy rodzic zamknie swój koniec pipe —
+/// stdin dziecka może stać się zamknięty w niektórych konfiguracjach.
+fn ensure_stdin_open() {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    // Sprawdź czy fd 0 jest otwarty przez próbę fcntl
+    let stdin_fd: RawFd = 0;
+    let flags = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_GETFD);
+    if flags.is_err() {
+        // stdin zamknięty — otwórz /dev/null jako fallback
+        if let Ok(null_fd) = open(
+            "/dev/null",
+            OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            if null_fd != 0 {
+                let _ = dup2(null_fd, 0);
+                let _ = nix::unistd::close(null_fd);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +219,7 @@ fn full_setup(
         nix::unistd::chroot(&new_root).into_diagnostic()?;
         chdir("/").into_diagnostic()?;
     }
+    ensure_stdin_open();
     apply_resource_limits(limits)?;
     if let Err(e) = setup_landlock(manifest) {
         eprintln!("  {} Landlock unavailable: {}", "⚠".yellow(), e);
@@ -205,13 +236,13 @@ fn full_setup(
 
 fn wait_child(child: nix::unistd::Pid, read_fd: OwnedFd) -> Result<()> {
     let status = nix::sys::wait::waitpid(child, None).into_diagnostic()?;
-    let code = match status {
+    let code   = match status {
         nix::sys::wait::WaitStatus::Exited(_, c) => c,
         _ => 1,
     };
     if code != 0 {
         let mut buf = vec![0u8; 4096];
-        let n = read(read_fd.as_raw_fd(), &mut buf).unwrap_or(0);
+        let n   = read(read_fd.as_raw_fd(), &mut buf).unwrap_or(0);
         let msg = String::from_utf8_lossy(&buf[..n]);
         if msg.is_empty() { bail!("Process exited with code {}", code); }
         bail!("Sandbox error: {}", msg.trim());
@@ -308,7 +339,7 @@ fn bind_gui_sockets(new_root: &Path) -> Result<()> {
               MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>).into_diagnostic()?;
     }
     if let Ok(rt) = env::var("XDG_RUNTIME_DIR") {
-        for sock in &["wayland-0", "bus", "pipewire-0"] {
+        for sock in &["wayland-0","bus","pipewire-0"] {
             let src = format!("{}/{}", rt, sock);
             if !Path::new(&src).exists() { continue; }
             let target = new_root.join(src.trim_start_matches('/'));
@@ -364,12 +395,8 @@ fn pivot_and_chdir(new_root: &Path) -> Result<()> {
 }
 
 fn apply_resource_limits(limits: ResourceLimits) -> Result<()> {
-    if limits.cpu_secs > 0 {
-        setrlimit(Resource::RLIMIT_CPU, limits.cpu_secs, limits.cpu_secs).into_diagnostic()?;
-    }
-    if limits.mem_bytes > 0 {
-        setrlimit(Resource::RLIMIT_AS, limits.mem_bytes, limits.mem_bytes).into_diagnostic()?;
-    }
+    if limits.cpu_secs  > 0 { setrlimit(Resource::RLIMIT_CPU,   limits.cpu_secs,  limits.cpu_secs).into_diagnostic()?; }
+    if limits.mem_bytes > 0 { setrlimit(Resource::RLIMIT_AS,    limits.mem_bytes, limits.mem_bytes).into_diagnostic()?; }
     setrlimit(Resource::RLIMIT_NPROC, limits.nproc, limits.nproc).into_diagnostic()?;
     Ok(())
 }
@@ -382,48 +409,39 @@ fn setup_landlock(manifest: &Manifest) -> Result<()> {
     let abi = best_landlock_abi()
         .ok_or_else(|| miette!("Landlock not supported (requires Linux 5.13+)"))?;
     let mut ruleset = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| miette!("Landlock ruleset: {}", e))?
-        .create()
-        .map_err(|e| miette!("Landlock create: {}", e))?;
+        .handle_access(AccessFs::from_all(abi)).map_err(|e| miette!("{}", e))?
+        .create().map_err(|e| miette!("{}", e))?;
     let ro = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
     let rw = AccessFs::from_all(abi);
-    for path in &["/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc"] {
+    for path in &["/usr","/lib","/lib64","/lib32","/bin","/sbin","/etc"] {
         if !Path::new(path).exists() { continue; }
-        ruleset = ruleset.add_rule(
-            PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?, ro)
-        ).map_err(|e| miette!("{}", e))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?, ro))
+            .map_err(|e| miette!("{}", e))?;
     }
-    for path in &["/proc", "/sys"] {
+    for path in &["/proc","/sys"] {
         if !Path::new(path).exists() { continue; }
-        ruleset = ruleset.add_rule(
-            PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?,
-                             AccessFs::ReadFile | AccessFs::ReadDir)
-        ).map_err(|e| miette!("{}", e))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?,
+            AccessFs::ReadFile | AccessFs::ReadDir)).map_err(|e| miette!("{}", e))?;
     }
-    for path in &["/app", "/tmp"] {
+    for path in &["/app","/tmp"] {
         if !Path::new(path).exists() { continue; }
-        ruleset = ruleset.add_rule(
-            PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?, rw)
-        ).map_err(|e| miette!("{}", e))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(path).map_err(|e| miette!("{}", e))?, rw))
+            .map_err(|e| miette!("{}", e))?;
     }
     if let Ok(home) = env::var("HOME") {
         if Path::new(&home).exists() {
-            ruleset = ruleset.add_rule(
-                PathBeneath::new(PathFd::new(&home).map_err(|e| miette!("{}", e))?, rw)
-            ).map_err(|e| miette!("{}", e))?;
+            ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(&home).map_err(|e| miette!("{}", e))?, rw))
+                .map_err(|e| miette!("{}", e))?;
         }
     }
     if manifest.sandbox.dev && Path::new("/dev").exists() {
-        ruleset = ruleset.add_rule(
-            PathBeneath::new(PathFd::new("/dev").map_err(|e| miette!("{}", e))?, rw)
-        ).map_err(|e| miette!("{}", e))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new("/dev").map_err(|e| miette!("{}", e))?, rw))
+            .map_err(|e| miette!("{}", e))?;
     }
     for fs_p in &manifest.sandbox.filesystem {
         if !Path::new(fs_p).exists() { continue; }
-        ruleset = ruleset.add_rule(
-            PathBeneath::new(PathFd::new(fs_p).map_err(|e| miette!("{}", e))?, rw)
-        ).map_err(|e| miette!("{}", e))?;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(fs_p).map_err(|e| miette!("{}", e))?, rw))
+            .map_err(|e| miette!("{}", e))?;
     }
     let status = ruleset.restrict_self().map_err(|e| miette!("{}", e))?;
     if status.ruleset == RulesetStatus::NotEnforced {
@@ -435,10 +453,7 @@ fn setup_landlock(manifest: &Manifest) -> Result<()> {
 fn best_landlock_abi() -> Option<ABI> {
     if let Ok(v) = std::fs::read_to_string("/proc/sys/kernel/landlock/abi") {
         return match v.trim().parse::<u32>().unwrap_or(0) {
-            0 => None,
-            1 => Some(ABI::V1),
-            2 => Some(ABI::V2),
-            _ => Some(ABI::V3),
+            0 => None, 1 => Some(ABI::V1), 2 => Some(ABI::V2), _ => Some(ABI::V3),
         };
     }
     for abi in [ABI::V3, ABI::V2, ABI::V1] {
@@ -450,16 +465,16 @@ fn best_landlock_abi() -> Option<ABI> {
 }
 
 // ---------------------------------------------------------------------------
-// Seccomp — FIXED: używa libseccomp (0.3) zamiast seccomp 0.1.2
-// Unconditional deny działa poprawnie — ScmpAction::Errno bez żadnych warunków.
+// Seccomp — FIXED:
+//   - usunięto nieistniejący ScmpArg
+//   - ScmpAction::Errno(i32) — cast jawny libc::EPERM as i32
+//   - dodano blokady mount/pivot_root/setns/unshare
 // ---------------------------------------------------------------------------
 
 fn setup_seccomp() -> Result<()> {
     let mut ctx = ScmpFilterContext::new_filter(ScmpAction::Allow)
         .map_err(|e| miette!("Seccomp context: {}", e))?;
 
-    // Lista syscalli które zawsze blokujemy bezwarunkowo
-    // Dzięki libseccomp możemy dodać regułę bez żadnych comparatorów
     let blocked: &[&str] = &[
         "kexec_load", "kexec_file_load",
         "init_module", "finit_module", "delete_module",
@@ -474,18 +489,18 @@ fn setup_seccomp() -> Result<()> {
         "keyctl", "add_key", "request_key",
         "bpf",
         "userfaultfd",
-        "mount", "umount2",       // procesy sandbox nie powinny montować
-        "pivot_root",              // sandbox już to zrobił
-        "chroot",                  // jw.
-        "setns",                   // nie wchodź do cudzych namespace
-        "unshare",                 // nie twórz nowych namespace z wewnątrz
+        "mount", "umount2",
+        "pivot_root",
+        "chroot",
+        "setns",
+        "unshare",
     ];
 
     for name in blocked {
         let syscall = ScmpSyscall::from_name(name)
             .map_err(|e| miette!("Unknown syscall '{}': {}", name, e))?;
-        // Brak ScmpArg — reguła pasuje bezwarunkowo (prawdziwy unconditional deny)
-        ctx.add_rule(ScmpAction::Errno(libc::EPERM as u32), syscall)
+        // FIXED: Errno przyjmuje i32, nie u32
+        ctx.add_rule(ScmpAction::Errno(libc::EPERM as i32), syscall)
             .map_err(|e| miette!("seccomp add_rule '{}': {}", name, e))?;
     }
 
@@ -502,11 +517,8 @@ fn exec_in_sandbox(
     bin: Option<&str>, extra_args: Vec<String>,
 ) -> Result<()> {
     let (cmd_str, args_strs) = if is_install {
-        let cmd = if install_commands.is_empty() {
-            "echo 'Install complete'".to_string()
-        } else {
-            install_commands.join(" && ")
-        };
+        let cmd = if install_commands.is_empty() { "echo 'Install complete'".to_string() }
+                  else { install_commands.join(" && ") };
         ("/bin/sh".to_string(), vec!["/bin/sh".to_string(), "-c".to_string(), cmd])
     } else {
         let bin_path = format!("/app/{}", bin.expect("bin required"));
@@ -522,11 +534,8 @@ fn exec_from_path(
     bin: Option<&str>, extra_args: Vec<String>,
 ) -> Result<()> {
     let (cmd_str, args_strs) = if is_install {
-        let cmd = if install_commands.is_empty() {
-            "echo 'Install complete'".to_string()
-        } else {
-            install_commands.join(" && ")
-        };
+        let cmd = if install_commands.is_empty() { "echo 'Install complete'".to_string() }
+                  else { install_commands.join(" && ") };
         ("/bin/sh".to_string(), vec!["/bin/sh".to_string(), "-c".to_string(), cmd])
     } else {
         let bin_path = format!("{}/{}", path, bin.expect("bin required"));
@@ -538,7 +547,7 @@ fn exec_from_path(
 }
 
 fn do_execve(cmd: &str, args: &[String]) -> Result<()> {
-    let cmd_c = CString::new(cmd).map_err(|e| miette!("{}", e))?;
+    let cmd_c   = CString::new(cmd).map_err(|e| miette!("{}", e))?;
     let args_c: Vec<CString> = args.iter()
         .map(|a| CString::new(a.as_str()).map_err(|e| miette!("{}", e)))
         .collect::<Result<Vec<_>>>()?;
