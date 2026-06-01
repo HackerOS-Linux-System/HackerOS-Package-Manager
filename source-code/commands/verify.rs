@@ -18,40 +18,39 @@ pub fn verify(package: String) -> Result<()> {
         .ok_or_else(|| miette!("Package '{}' not installed", package))?;
     let expected    = state.packages.get(&package)
         .and_then(|vs| vs.get(&current_ver))
-        .map(|info| info.checksum.clone())
+        .map(|i| i.checksum.clone())
         .ok_or_else(|| miette!("No checksum in state for {}@{}", package, current_ver))?;
 
     let pkg_path = Path::new(STORE_PATH).join(&package).join(&current_ver);
 
     println!("{} Verifying {}@{}...\n", "→".cyan(), package.cyan(), current_ver.green());
 
-    // ── 1. SHA-256 hash zawartości ───────────────────────────────────────────
+    // ── 1. SHA-256 ───────────────────────────────────────────────────────────
     print!("  {:<40}", "Content hash (SHA-256):".bold());
     let computed = compute_dir_hash(&pkg_path)?;
     if computed == expected {
         println!("{}", "OK".green());
-        println!("    {}", &computed[..32].dimmed());
+        let short = &computed[..computed.len().min(32)];
+        println!("    {}", short.dimmed());
     } else {
         println!("{}", "MISMATCH".red().bold());
-        println!("    stored:   {}", &expected[..32].red());
-        println!("    computed: {}", &computed[..32].red());
+        println!("    stored:   {}", &expected[..16.min(expected.len())].red());
+        println!("    computed: {}", &computed[..16.min(computed.len())].red());
         bail!("Content checksum verification failed for {}@{}", package, current_ver);
     }
 
-    // ── 2. GPG podpis info.hk ────────────────────────────────────────────────
+    // ── 2. GPG podpis ────────────────────────────────────────────────────────
     let info_hk     = pkg_path.join("info.hk");
     let info_hk_sig = pkg_path.join("info.hk.sig");
 
     print!("  {:<40}", "GPG signature (info.hk.sig):".bold());
-
     if !info_hk_sig.exists() {
         println!("{}", "NOT PRESENT".yellow());
         println!("    {} Package is not GPG-signed.", "⚠".yellow());
-        println!("    {} For security, prefer signed packages from verified authors.", "→".dimmed());
+        println!("    {} For security, prefer signed packages.", "→".dimmed());
     } else if !info_hk.exists() {
         println!("{}", "ERROR".red());
-        println!("    info.hk missing from store — cannot verify signature.");
-        bail!("info.hk missing");
+        bail!("info.hk missing from store — cannot verify signature");
     } else {
         match verify_gpg_signature(&info_hk, &info_hk_sig) {
             Ok(signer) => {
@@ -66,12 +65,12 @@ pub fn verify(package: String) -> Result<()> {
         }
     }
 
-    // ── 3. Manifest integrity ─────────────────────────────────────────────────
+    // ── 3. Manifest readable ─────────────────────────────────────────────────
     print!("  {:<40}", "Manifest (info.hk) readable:".bold());
     match crate::manifest::Manifest::load_from_path(pkg_path.to_str().unwrap()) {
-        Ok(manifest) => {
+        Ok(m)  => {
             println!("{}", "OK".green());
-            println!("    name={} version={}", manifest.name.cyan(), manifest.version.green());
+            println!("    name={} version={}", m.name.cyan(), m.version.green());
         }
         Err(e) => {
             println!("{}", "ERROR".red());
@@ -85,7 +84,7 @@ pub fn verify(package: String) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// GPG verification via gpgme crate
+// GPG — FIXED: export_keys wymaga &Key (reference), nie Key (owned)
 // ---------------------------------------------------------------------------
 
 fn verify_gpg_signature(data_file: &Path, sig_file: &Path) -> Result<String> {
@@ -94,17 +93,17 @@ fn verify_gpg_signature(data_file: &Path, sig_file: &Path) -> Result<String> {
     let mut ctx = Context::from_protocol(Protocol::OpenPgp)
         .map_err(|e| miette!("Failed to initialize GPGME: {}", e))?;
 
-    // Załaduj trusted keyring jeśli istnieje
+    // Załaduj trusted keyring
     let keyring_path = if Path::new(TRUSTED_KEYRING).exists() {
-        Some(TRUSTED_KEYRING)
+        Some(TRUSTED_KEYRING.to_string())
     } else {
+        // FIXED: shellexpand jest teraz zależnością
         let user_kr = shellexpand::tilde(USER_KEYRING).to_string();
-        if Path::new(&user_kr).exists() { Some(user_kr.as_str()) } else { None }
+        if Path::new(&user_kr).exists() { Some(user_kr) } else { None }
     };
 
     if let Some(kr) = keyring_path {
-        // Import kluczy z keyring
-        let kr_data = fs::read(kr).into_diagnostic()?;
+        let kr_data = fs::read(&kr).into_diagnostic()?;
         ctx.import(kr_data.as_slice())
             .map_err(|e| miette!("Failed to import keyring: {}", e))?;
     }
@@ -118,14 +117,13 @@ fn verify_gpg_signature(data_file: &Path, sig_file: &Path) -> Result<String> {
     let mut signers = Vec::new();
     for sig in result.signatures() {
         let summary = sig.summary();
-        // Sprawdź czy podpis jest ważny
         if summary.contains(SignatureSummary::VALID) || summary.contains(SignatureSummary::GREEN) {
-            let signer = sig.fingerprint()
+            let fp = sig.fingerprint()
                 .map(|f| f.to_string())
                 .unwrap_or_else(|_| "unknown fingerprint".to_string());
-            signers.push(signer);
+            signers.push(fp);
         } else if summary.contains(SignatureSummary::KEY_MISSING) {
-            bail!("Signing key not in trusted keyring.\n    Add it with: hpm verify --import-key <keyid>");
+            bail!("Signing key not in trusted keyring.\n    Add: hpm verify --import-key <keyid>");
         } else if summary.contains(SignatureSummary::RED) {
             bail!("BAD signature — package may be tampered with!");
         } else {
@@ -133,27 +131,24 @@ fn verify_gpg_signature(data_file: &Path, sig_file: &Path) -> Result<String> {
         }
     }
 
-    if signers.is_empty() {
-        bail!("No valid signatures found");
-    }
-
+    if signers.is_empty() { bail!("No valid signatures found"); }
     Ok(signers.join(", "))
 }
 
 // ---------------------------------------------------------------------------
-// hpm verify --import-key <keyid|keyfile>
+// hpm verify --import-key — FIXED: export_keys używa &Key przez collect+iter
 // ---------------------------------------------------------------------------
 
 pub fn import_key(key_source: &str) -> Result<()> {
-    use gpgme::{Context, Protocol};
+    use gpgme::{Context, Protocol, ExportMode};
 
     println!("{} Importing GPG key: {}", "→".cyan(), key_source.cyan());
 
+    // Pobierz dane klucza
     let key_data = if Path::new(key_source).exists() {
-        // Plik lokalny
         fs::read(key_source).into_diagnostic()?
     } else {
-        // Pobierz z serwera kluczy
+        // FIXED: reqwest::blocking dostępne po dodaniu feature "blocking"
         let url = if key_source.starts_with("http") {
             key_source.to_string()
         } else {
@@ -170,26 +165,31 @@ pub fn import_key(key_source: &str) -> Result<()> {
     let result = ctx.import(key_data.as_slice())
         .map_err(|e| miette!("Import failed: {}", e))?;
 
-    // Zapisz do trusted keyring
+    // Zapisz zaktualizowany keyring
     let keyring_dir = Path::new(TRUSTED_KEYRING).parent().unwrap();
     fs::create_dir_all(keyring_dir).into_diagnostic()?;
 
-    // Eksportuj zaktualizowany keyring
+    // FIXED: export_keys potrzebuje IntoIterator<Item = &Key>
+    // Zbieramy klucze do Vec<Key>, a potem exportujemy przez referencje
+    let all_keys: Vec<gpgme::Key> = ctx.keys()
+        .map_err(|e| miette!("{}", e))?
+        .filter_map(|k| k.ok())
+        .collect();
+
     let mut exported = Vec::new();
     ctx.export_keys(
-        ctx.keys().map_err(|e| miette!("{}", e))?
-           .filter_map(|k| k.ok()),
-        gpgme::ExportMode::empty(),
+        all_keys.iter(),  // iter() daje &Key — spełnia IntoIterator<Item = &Key>
+        ExportMode::empty(),
         &mut exported,
     ).map_err(|e| miette!("Export: {}", e))?;
     fs::write(TRUSTED_KEYRING, &exported).into_diagnostic()?;
 
-    let imported = result.imported();
+    let imported  = result.imported();
     let unchanged = result.unchanged();
     if imported > 0 {
         println!("{} Imported {} key(s) to {}", "✔".green(), imported, TRUSTED_KEYRING.cyan());
     } else if unchanged > 0 {
-        println!("{} Key already in keyring ({})", "→".yellow(), TRUSTED_KEYRING.dimmed());
+        println!("{} Key already in keyring", "→".yellow());
     }
     Ok(())
 }
