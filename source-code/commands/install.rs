@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use indicatif::{ProgressBar, ProgressStyle};
 use git2::{Repository, Oid, Tree};
 use crate::{
@@ -23,7 +24,60 @@ const ICON_DIR:    &str = "/usr/share/icons/hicolor";
 const PIXMAP_DIR:  &str = "/usr/share/pixmaps";
 
 // ---------------------------------------------------------------------------
-// /usr/bin wrapper conflict detection
+// SIGINT / SIGTERM cleanup registry
+// ---------------------------------------------------------------------------
+
+/// Globalna lista ścieżek staging które mają być wyczyszczone przy SIGINT.
+static STAGING_REGISTRY: std::sync::OnceLock<Arc<Mutex<Vec<PathBuf>>>> = std::sync::OnceLock::new();
+
+fn staging_registry() -> &'static Arc<Mutex<Vec<PathBuf>>> {
+    STAGING_REGISTRY.get_or_init(|| {
+        let registry = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let reg_clone = Arc::clone(&registry);
+
+        // Zarejestruj handler SIGINT i SIGTERM
+        unsafe {
+            libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, sigint_handler as libc::sighandler_t);
+        }
+
+        registry
+    })
+}
+
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    // Wyczyść wszystkie staging dirs
+    if let Some(registry) = STAGING_REGISTRY.get() {
+        if let Ok(dirs) = registry.lock() {
+            for dir in dirs.iter() {
+                if dir.exists() {
+                    let _ = fs::remove_dir_all(dir);
+                    eprintln!("\nhpm: cleaned up staging: {}", dir.display());
+                }
+            }
+        }
+    }
+    // Przywróć domyślny handler i ponownie wyślij sygnał
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+    }
+}
+
+fn register_staging(path: &Path) {
+    if let Ok(mut dirs) = staging_registry().lock() {
+        dirs.push(path.to_owned());
+    }
+}
+
+fn unregister_staging(path: &Path) {
+    if let Ok(mut dirs) = staging_registry().lock() {
+        dirs.retain(|p| p != path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wrapper conflict detection
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,14 +98,13 @@ const SYSTEM_CRITICAL: &[&str] = &[
     "ps", "kill", "killall", "top", "htop",
     "ip", "ifconfig", "ping", "curl", "wget", "ssh", "scp",
     "apt", "dpkg", "apt-get", "apt-cache",
-    "systemctl", "journalctl", "systemd",
+    "systemctl", "journalctl",
     "python", "python3", "perl", "ruby", "node", "npm",
     "git", "make", "gcc", "cc", "g++", "clang",
     "env", "which", "whereis", "type",
-    "hostname", "uname", "lsb_release",
-    "df", "du", "lsblk", "fdisk", "parted",
+    "hostname", "uname", "df", "du",
     "useradd", "userdel", "groupadd", "usermod",
-    "crontab", "at",
+    "crontab",
 ];
 
 fn classify_wrapper(bin_name: &str, path: &Path) -> WrapperConflict {
@@ -74,24 +127,17 @@ fn classify_wrapper(bin_name: &str, path: &Path) -> WrapperConflict {
     WrapperConflict::Foreign
 }
 
-/// Rozwiąż nazwę wrappera.
-/// Najpierw sprawdza persystentny cache (WrapperNames) — jeśli użytkownik
-/// wcześniej wybrał alternatywną nazwę, użyj jej bez pytania.
 fn resolve_wrapper_name(bin_name: &str, pkg_name: &str) -> Result<Option<String>> {
     // Sprawdź persystentny cache wyborów
     let wn = WrapperNames::load();
     if let Some(cached_name) = wn.get(pkg_name, bin_name) {
         let cached_path = Path::new("/usr/bin").join(cached_name);
-        // Jeśli zapamiętana nazwa jest wolna lub należy do nas — użyj jej
-        let conflict = classify_wrapper(cached_name, &cached_path);
+        let conflict    = classify_wrapper(cached_name, &cached_path);
         if conflict == WrapperConflict::Free
             || conflict == (WrapperConflict::HpmWrapper { pkg: pkg_name.to_string() })
         {
             return Ok(Some(cached_name.to_string()));
         }
-        // Zapamiętana nazwa jest teraz zajęta przez coś innego — zapytaj ponownie
-        eprintln!("  {} Cached wrapper name '/usr/bin/{}' for '{}' is now occupied, resolving again...",
-                  "⚠".yellow(), cached_name, bin_name);
     }
 
     let target   = Path::new("/usr/bin").join(bin_name);
@@ -101,40 +147,32 @@ fn resolve_wrapper_name(bin_name: &str, pkg_name: &str) -> Result<Option<String>
         WrapperConflict::Free => Ok(Some(bin_name.to_string())),
 
         WrapperConflict::HpmWrapper { ref pkg } => {
-            if pkg == pkg_name {
-                Ok(Some(bin_name.to_string()))
-            } else {
-                println!(
-                    "  {} {} /usr/bin/{} is already used by hpm package '{}'",
-                    "⚠".yellow(), "Conflict:".bold(), bin_name, pkg.cyan()
-                );
+            if pkg == pkg_name { Ok(Some(bin_name.to_string())) }
+            else {
+                println!("  {} {} /usr/bin/{} used by '{}'",
+                         "⚠".yellow(), "Conflict:".bold(), bin_name, pkg.cyan());
                 ask_wrapper_resolution(bin_name, pkg_name, "another hpm package")
             }
         }
 
         WrapperConflict::Foreign => {
-            let file_type = describe_foreign_file(&target);
-            println!(
-                "  {} {} /usr/bin/{} already exists ({})",
-                "⚠".yellow(), "Conflict:".bold(), bin_name.cyan(), file_type.dimmed()
-            );
-            ask_wrapper_resolution(bin_name, pkg_name, &file_type)
+            let ft = describe_foreign_file(&target);
+            println!("  {} {} /usr/bin/{} exists ({})",
+                     "⚠".yellow(), "Conflict:".bold(), bin_name.cyan(), ft.dimmed());
+            ask_wrapper_resolution(bin_name, pkg_name, &ft)
         }
 
         WrapperConflict::SystemCritical => {
-            eprintln!(
-                "  {} {} /usr/bin/{} is a critical system tool.",
-                "✗".red(), "Blocked:".bold(), bin_name.cyan()
-            );
+            eprintln!("  {} /usr/bin/{} is a critical system tool — blocked.",
+                      "✗".red(), bin_name.cyan());
             let suggested = format!("{}-{}", pkg_name, bin_name);
             let alt_path  = Path::new("/usr/bin").join(&suggested);
             if !alt_path.exists() {
-                eprint!("    Use suggested name '{}' instead? [Y/n] ", suggested.cyan());
+                eprint!("    Use '{}' instead? [Y/n] ", suggested.cyan());
                 std::io::stderr().flush().into_diagnostic()?;
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input).into_diagnostic()?;
                 if !input.trim().eq_ignore_ascii_case("n") {
-                    println!("    {} Using /usr/bin/{}", "→".yellow(), suggested.cyan());
                     return Ok(Some(suggested));
                 }
             }
@@ -142,59 +180,38 @@ fn resolve_wrapper_name(bin_name: &str, pkg_name: &str) -> Result<Option<String>
         }
     };
 
-    // Jeśli użytkownik wybrał niestandardową nazwę, zapisz ją
+    // Zapisz niestandardowy wybór
     if let Ok(Some(ref chosen)) = result {
         if chosen != bin_name {
             let mut wn = WrapperNames::load();
             wn.set(pkg_name, bin_name, chosen);
         }
     }
-
     result
 }
 
 fn ask_wrapper_resolution(bin_name: &str, pkg_name: &str, conflict_desc: &str) -> Result<Option<String>> {
-    let suggested_alt = format!("{}-{}", pkg_name, bin_name);
-    let alt_path      = Path::new("/usr/bin").join(&suggested_alt);
-
-    println!("  Options:");
-    println!("    {} Overwrite /usr/bin/{} (replaces {})", "[1]".cyan(), bin_name, conflict_desc);
-    if !alt_path.exists() {
-        println!("    {} Use /usr/bin/{} instead (safe)", "[2]".cyan(), suggested_alt);
-    }
-    println!("    {} Skip — don't create wrapper for '{}'", "[3]".cyan(), bin_name);
-
+    let suggested = format!("{}-{}", pkg_name, bin_name);
+    let alt_path  = Path::new("/usr/bin").join(&suggested);
+    println!("  [1] Overwrite /usr/bin/{} (replaces {})", bin_name, conflict_desc);
+    if !alt_path.exists() { println!("  [2] Use /usr/bin/{} instead (safe)", suggested); }
+    println!("  [3] Skip wrapper for '{}'", bin_name);
     eprint!("  Choice [2]: ");
     std::io::stderr().flush().into_diagnostic()?;
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).into_diagnostic()?;
-
     match input.trim() {
-        "1" => {
-            println!("    {} Overwriting /usr/bin/{}", "→".yellow(), bin_name);
-            Ok(Some(bin_name.to_string()))
-        }
-        "3" => {
-            println!("    {} Skipping wrapper for '{}'", "→".yellow(), bin_name);
-            Ok(None)
-        }
-        _ => {
-            if !alt_path.exists() {
-                println!("    {} Using /usr/bin/{}", "→".yellow(), suggested_alt.cyan());
-                Ok(Some(suggested_alt))
-            } else {
-                eprint!("    /usr/bin/{} also exists. Enter a custom name (or Enter to skip): ", suggested_alt);
+        "1" => Ok(Some(bin_name.to_string())),
+        "3" => Ok(None),
+        _   => {
+            if !alt_path.exists() { Ok(Some(suggested)) }
+            else {
+                eprint!("    /usr/bin/{} also exists. Custom name (or Enter to skip): ", suggested);
                 std::io::stderr().flush().into_diagnostic()?;
                 let mut custom = String::new();
                 std::io::stdin().read_line(&mut custom).into_diagnostic()?;
                 let custom = custom.trim().to_string();
-                if custom.is_empty() {
-                    println!("    {} Skipping wrapper for '{}'", "→".yellow(), bin_name);
-                    Ok(None)
-                } else {
-                    println!("    {} Using /usr/bin/{}", "→".yellow(), custom.cyan());
-                    Ok(Some(custom))
-                }
+                if custom.is_empty() { Ok(None) } else { Ok(Some(custom)) }
             }
         }
     }
@@ -206,8 +223,7 @@ fn describe_foreign_file(path: &Path) -> String {
         if let Ok(content) = fs::read(path) {
             if content.starts_with(b"#!") {
                 let end = content.iter().position(|&b| b == b'\n').unwrap_or(80).min(80);
-                let line = String::from_utf8_lossy(&content[..end]);
-                return format!("script: {}", line.trim());
+                return format!("script: {}", String::from_utf8_lossy(&content[..end]).trim());
             }
             if content.starts_with(b"\x7fELF") { return "compiled binary (ELF)".to_string(); }
         }
@@ -217,7 +233,23 @@ fn describe_foreign_file(path: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point — obsługa @tag oraz normalnych pakietów
+// ATOMOWY zapis wrappera — NOWE
+// Zamiast fs::write() bezpośrednio na /usr/bin/<name> piszemy do .tmp i rename().
+// Jeśli hpm zginie w połowie — tmp zostaje, ale /usr/bin/<name> jest albo stary albo nowy.
+// ---------------------------------------------------------------------------
+
+fn write_wrapper_atomic(wrapper_path: &Path, content: &str) -> Result<()> {
+    let tmp_path = wrapper_path.with_extension("hpm.tmp");
+    // Zapis do pliku tymczasowego
+    fs::write(&tmp_path, content.as_bytes()).into_diagnostic()?;
+    make_executable(&tmp_path)?;
+    // Atomowe zastąpienie (rename jest atomowe w obrębie tego samego filesystemu)
+    fs::rename(&tmp_path, wrapper_path).into_diagnostic()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn install(specs: Vec<String>) -> Result<()> {
@@ -231,21 +263,21 @@ pub fn install(specs: Vec<String>) -> Result<()> {
     let repo_mgr  = RepoManager::load_sync()?;
     let mut state = State::load()?;
 
-    // Rozwiń @tagi na listy pakietów
+    // Rozwiń @tagi
     let mut expanded: Vec<String> = Vec::new();
     for spec in &specs {
         if let Some(tag) = spec.strip_prefix('@') {
             let pkgs = repo_mgr.packages_for_tag(tag);
             if pkgs.is_empty() {
-                eprintln!("{} No packages found for tag '@{}'", "⚠".yellow(), tag);
-                let all_tags = repo_mgr.all_tags();
-                if !all_tags.is_empty() {
+                eprintln!("{} No packages for tag '@{}'", "⚠".yellow(), tag);
+                let all = repo_mgr.all_tags();
+                if !all.is_empty() {
                     eprintln!("  Available tags: {}",
-                        all_tags.iter().map(|t| format!("@{}", t)).collect::<Vec<_>>().join(", "));
+                        all.iter().map(|t| format!("@{}", t)).collect::<Vec<_>>().join(", "));
                 }
                 std::process::exit(1);
             }
-            println!("{} Tag @{} expands to {} package(s): {}",
+            println!("{} @{} → {} packages: {}",
                      "→".blue(), tag.cyan(), pkgs.len(),
                      pkgs.iter().map(|p| p.cyan().to_string()).collect::<Vec<_>>().join(", "));
             expanded.extend(pkgs);
@@ -253,15 +285,10 @@ pub fn install(specs: Vec<String>) -> Result<()> {
             expanded.push(spec.clone());
         }
     }
-
-    // Deduplikacja
     expanded.dedup();
-
-    // Sprawdź konflikty między pakietami z tej sesji
-    check_inter_package_conflicts(&expanded, &state)?;
+    check_inter_package_conflicts(&expanded)?;
 
     state.push_snapshot(&format!("pre-install {}", expanded.join(", ")));
-
     let mut any_installed = false;
 
     for spec in &expanded {
@@ -272,23 +299,20 @@ pub fn install(specs: Vec<String>) -> Result<()> {
             (spec.clone(), None)
         };
 
-        let _pkg_url = repo_mgr.get_package_url(&pkg_name)
-            .ok_or_else(|| miette::miette!(
-                "Package '{}' not found in repository index.\n  Run {} to refresh.",
+        if repo_mgr.get_package_url(&pkg_name).is_none() {
+            return Err(miette::miette!(
+                "Package '{}' not found.\n  Run {} to refresh.",
                 pkg_name, "hpm refresh".yellow()
-            ))?;
+            ));
+        }
 
-        if let Some(ver) = &requested_ver {
-            if let Some(vers) = state.packages.get(&pkg_name) {
-                if vers.contains_key(ver.as_str()) {
-                    println!("{} {}@{} is already installed",
-                             "✔".green(), pkg_name.cyan(), ver.cyan());
-                    continue;
-                }
+        if let Some(ref ver) = requested_ver {
+            if state.packages.get(&pkg_name).map(|vs| vs.contains_key(ver.as_str())).unwrap_or(false) {
+                println!("{} {}@{} is already installed", "✔".green(), pkg_name.cyan(), ver.cyan());
+                continue;
             }
         } else if let Some(cur) = state.get_current_version(&pkg_name) {
-            println!("{} {} is already installed (version {})",
-                     "✔".green(), pkg_name.cyan(), cur.cyan());
+            println!("{} {} is already installed ({})", "✔".green(), pkg_name.cyan(), cur.cyan());
             continue;
         }
 
@@ -300,17 +324,12 @@ pub fn install(specs: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Sprawdź konflikty między pakietami z tej samej sesji instalacji.
-fn check_inter_package_conflicts(specs: &[String], state: &State) -> Result<()> {
+fn check_inter_package_conflicts(specs: &[String]) -> Result<()> {
     let pkg_names: Vec<&str> = specs.iter()
-        .map(|s| {
-            let idx = s.find('@').unwrap_or(s.len());
-            &s[..idx]
-        })
+        .map(|s| { let i = s.find('@').unwrap_or(s.len()); &s[..i] })
         .collect();
-
     for i in 0..pkg_names.len() {
-        for j in (i + 1)..pkg_names.len() {
+        for j in (i+1)..pkg_names.len() {
             if pkg_names[i] == pkg_names[j] {
                 bail!("Duplicate package '{}' in install list", pkg_names[i]);
             }
@@ -320,22 +339,18 @@ fn check_inter_package_conflicts(specs: &[String], state: &State) -> Result<()> 
 }
 
 // ---------------------------------------------------------------------------
-// Install a single package
+// install_single
 // ---------------------------------------------------------------------------
 
 pub fn install_single(
-    pkg_name: &str,
-    version: Option<&str>,
-    repo_mgr: &RepoManager,
-    state: &mut State,
-    manually_installed: bool,
+    pkg_name: &str, version: Option<&str>,
+    repo_mgr: &RepoManager, state: &mut State, manually_installed: bool,
 ) -> Result<()> {
     let pkg_url = repo_mgr.get_package_url(pkg_name)
         .ok_or_else(|| miette::miette!("Package '{}' not found", pkg_name))?;
 
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::default_spinner()
-        .template("{spinner:.red} {msg}").unwrap());
+    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.red} {msg}").unwrap());
     pb.set_message(format!("Fetching {}...", pkg_name.cyan()));
 
     let repo_path = repo_mgr.clone_package_repo(pkg_name, pkg_url)?;
@@ -344,64 +359,56 @@ pub fn install_single(
     let (selected_version, commit_oid) = resolve_version(&repo, &tags, version, pkg_name)?;
 
     pb.set_message(format!("Extracting {}@{}...", pkg_name.cyan(), selected_version.green()));
-
     let checkout_dir = tempfile::tempdir().into_diagnostic()?;
     let commit       = repo.find_commit(commit_oid).into_diagnostic()?;
     let tree         = commit.tree().into_diagnostic()?;
     extract_tree(&repo, &tree, checkout_dir.path())?;
 
-    let src_dir   = checkout_dir.path();
+    let src_dir  = checkout_dir.path();
     pb.set_message("Reading manifest...");
-    let manifest  = Manifest::load_from_path(src_dir.to_str().unwrap())?;
+    let manifest = Manifest::load_from_path(src_dir.to_str().unwrap())?;
+
+    // Arch validation
+    crate::manifest::check_arch_compatibility(&manifest.arch)?;
+
     let build_cfg = BuildConfig::load_from_dir(src_dir);
 
     // Conflict check
-    let conflict_violations = state.check_conflicts(pkg_name, &manifest.conflicts);
-    if !conflict_violations.is_empty() {
-        bail!(
-            "Cannot install '{}': package conflicts:\n{}",
-            pkg_name,
-            conflict_violations.iter().map(|v| format!("  ✗ {}", v)).collect::<Vec<_>>().join("\n")
-        );
+    let violations = state.check_conflicts(pkg_name, &manifest.conflicts);
+    if !violations.is_empty() {
+        bail!("Cannot install '{}': conflicts:\n{}", pkg_name,
+              violations.iter().map(|v| format!("  ✗ {}", v)).collect::<Vec<_>>().join("\n"));
     }
 
-    // Deps — z wykrywaniem niekompatybilnych wersji
+    // Deps
     if !manifest.deps.is_empty() {
         pb.set_message("Resolving dependencies...");
         for (dep_name, dep_req) in &manifest.deps {
             let already_ok = state.packages.get(dep_name)
-                .map(|vers| vers.keys().any(|v| crate::utils::satisfies(v, dep_req)))
+                .map(|vs| vs.keys().any(|v| crate::utils::satisfies(v, dep_req)))
                 .unwrap_or(false);
-
             if !already_ok {
-                if let Some(installed_vers) = state.packages.get(dep_name) {
-                    if !installed_vers.is_empty() {
-                        println!("\n  {} Dependency {} requires {} but installed version incompatible — updating",
-                                 "⚠".yellow(), dep_name.cyan(), dep_req);
-                    }
+                if state.packages.get(dep_name).map(|vs| !vs.is_empty()).unwrap_or(false) {
+                    println!("\n  {} dep {} requires {} — updating",
+                             "⚠".yellow(), dep_name.cyan(), dep_req);
                 }
-                println!("\n  {} Installing dependency: {}{}",
-                         "→".yellow(), dep_name.cyan(),
-                         if dep_req.is_empty() { String::new() }
-                         else { format!(" ({})", dep_req) });
-                let dep_ver = if dep_req.is_empty() || dep_req.starts_with(">=")
-                    || dep_req.starts_with('>') || dep_req.starts_with('=') { None }
-                    else { Some(dep_req.as_str()) };
+                println!("\n  {} Installing dep: {}{}", "→".yellow(), dep_name.cyan(),
+                         if dep_req.is_empty() { String::new() } else { format!(" ({})", dep_req) });
+                let dep_ver = if dep_req.is_empty() || dep_req.starts_with('>') || dep_req.starts_with('=') { None }
+                              else { Some(dep_req.as_str()) };
                 install_single(dep_name, dep_ver, repo_mgr, state, false)?;
             }
         }
     }
 
-    // Build deps (deb)
-    let mut build_deb_deps = manifest.build.deb_deps.clone();
+    // Build deps
+    let mut build_deb = manifest.build.deb_deps.clone();
     if let Some(ref cfg) = build_cfg {
-        for dep in &cfg.build_deps {
-            if !build_deb_deps.contains(dep) { build_deb_deps.push(dep.clone()); }
-        }
+        for d in &cfg.build_deps { if !build_deb.contains(d) { build_deb.push(d.clone()); } }
     }
-    if !build_deb_deps.is_empty() {
-        pb.set_message("Installing build dependencies...");
-        crate::utils::ensure_deb_packages(&build_deb_deps)?;
+    if !build_deb.is_empty() {
+        pb.set_message("Installing build deps...");
+        crate::utils::ensure_deb_packages(&build_deb)?;
     }
 
     // Build
@@ -413,15 +420,28 @@ pub fn install_single(
     };
 
     if !contents_src.exists() {
-        bail!("No 'contents/' directory found for '{}@{}'.", pkg_name, selected_version);
+        bail!("No 'contents/' for '{}@{}'", pkg_name, selected_version);
     }
 
-    // Atomic staging
+    // Pre-install hook
+    if manifest.has_hooks {
+        let store_path_str = format!("{}{}/{}", STORE_PATH, pkg_name, selected_version);
+        let ctx = crate::hooks::HookContext {
+            pkg_name, pkg_version: &selected_version,
+            store_path: &store_path_str, old_version: None,
+        };
+        crate::hooks::run_hook(src_dir, crate::hooks::HookKind::PreInstall, &ctx)?;
+    }
+
+    // Atomic staging — zarejestruj w SIGINT registry
     let dest_dir    = Path::new(STORE_PATH).join(pkg_name).join(&selected_version);
     let staging_dir = Path::new(STORE_PATH).join(pkg_name)
         .join(format!(".staging-{}", selected_version));
     if staging_dir.exists() { let _ = fs::remove_dir_all(&staging_dir); }
     fs::create_dir_all(&staging_dir).into_diagnostic()?;
+
+    // Zarejestruj staging do cleanup przy SIGINT
+    register_staging(&staging_dir);
 
     let stage_result = (|| -> Result<()> {
         copy_dir_all(&contents_src, &staging_dir)?;
@@ -430,31 +450,33 @@ pub fn install_single(
         if manifest_src.exists() {
             fs::copy(&manifest_src, staging_dir.join("info.hk")).into_diagnostic()?;
         }
+        // Kopiuj hooki do store
+        crate::hooks::install_hooks(src_dir, &staging_dir)?;
         Ok(())
     })();
 
     if let Err(e) = stage_result {
         let _ = fs::remove_dir_all(&staging_dir);
+        unregister_staging(&staging_dir);
         return Err(e);
     }
 
     if dest_dir.exists() { fs::remove_dir_all(&dest_dir).into_diagnostic()?; }
     fs::rename(&staging_dir, &dest_dir).into_diagnostic()?;
+    unregister_staging(&staging_dir);
 
-    // Runtime deb deps
-    let mut runtime_deb_deps = manifest.runtime.deb_deps.clone();
+    // Runtime deps
+    let mut runtime_deb = manifest.runtime.deb_deps.clone();
     if let Some(ref cfg) = build_cfg {
-        for dep in &cfg.runtime_deps {
-            if !runtime_deb_deps.contains(dep) { runtime_deb_deps.push(dep.clone()); }
-        }
+        for d in &cfg.runtime_deps { if !runtime_deb.contains(d) { runtime_deb.push(d.clone()); } }
     }
-    if !runtime_deb_deps.is_empty() {
-        pb.set_message("Installing runtime dependencies...");
-        crate::utils::ensure_deb_packages(&runtime_deb_deps)?;
+    if !runtime_deb.is_empty() {
+        pb.set_message("Installing runtime deps...");
+        crate::utils::ensure_deb_packages(&runtime_deb)?;
     }
 
-    // /usr/bin wrappers — z persystencją nazw
-    pb.set_message("Checking /usr/bin for conflicts...");
+    // Wrappers — ATOMOWY ZAPIS
+    pb.set_message("Creating binary wrappers...");
     let hpm_exe = std::env::current_exe().into_diagnostic()?;
 
     for bin_name in &manifest.bins {
@@ -468,16 +490,13 @@ pub fn install_single(
 
         let bin_rel = match bin_rel {
             Some(r) => { make_executable(&dest_dir.join(&r)).ok(); r }
-            None => {
-                pb.suspend(|| print_binary_not_found_help(&dest_dir, bin_name, pkg_name));
-                continue;
-            }
+            None    => { pb.suspend(|| print_binary_not_found_help(&dest_dir, bin_name)); continue; }
         };
 
         let wrapper_name = match resolve_wrapper_name(bin_name, pkg_name)? {
-            Some(name) => name,
-            None => {
-                println!("  {} Skipped wrapper for '{}'. Run manually:\n    {} run {} {}",
+            Some(n) => n,
+            None    => {
+                println!("  {} Skipped '{}'. Run: {} run {} {}",
                          "ℹ".cyan(), bin_name, hpm_exe.display(), pkg_name, bin_rel);
                 continue;
             }
@@ -488,8 +507,8 @@ pub fn install_single(
             "#!/bin/sh\nexec {} run {} {} \"$@\"\n",
             hpm_exe.display(), pkg_name, bin_rel
         );
-        fs::write(&wrapper_path, &content).into_diagnostic()?;
-        make_executable(&wrapper_path)?;
+        // ATOMOWY ZAPIS: .tmp → rename
+        write_wrapper_atomic(&wrapper_path, &content)?;
 
         if wrapper_name == *bin_name {
             println!("  {} Wrapper: {} → {}/{}/{}",
@@ -508,14 +527,25 @@ pub fn install_single(
                                         &hpm_exe.display().to_string())?;
     }
 
-    let depends_on: HashSet<String> = manifest.deps.iter()
-        .map(|(name, _)| {
-            state.get_current_version(name)
-                .map(|ver| format!("{}@{}", name, ver))
-                .unwrap_or_else(|| name.clone())
-        }).collect();
-    let conflicts_with: HashSet<String> = manifest.conflicts.iter().cloned().collect();
+    // Bash completion — NOWE
+    install_completions(&dest_dir, bin_name_for_pkg(&manifest, pkg_name))?;
 
+    // Post-install hook
+    if manifest.has_hooks {
+        let store_path_str = format!("{}{}/{}", STORE_PATH, pkg_name, selected_version);
+        let ctx = crate::hooks::HookContext {
+            pkg_name, pkg_version: &selected_version,
+            store_path: &store_path_str, old_version: None,
+        };
+        crate::hooks::run_hook(&dest_dir, crate::hooks::HookKind::PostInstall, &ctx)?;
+    }
+
+    let depends_on: HashSet<String> = manifest.deps.iter().map(|(name, _)| {
+        state.get_current_version(name)
+            .map(|ver| format!("{}@{}", name, ver))
+            .unwrap_or_else(|| name.clone())
+    }).collect();
+    let conflicts_with: HashSet<String> = manifest.conflicts.iter().cloned().collect();
     let checksum = compute_dir_hash(&dest_dir).unwrap_or_default();
     state.update_package(pkg_name, &selected_version, &checksum,
                          manually_installed, depends_on, conflicts_with);
@@ -532,7 +562,39 @@ pub fn install_single(
 }
 
 // ---------------------------------------------------------------------------
-// Desktop integration — pub API (używane przez rollback i repair)
+// Bash/Zsh/Fish completion — NOWE
+// Jeśli pakiet ma plik completions/<name>.bash (lub .zsh, .fish) — instaluj.
+// ---------------------------------------------------------------------------
+
+fn install_completions(dest_dir: &Path, bin_name: &str) -> Result<()> {
+    let completions_dir = dest_dir.join("completions");
+    if !completions_dir.exists() { return Ok(()); }
+
+    let targets: &[(&str, &str)] = &[
+        (".bash", "/usr/share/bash-completion/completions/"),
+        (".zsh",  "/usr/share/zsh/site-functions/"),
+        (".fish", "/usr/share/fish/completions/"),
+    ];
+
+    for (ext, install_dir) in targets {
+        let src = completions_dir.join(format!("{}{}", bin_name, ext));
+        if !src.exists() { continue; }
+        if fs::create_dir_all(install_dir).is_ok() {
+            let dst = Path::new(install_dir).join(format!("{}{}", bin_name, ext));
+            if fs::copy(&src, &dst).is_ok() {
+                println!("  {} Completion: {} → {}", "✔".green(), src.file_name().unwrap_or_default().to_string_lossy().dimmed(), install_dir.dimmed());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bin_name_for_pkg<'a>(manifest: &'a Manifest, pkg_name: &'a str) -> &'a str {
+    manifest.bins.first().map(|s| s.as_str()).unwrap_or(pkg_name)
+}
+
+// ---------------------------------------------------------------------------
+// Desktop integration pub API
 // ---------------------------------------------------------------------------
 
 pub fn install_desktop_integration_pub(
@@ -543,7 +605,7 @@ pub fn install_desktop_integration_pub(
 }
 
 // ---------------------------------------------------------------------------
-// Make binaries executable
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn make_all_binaries_executable(dir: &Path, manifest: &Manifest) -> Result<()> {
@@ -567,9 +629,8 @@ fn make_scripts_executable_recursive(dir: &Path) {
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                make_scripts_executable_recursive(&path);
-            } else {
+            if path.is_dir() { make_scripts_executable_recursive(&path); }
+            else {
                 use std::io::Read;
                 if let Ok(mut f) = fs::File::open(&path) {
                     let mut buf = [0u8; 2];
@@ -582,33 +643,18 @@ fn make_scripts_executable_recursive(dir: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Binary not found diagnostics
-// ---------------------------------------------------------------------------
-
-fn print_binary_not_found_help(dest_dir: &Path, bin_name: &str, _pkg_name: &str) {
+fn print_binary_not_found_help(dest_dir: &Path, bin_name: &str) {
     eprintln!("{} Binary '{}' not found in installed files.", "⚠".yellow(), bin_name.cyan());
     let all   = list_all_files(dest_dir);
     let execs: Vec<_> = all.iter().filter(|p| {
         p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
     }).collect();
-
     if execs.is_empty() {
-        eprintln!("  No executable files in store. Files present:");
-        for f in &all {
-            if let Ok(rel) = f.strip_prefix(dest_dir) { eprintln!("    {}", rel.display()); }
-        }
-        eprintln!("  {} Fix: git update-index --chmod=+x contents/bin/<binary>", "→".yellow());
+        eprintln!("  No executables. Fix: git update-index --chmod=+x contents/bin/<binary>");
     } else {
         eprintln!("  Executables found:");
         for f in &execs {
             if let Ok(rel) = f.strip_prefix(dest_dir) { eprintln!("    {}", rel.display()); }
-        }
-        if let Some(first) = execs.first() {
-            if let Ok(rel) = first.strip_prefix(dest_dir) {
-                eprintln!("  {} Declare in info.hk:", "→".yellow());
-                eprintln!("    -> bins.{} => \"{}\"", bin_name, rel.display());
-            }
         }
     }
 }
@@ -630,10 +676,6 @@ fn collect_all(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Binary discovery
-// ---------------------------------------------------------------------------
 
 pub fn find_binary_in_dir(pkg_dir: &Path, bin_name: &str) -> Option<String> {
     if pkg_dir.join("bin").join(bin_name).exists() { return Some(format!("bin/{}", bin_name)); }
@@ -667,7 +709,6 @@ fn install_desktop_integration(
     let icon_name = install_icon(dest_dir, manifest, pkg_name)?;
     fs::create_dir_all(DESKTOP_DIR).into_diagnostic()?;
     let desktop_path = Path::new(DESKTOP_DIR).join(format!("{}.desktop", pkg_name));
-
     if !desktop.desktop_file.is_empty() {
         let custom = dest_dir.join(&desktop.desktop_file);
         if custom.exists() {
@@ -681,18 +722,15 @@ fn install_desktop_integration(
         patch_desktop_exec(&desktop_path, hpm_exe, pkg_name, manifest)?;
         return Ok(());
     }
-
-    let bin_name = manifest.bins.first().map(|s| s.as_str()).unwrap_or(pkg_name);
+    let bin_name     = manifest.bins.first().map(|s| s.as_str()).unwrap_or(pkg_name);
     let display_name = if !desktop.display_name.is_empty() { desktop.display_name.clone() }
     else {
         let mut c = pkg_name.chars();
         c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
     };
-    let categories = if !desktop.categories.is_empty() { desktop.categories.clone() }
-        else { "Utility;".to_string() };
-    let comment = if !desktop.comment.is_empty() { desktop.comment.clone() }
-        else { manifest.summary.clone() };
-    let exec_cmd = format!("{} run {} {}", hpm_exe, pkg_name, bin_name);
+    let categories = if !desktop.categories.is_empty() { desktop.categories.clone() } else { "Utility;".to_string() };
+    let comment    = if !desktop.comment.is_empty()    { desktop.comment.clone()    } else { manifest.summary.clone() };
+    let exec_cmd   = format!("{} run {} {}", hpm_exe, pkg_name, bin_name);
     let mut content = format!(
         "[Desktop Entry]\nType=Application\nName={}\nComment={}\nExec={} %F\nCategories={}\nTerminal={}\n",
         display_name, comment, exec_cmd, categories,
@@ -746,12 +784,10 @@ fn patch_desktop_exec(path: &Path, hpm_exe: &str, pkg_name: &str, manifest: &Man
     let new_exec = format!("{} run {} {}", hpm_exe, pkg_name, bin_name);
     let patched: String = content.lines().map(|line| {
         if line.starts_with("Exec=") {
-            let suffix = line.trim_start_matches("Exec=")
-                .split_whitespace().skip(1)
-                .filter(|t| t.starts_with('%'))
-                .collect::<Vec<_>>().join(" ");
+            let suffix = line.trim_start_matches("Exec=").split_whitespace().skip(1)
+                .filter(|t| t.starts_with('%')).collect::<Vec<_>>().join(" ");
             if suffix.is_empty() { format!("Exec={}", new_exec) }
-            else { format!("Exec={} {}", new_exec, suffix) }
+            else                  { format!("Exec={} {}", new_exec, suffix) }
         } else { line.to_string() }
     }).collect::<Vec<_>>().join("\n");
     fs::write(path, patched + "\n").into_diagnostic()?;
@@ -762,11 +798,8 @@ fn find_file_by_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = find_file_by_ext(&path, ext) { return Some(found); }
-            } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-                return Some(path);
-            }
+            if path.is_dir() { if let Some(f) = find_file_by_ext(&path, ext) { return Some(f); } }
+            else if path.extension().and_then(|e| e.to_str()) == Some(ext) { return Some(path); }
         }
     }
     None
@@ -788,7 +821,7 @@ fn extract_tree(repo: &Repository, tree: &Tree, dest: &Path) -> Result<()> {
                 }
                 fs::write(&entry_path, blob.content()).into_diagnostic()?;
                 if entry.filemode() == 0o100755 { make_executable(&entry_path)?; }
-                if blob.content().starts_with(b"#!")  { make_executable(&entry_path)?; }
+                if blob.content().starts_with(b"#!") { make_executable(&entry_path)?; }
             }
             Some(git2::ObjectType::Tree) => {
                 fs::create_dir_all(&entry_path).into_diagnostic()?;
@@ -802,7 +835,7 @@ fn extract_tree(repo: &Repository, tree: &Tree, dest: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Classic build
+// Build
 // ---------------------------------------------------------------------------
 
 fn run_classic_build(src_dir: &Path, manifest: &Manifest, pb: &ProgressBar) -> Result<()> {
@@ -810,19 +843,13 @@ fn run_classic_build(src_dir: &Path, manifest: &Manifest, pb: &ProgressBar) -> R
     if build_script.exists() {
         pb.set_message("Running build.info...");
         make_executable(&build_script)?;
-        crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest,
-                                     &["./build.info".to_string()])?;
+        crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest, &["./build.info".to_string()])?;
     } else if !manifest.build.commands.is_empty() {
         pb.set_message("Building package...");
-        crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest,
-                                     &manifest.build.commands)?;
+        crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest, &manifest.build.commands)?;
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// build.toml build
-// ---------------------------------------------------------------------------
 
 fn run_build_config(
     cfg: &BuildConfig, src_dir: &Path, version: &str,
@@ -830,63 +857,48 @@ fn run_build_config(
 ) -> Result<PathBuf> {
     let contents_dir = src_dir.join("contents");
     fs::create_dir_all(&contents_dir).into_diagnostic()?;
-
     let install_path = if cfg.install_path.is_empty() { format!("bin/{}", pkg_name) }
-        else { cfg.install_path.clone() };
+                       else { cfg.install_path.clone() };
     let dest = contents_dir.join(&install_path);
     if let Some(parent) = dest.parent() { fs::create_dir_all(parent).into_diagnostic()?; }
 
     match &cfg.source {
         BuildSource::Prebuilt => { pb.set_message("Using prebuilt contents/..."); }
-
         BuildSource::Download { url, binary_path, strip_components } => {
             let resolved_url = url.replace("{version}", version);
             pb.set_message(format!("Downloading {}...", resolved_url.dimmed()));
-            let tmp      = tempfile::NamedTempFile::new().into_diagnostic()?;
+            let tmp = tempfile::NamedTempFile::new().into_diagnostic()?;
             let tmp_path = tmp.path().to_str().unwrap().to_string();
             download_file(&resolved_url, &tmp_path)?;
-
             let is_tar = resolved_url.contains(".tar.") || resolved_url.ends_with(".tgz");
             let is_zip = resolved_url.ends_with(".zip");
-
             if is_tar {
                 let ex = tempfile::tempdir().into_diagnostic()?;
                 let mut cmd = std::process::Command::new("tar");
                 cmd.arg("-xf").arg(&tmp_path).arg("-C").arg(ex.path());
-                if *strip_components > 0 {
-                    cmd.arg(format!("--strip-components={}", strip_components));
-                }
+                if *strip_components > 0 { cmd.arg(format!("--strip-components={}", strip_components)); }
                 if !cmd.status().into_diagnostic()?.success() { bail!("tar extraction failed"); }
                 if binary_path.is_empty() { copy_dir_all(ex.path(), &contents_dir)?; }
-                else {
-                    fs::copy(ex.path().join(binary_path), &dest).into_diagnostic()?;
-                    make_executable(&dest)?;
-                }
+                else { fs::copy(ex.path().join(binary_path), &dest).into_diagnostic()?; make_executable(&dest)?; }
             } else if is_zip {
                 let ex = tempfile::tempdir().into_diagnostic()?;
                 if !std::process::Command::new("unzip")
                     .args(["-q", &tmp_path, "-d", ex.path().to_str().unwrap()])
                     .status().into_diagnostic()?.success() { bail!("unzip failed"); }
                 if binary_path.is_empty() { copy_dir_all(ex.path(), &contents_dir)?; }
-                else {
-                    fs::copy(ex.path().join(binary_path), &dest).into_diagnostic()?;
-                    make_executable(&dest)?;
-                }
+                else { fs::copy(ex.path().join(binary_path), &dest).into_diagnostic()?; make_executable(&dest)?; }
             } else {
                 fs::copy(&tmp_path, &dest).into_diagnostic()?;
                 make_executable(&dest)?;
             }
         }
-
         BuildSource::Build { commands, output } => {
             pb.set_message("Building from source...");
             for (k, v) in &cfg.env { std::env::set_var(k, v); }
             let script = src_dir.join("_hpm_build.sh");
-            fs::write(&script, format!("#!/bin/sh\nset -e\n{}", commands.join("\n")))
-                .into_diagnostic()?;
+            fs::write(&script, format!("#!/bin/sh\nset -e\n{}", commands.join("\n"))).into_diagnostic()?;
             make_executable(&script)?;
-            crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest,
-                                         &["./_hpm_build.sh".to_string()])?;
+            crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest, &["./_hpm_build.sh".to_string()])?;
             let _ = fs::remove_file(&script);
             let out = src_dir.join(output);
             if !out.exists() { bail!("Build output '{}' not found.", output); }
@@ -902,10 +914,8 @@ fn run_build_config(
 // ---------------------------------------------------------------------------
 
 fn resolve_version(
-    repo: &Repository,
-    tags: &git2::string_array::StringArray,
-    version: Option<&str>,
-    pkg_name: &str,
+    repo: &Repository, tags: &git2::string_array::StringArray,
+    version: Option<&str>, pkg_name: &str,
 ) -> Result<(String, Oid)> {
     if let Some(v) = version {
         let found = tags.iter().flatten()
