@@ -67,12 +67,12 @@ fn check_environment() -> Result<()> {
     let mut all_ok = true;
     for (cmd, desc, required) in checks {
         let found = std::process::Command::new("which").arg(cmd).output()
-            .map(|o| o.status.success()).unwrap_or(false);
+        .map(|o| o.status.success()).unwrap_or(false);
         if found {
             let version = std::process::Command::new(cmd).arg("--version").output().ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.lines().next().unwrap_or("").trim().to_string())
-                .unwrap_or_default();
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.lines().next().unwrap_or("").trim().to_string())
+            .unwrap_or_default();
             println!("  {} {:<35} {}", "✔".green(), desc, version.dimmed());
         } else if *required {
             println!("  {} {:<35} MISSING (required)", "✗".red(), desc);
@@ -191,10 +191,9 @@ struct TestEnvironment {
 impl TestEnvironment {
     fn setup() -> Result<Self> {
         let tmp = tempfile::tempdir().into_diagnostic()?;
-        // FIXED: keep() → std::io::Result<(TempDir, PathBuf)>
-        // Używamy map_err zamiast into_diagnostic() bo typ błędu to (io::Error, TempDir)
-        let (_guard, root) = tmp.keep()
-            .map_err(|(e, _)| miette::miette!("Failed to keep tempdir: {}", e))?;
+        // FIXED: TempDir::keep() zwraca PathBuf bezpośrednio (nie Result ani tuple)
+        // Dokumentacja: "Persist the temporary directory, returning the PathBuf where it is located"
+        let root      = tmp.keep();
         let store     = root.join("store");
         let lock_file = root.join("hpm.lock");
         fs::create_dir_all(&store).into_diagnostic()?;
@@ -211,7 +210,7 @@ impl TestEnvironment {
 [description]\n-> summary => Test package {}\n\
 [sandbox]\n-> network => false\n-> gui => false\n-> full_gui => false\n\
 -> dev => false\n-> disabled => false\n-> filesystem => {{}}\n",
-            name, version, extra, name
+name, version, extra, name
         );
         fs::write(dir.join("info.hk"), &info).ok();
         let bin = dir.join(format!("contents/bin/{}", name));
@@ -241,7 +240,7 @@ fn test_manifest_invalid(env: &TestEnvironment) -> Result<()> {
     match crate::manifest::Manifest::load_from_path(dir.to_str().unwrap()) {
         Err(_)  => Ok(()),
         Ok(m)   => if m.name.is_empty() { Ok(()) }
-                   else { bail!("Expected failure for empty name") }
+        else { bail!("Expected failure for empty name") }
     }
 }
 
@@ -249,7 +248,7 @@ fn test_build_validates(env: &TestEnvironment) -> Result<()> {
     let dir = env.root.join("pkg-build-test");
     fs::create_dir_all(dir.join("contents/bin")).into_diagnostic()?;
     fs::write(dir.join("info.hk"),
-        "[metadata]\n-> name => valid-pkg\n-> version => 1.0.0\n\
+              "[metadata]\n-> name => valid-pkg\n-> version => 1.0.0\n\
 [description]\n-> summary => test\n\
 [sandbox]\n-> network => false\n-> gui => false\n-> full_gui => false\n\
 -> dev => false\n-> disabled => false\n-> filesystem => {}\n"
@@ -286,9 +285,9 @@ fn test_lock_check_diff() -> Result<()> {
     let mut lock = LockFile::new();
     lock.packages.insert("missing-pkg".to_string(), LockEntry {
         version: "1.0.0".to_string(), git_commit: "abc".to_string(),
-        repo_url: "https://github.com/test/test".to_string(),
-        checksum: "dead".to_string(), dependencies: HashMap::new(),
-        manually_installed: true, installed_at: 0,
+                         repo_url: "https://github.com/test/test".to_string(),
+                         checksum: "dead".to_string(), dependencies: HashMap::new(),
+                         manually_installed: true, installed_at: 0,
     });
     let state = State::default();
     let diffs = lock.check_against_state(&state);
@@ -304,7 +303,7 @@ fn test_state_roundtrip() -> Result<()> {
     let mut info  = VersionInfo::new("abc123", true);
     info.depends_on = HashSet::from(["dep-a@1.0.0".to_string()]);
     state.packages.entry("test-pkg".to_string()).or_default()
-        .insert("2.0.0".to_string(), info);
+    .insert("2.0.0".to_string(), info);
     let data: Vec<u8> = serde_json::to_vec_pretty(&state).into_diagnostic()?;
     let loaded: State = serde_json::from_slice(&data).into_diagnostic()?;
     assert!(loaded.packages.contains_key("test-pkg"));
@@ -319,7 +318,7 @@ fn test_state_conflict() -> Result<()> {
     let mut info  = VersionInfo::new("hash1", true);
     info.conflicts_with = HashSet::from(["new-pkg".to_string()]);
     state.packages.entry("installed-pkg".to_string()).or_default()
-        .insert("1.0.0".to_string(), info);
+    .insert("1.0.0".to_string(), info);
     let conflicts = state.check_conflicts("new-pkg", &[]);
     assert!(!conflicts.is_empty());
     assert!(conflicts[0].contains("new-pkg"));
@@ -402,10 +401,10 @@ using <gen 2>\n\
 \n\
 ;; Sprawdź zależności\n\
 @ dep in curl git\n\
-    ::which @dep\n\
-    ? ok\n\
-        ::green tick @dep dostepny\n\
-    done\n\
+::which @dep\n\
+? ok\n\
+::green tick @dep dostepny\n\
+done\n\
 done\n\
 \n\
 ~> Pre-install hook zakonczony\n";
@@ -445,13 +444,13 @@ fn test_hooks_post_install(env: &TestEnvironment) -> Result<()> {
     fs::create_dir_all(&hooks_dir).into_diagnostic()?;
     fs::write(hooks_dir.join("post-install.hl"),
               b"#!/usr/bin/env hl\n~> post-install hook ran\n").into_diagnostic()?;
-    crate::utils::make_executable(&hooks_dir.join("post-install.hl"))?;
-    let ctx = HookContext {
-        pkg_name: "post-hook-pkg", pkg_version: "2.0.0",
-        store_path: env.store.to_str().unwrap(), old_version: None,
-    };
-    run_hook(&dir, HookKind::PostInstall, &ctx)?;
-    Ok(())
+              crate::utils::make_executable(&hooks_dir.join("post-install.hl"))?;
+              let ctx = HookContext {
+                  pkg_name: "post-hook-pkg", pkg_version: "2.0.0",
+                  store_path: env.store.to_str().unwrap(), old_version: None,
+              };
+              run_hook(&dir, HookKind::PostInstall, &ctx)?;
+              Ok(())
 }
 
 fn test_hooks_fail_blocks(env: &TestEnvironment) -> Result<()> {
@@ -462,15 +461,15 @@ fn test_hooks_fail_blocks(env: &TestEnvironment) -> Result<()> {
     // sh fallback gdy hl niedostępny — exit 1 blokuje instalację
     fs::write(hooks_dir.join("pre-install.hl"),
               b"#!/bin/sh\necho 'Refusing'\nexit 1\n").into_diagnostic()?;
-    crate::utils::make_executable(&hooks_dir.join("pre-install.hl"))?;
-    let ctx = HookContext {
-        pkg_name: "bad-hook-pkg", pkg_version: "1.0.0",
-        store_path: env.store.to_str().unwrap(), old_version: None,
-    };
-    match run_hook(&dir, HookKind::PreInstall, &ctx) {
-        Err(_) => Ok(()),
-        Ok(_)  => bail!("pre-install hook failure should have blocked install"),
-    }
+              crate::utils::make_executable(&hooks_dir.join("pre-install.hl"))?;
+              let ctx = HookContext {
+                  pkg_name: "bad-hook-pkg", pkg_version: "1.0.0",
+                  store_path: env.store.to_str().unwrap(), old_version: None,
+              };
+              match run_hook(&dir, HookKind::PreInstall, &ctx) {
+                  Err(_) => Ok(()),
+                  Ok(_)  => bail!("pre-install hook failure should have blocked install"),
+              }
 }
 
 fn test_diff_manifests(env: &TestEnvironment) -> Result<()> {
@@ -478,7 +477,7 @@ fn test_diff_manifests(env: &TestEnvironment) -> Result<()> {
     let dir2 = env.root.join("diff-pkg-2.0.0");
     fs::create_dir_all(&dir2).into_diagnostic()?;
     fs::write(dir2.join("info.hk"),
-        "[metadata]\n-> name => diff-pkg\n-> version => 2.0.0\n-> authors => New\n-> license => MIT\n\
+              "[metadata]\n-> name => diff-pkg\n-> version => 2.0.0\n-> authors => New\n-> license => MIT\n\
 [description]\n-> summary => Changed\n\
 [sandbox]\n-> network => true\n-> gui => false\n-> full_gui => false\n\
 -> dev => false\n-> disabled => false\n-> filesystem => {}\n"
@@ -603,14 +602,14 @@ fn test_rollback_state() -> Result<()> {
     use crate::state::{State, VersionInfo};
     let mut state = State::default();
     state.packages.entry("rollback-pkg".to_string()).or_default()
-        .insert("1.0.0".to_string(), VersionInfo::new("hash1", true));
+    .insert("1.0.0".to_string(), VersionInfo::new("hash1", true));
     state.push_snapshot("pre-update rollback-pkg");
     assert_eq!(state.history.len(), 1);
     state.packages.entry("rollback-pkg".to_string()).or_default()
-        .insert("2.0.0".to_string(), VersionInfo::new("hash2", true));
+    .insert("2.0.0".to_string(), VersionInfo::new("hash2", true));
     let ok = state.restore_snapshot(0);
     assert!(ok);
     assert!(state.packages.get("rollback-pkg")
-        .map(|vs| vs.contains_key("1.0.0")).unwrap_or(false));
+    .map(|vs| vs.contains_key("1.0.0")).unwrap_or(false));
     Ok(())
 }
