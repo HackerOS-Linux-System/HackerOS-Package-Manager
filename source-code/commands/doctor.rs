@@ -4,7 +4,6 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use crate::{
-    STORE_PATH,
     state::State,
     utils::compute_dir_hash,
 };
@@ -27,24 +26,24 @@ impl Report {
 // ---------------------------------------------------------------------------
 
 pub fn doctor() -> Result<()> {
-    println!("{} Running hpm diagnostics...\n", "→".cyan());
+    println!("{} Running hpm diagnostics...\n", "→".white());
 
     let state      = State::load()?;
     let mut report = Report::default();
 
-    // ── 1. State file ────────────────────────────────────────────────────────
-    if Path::new("/var/lib/hpm/state.json").exists() {
-        report.ok("state.json exists and is readable");
+    // ── 1. State database ────────────────────────────────────────────────────
+    if Path::new(&crate::db::db_path()).exists() {
+        report.ok("hpm.db exists and is readable");
     } else {
-        report.warn("state.json does not exist yet (no packages installed)");
+        report.warn("hpm.db does not exist yet (no packages installed)");
     }
 
     // ── 2. Store directory ───────────────────────────────────────────────────
-    let store_path = Path::new(STORE_PATH);
+    let store_path = Path::new(crate::store_path());
     if !store_path.exists() {
-        report.warn(format!("Store directory {} does not exist", STORE_PATH));
+        report.warn(format!("Store directory {} does not exist", crate::store_path()));
     } else {
-        report.ok(format!("Store directory {} exists", STORE_PATH));
+        report.ok(format!("Store directory {} exists", crate::store_path()));
     }
 
     // ── 3. Per-package checks ────────────────────────────────────────────────
@@ -80,6 +79,10 @@ pub fn doctor() -> Result<()> {
                                      pkg_name, ver, ver_dir.display()));
                 continue;
             }
+            if let Err(e) = crate::squash::ensure_mounted(&ver_dir) {
+                report.error(format!("{}@{}: could not mount compressed store: {}", pkg_name, ver, e));
+                continue;
+            }
 
             match compute_dir_hash(&ver_dir) {
                 Ok(actual) => {
@@ -100,41 +103,41 @@ pub fn doctor() -> Result<()> {
 
             if let Ok(manifest) = crate::manifest::Manifest::load_from_path(ver_dir.to_str().unwrap()) {
                 for bin_name in &manifest.bins {
-                    let wrapper = Path::new("/usr/bin").join(bin_name);
+                    let wrapper = Path::new(crate::bin_dir()).join(bin_name);
                     if !wrapper.exists() {
                         // Też sprawdź alternatywną nazwę pkg-bin
-                        let alt_wrapper = Path::new("/usr/bin").join(format!("{}-{}", pkg_name, bin_name));
+                        let alt_wrapper = Path::new(crate::bin_dir()).join(format!("{}-{}", pkg_name, bin_name));
                         if alt_wrapper.exists() {
                             report.warn(format!(
-                                "{}@{}: /usr/bin/{} missing but /usr/bin/{}-{} exists (renamed wrapper)",
-                                pkg_name, ver, bin_name, pkg_name, bin_name
+                                "{}@{}: {bin_dir}/{} missing but {bin_dir}/{}-{} exists (renamed wrapper)",
+                                pkg_name, ver, bin_name, pkg_name, bin_name, bin_dir = crate::bin_dir()
                             ));
                         } else if current_ver.as_deref() == Some(ver.as_str()) {
                             report.error(format!(
-                                "{}@{}: /usr/bin/{} wrapper missing (package is current but has no wrapper)",
-                                pkg_name, ver, bin_name
+                                "{}@{}: {}/{} wrapper missing (package is current but has no wrapper)",
+                                pkg_name, ver, crate::bin_dir(), bin_name
                             ));
                         } else {
                             report.warn(format!(
-                                "{}@{}: /usr/bin/{} wrapper missing (non-current version, OK)",
-                                pkg_name, ver, bin_name
+                                "{}@{}: {}/{} wrapper missing (non-current version, OK)",
+                                pkg_name, ver, crate::bin_dir(), bin_name
                             ));
                         }
                     } else {
                         let content = fs::read_to_string(&wrapper).unwrap_or_default();
                         if content.contains(&format!("hpm run {} ", pkg_name)) {
-                            report.ok(format!("{}@{}: /usr/bin/{} wrapper OK", pkg_name, ver, bin_name));
+                            report.ok(format!("{}@{}: {}/{} wrapper OK", pkg_name, ver, crate::bin_dir(), bin_name));
                         } else {
                             report.warn(format!(
-                                "{}@{}: /usr/bin/{} wrapper exists but doesn't call hpm run",
-                                pkg_name, ver, bin_name
+                                "{}@{}: {}/{} wrapper exists but doesn't call hpm run",
+                                pkg_name, ver, crate::bin_dir(), bin_name
                             ));
                         }
                     }
                 }
 
                 if manifest.is_gui || manifest.sandbox.gui {
-                    let desktop = Path::new("/usr/share/applications")
+                    let desktop = Path::new(crate::desktop_dir())
                         .join(format!("{}.desktop", pkg_name));
                     if !desktop.exists() {
                         report.warn(format!(
@@ -159,7 +162,7 @@ pub fn doctor() -> Result<()> {
                 if !state.packages.contains_key(&name) {
                     report.warn(format!(
                         "Store directory {}/{} exists but is not in state.json (orphaned store entry)",
-                        STORE_PATH, name
+                        crate::store_path(), name
                     ));
                 }
             }
@@ -167,7 +170,7 @@ pub fn doctor() -> Result<()> {
     }
 
     // ── 5. Stale wrappers ────────────────────────────────────────────────────
-    if let Ok(rd) = fs::read_dir("/usr/bin") {
+    if let Ok(rd) = fs::read_dir(crate::bin_dir()) {
         for entry in rd.flatten() {
             let path = entry.path();
             if path.is_file() {
@@ -176,7 +179,8 @@ pub fn doctor() -> Result<()> {
                     if let Some(pkg) = extract_pkg_from_wrapper(&content) {
                         if !state.packages.contains_key(&pkg) {
                             report.warn(format!(
-                                "/usr/bin/{}: wrapper references '{}' but it is not installed",
+                                "{}/{}: wrapper references '{}' but it is not installed",
+                                crate::bin_dir(),
                                 path.file_name().unwrap_or_default().to_string_lossy(),
                                 pkg
                             ));
@@ -191,22 +195,22 @@ pub fn doctor() -> Result<()> {
     check_duplicate_wrappers(&state, &mut report);
 
     // ── Print report ─────────────────────────────────────────────────────────
-    println!("{} Summary:\n", "→".cyan());
+    println!("{} Summary:\n", "→".white());
 
-    for msg in &report.ok       { println!("  {} {}", "✔".green(),  msg); }
-    for msg in &report.warnings { println!("  {} {}", "⚠".yellow(), msg); }
+    for msg in &report.ok       { println!("  {} {}", "✔".red(),  msg); }
+    for msg in &report.warnings { println!("  {} {}", "⚠".bright_black(), msg); }
     for msg in &report.errors   { println!("  {} {}", "✗".red(),    msg); }
 
     println!();
     println!("  Checks:   {}", report.ok.len() + report.warnings.len() + report.errors.len());
-    println!("  {} OK:       {}", "✔".green(),  report.ok.len());
-    println!("  {} Warnings: {}", "⚠".yellow(), report.warnings.len());
+    println!("  {} OK:       {}", "✔".red(),  report.ok.len());
+    println!("  {} Warnings: {}", "⚠".bright_black(), report.warnings.len());
     println!("  {} Errors:   {}", "✗".red(),    report.errors.len());
 
     if !report.errors.is_empty() {
-        println!("\n{} Run {} to attempt automatic repair.", "→".yellow(), "hpm repair".yellow());
+        println!("\n{} Run {} to attempt automatic repair.", "→".bright_black(), "hpm repair".bright_black());
     } else if report.warnings.is_empty() {
-        println!("\n{} All checks passed.", "✔".green());
+        println!("\n{} All checks passed.", "✔".red());
     }
 
     Ok(())
@@ -217,11 +221,11 @@ pub fn doctor() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub fn repair() -> Result<()> {
-    println!("{} Running hpm repair...\n", "→".cyan());
+    println!("{} Running hpm repair...\n", "→".white());
 
     let state    = State::load()?;
-    let hpm_exe  = std::env::current_exe().into_diagnostic()?;
-    let store    = Path::new(STORE_PATH);
+    let hpm_exe  = crate::commands::install::which_hpm_for_wrappers();
+    let store    = Path::new(crate::store_path());
     let mut fixed = 0usize;
 
     // ── 1. Napraw brakujące symlinki current ─────────────────────────────────
@@ -238,14 +242,14 @@ pub fn repair() -> Result<()> {
                 if target.exists() {
                     std::os::unix::fs::symlink(newest, &link).into_diagnostic()?;
                     println!("  {} Fixed missing 'current' symlink for {} → {}", 
-                             "✔".green(), pkg_name.cyan(), newest.green());
+                             "✔".red(), pkg_name.white(), newest.red());
                     fixed += 1;
                 }
             }
         }
     }
 
-    // ── 2. Napraw brakujące wrappery /usr/bin ─────────────────────────────────
+    // ── 2. Napraw brakujące wrappery bin_dir() ──────────────────────────────
     for (pkg_name, versions) in &state.packages {
         let current_ver = match state.get_current_version(pkg_name) {
             Some(v) => v,
@@ -254,6 +258,7 @@ pub fn repair() -> Result<()> {
 
         let ver_dir = store.join(pkg_name).join(&current_ver);
         if !ver_dir.exists() { continue; }
+        if crate::squash::ensure_mounted(&ver_dir).is_err() { continue; }
 
         let manifest = match crate::manifest::Manifest::load_from_path(ver_dir.to_str().unwrap()) {
             Ok(m)  => m,
@@ -261,7 +266,7 @@ pub fn repair() -> Result<()> {
         };
 
         for bin_name in &manifest.bins {
-            let wrapper = Path::new("/usr/bin").join(bin_name);
+            let wrapper = Path::new(crate::bin_dir()).join(bin_name);
 
             // Sprawdź czy wrapper jest poprawny
             let needs_fix = if wrapper.exists() {
@@ -282,23 +287,23 @@ pub fn repair() -> Result<()> {
                 if let Some(rel) = bin_rel {
                     let content = format!(
                         "#!/bin/sh\nexec {} run {} {} \"$@\"\n",
-                        hpm_exe.display(), pkg_name, rel
+                        hpm_exe, pkg_name, rel
                     );
                     fs::write(&wrapper, &content).into_diagnostic()?;
                     crate::utils::make_executable(&wrapper)?;
-                    println!("  {} Repaired wrapper /usr/bin/{} for {}@{}",
-                             "✔".green(), bin_name.cyan(), pkg_name, current_ver);
+                    println!("  {} Repaired wrapper {}/{} for {}@{}",
+                             "✔".red(), crate::bin_dir(), bin_name.white(), pkg_name, current_ver);
                     fixed += 1;
                 } else {
-                    println!("  {} Cannot repair /usr/bin/{}: binary not found in store",
-                             "⚠".yellow(), bin_name);
+                    println!("  {} Cannot repair {}/{}: binary not found in store",
+                             "⚠".bright_black(), crate::bin_dir(), bin_name);
                 }
             }
         }
     }
 
     // ── 3. Usuń osierocone wrappery ───────────────────────────────────────────
-    if let Ok(rd) = fs::read_dir("/usr/bin") {
+    if let Ok(rd) = fs::read_dir(crate::bin_dir()) {
         for entry in rd.flatten() {
             let path = entry.path();
             if !path.is_file() { continue; }
@@ -308,8 +313,8 @@ pub fn repair() -> Result<()> {
                     if !state.packages.contains_key(&pkg) {
                         fs::remove_file(&path).into_diagnostic()?;
                         println!("  {} Removed stale wrapper {} (package '{}' not installed)",
-                                 "✔".green(),
-                                 path.file_name().unwrap_or_default().to_string_lossy().cyan(),
+                                 "✔".red(),
+                                 path.file_name().unwrap_or_default().to_string_lossy().white(),
                                  pkg);
                         fixed += 1;
                     }
@@ -326,6 +331,7 @@ pub fn repair() -> Result<()> {
         };
         let ver_dir = store.join(pkg_name).join(&current_ver);
         if !ver_dir.exists() { continue; }
+        if crate::squash::ensure_mounted(&ver_dir).is_err() { continue; }
 
         let manifest = match crate::manifest::Manifest::load_from_path(ver_dir.to_str().unwrap()) {
             Ok(m)  => m,
@@ -333,19 +339,19 @@ pub fn repair() -> Result<()> {
         };
 
         if manifest.is_gui || manifest.sandbox.gui || manifest.sandbox.full_gui {
-            let desktop = Path::new("/usr/share/applications")
+            let desktop = Path::new(crate::desktop_dir())
                 .join(format!("{}.desktop", pkg_name));
             if !desktop.exists() {
                 match crate::commands::install::install_desktop_integration_pub(
-                    &ver_dir, &manifest, pkg_name, &hpm_exe.display().to_string(),
+                    &ver_dir, &manifest, pkg_name, &hpm_exe.to_string(),
                 ) {
                     Ok(_)  => {
-                        println!("  {} Restored .desktop for {}", "✔".green(), pkg_name.cyan());
+                        println!("  {} Restored .desktop for {}", "✔".red(), pkg_name.white());
                         fixed += 1;
                     }
                     Err(e) => {
                         println!("  {} Could not restore .desktop for {}: {}", 
-                                 "⚠".yellow(), pkg_name, e);
+                                 "⚠".bright_black(), pkg_name, e);
                     }
                 }
             }
@@ -353,9 +359,9 @@ pub fn repair() -> Result<()> {
     }
 
     if fixed == 0 {
-        println!("{} Nothing needed repair.", "✔".green());
+        println!("{} Nothing needed repair.", "✔".red());
     } else {
-        println!("\n{} Repaired {} issue(s).", "✔".green(), fixed);
+        println!("\n{} Repaired {} issue(s).", "✔".red(), fixed);
     }
 
     Ok(())
@@ -374,7 +380,8 @@ fn check_duplicate_wrappers(state: &State, report: &mut Report) {
             Some(v) => v,
             None    => continue,
         };
-        let ver_dir = Path::new(STORE_PATH).join(pkg_name).join(&current_ver);
+        let ver_dir = Path::new(crate::store_path()).join(pkg_name).join(&current_ver);
+        let _ = crate::squash::ensure_mounted(&ver_dir);
         if let Ok(manifest) = crate::manifest::Manifest::load_from_path(ver_dir.to_str().unwrap_or("")) {
             for bin_name in &manifest.bins {
                 wrapper_owners
@@ -388,7 +395,8 @@ fn check_duplicate_wrappers(state: &State, report: &mut Report) {
     for (bin_name, owners) in &wrapper_owners {
         if owners.len() > 1 {
             report.warn(format!(
-                "/usr/bin/{} is claimed by multiple packages: {}",
+                "{}/{} is claimed by multiple packages: {}",
+                crate::bin_dir(),
                 bin_name,
                 owners.join(", ")
             ));
