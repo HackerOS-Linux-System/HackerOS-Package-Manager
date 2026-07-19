@@ -3,7 +3,7 @@ use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use crate::{STORE_PATH, state::State, repo::RepoManager};
+use crate::{state::State, repo::RepoManager};
 
 pub fn diff(args: Vec<String>) -> Result<()> {
     if args.len() < 2 {
@@ -28,33 +28,47 @@ pub fn diff(args: Vec<String>) -> Result<()> {
     };
 
     println!("{} Comparing {}  {} ↔ {}\n",
-             "→".cyan(), pkg_name.bold().cyan(),
-             ver1.yellow(), ver2.green());
+             "→".white(), pkg_name.bold().white(),
+             ver1.bright_black(), ver2.red());
 
-    let path1 = Path::new(STORE_PATH).join(pkg_name).join(ver1);
-    let path2 = Path::new(STORE_PATH).join(pkg_name).join(&ver2);
+    let path1 = Path::new(crate::store_path()).join(pkg_name).join(ver1);
+    let path2 = Path::new(crate::store_path()).join(pkg_name).join(&ver2);
 
     let in_store1 = path1.exists();
     let in_store2 = path2.exists();
+    if in_store1 { let _ = crate::squash::ensure_mounted(&path1); }
+    if in_store2 { let _ = crate::squash::ensure_mounted(&path2); }
 
     // Jeśli nie ma lokalnie — spróbuj pobrać z repo
     if !in_store1 || !in_store2 {
-        println!("{} One or both versions not in local store — fetching from repo...", "→".yellow());
+        println!("{} One or both versions not in local store — fetching from repo...", "→".bright_black());
     }
 
     // ── Manifest diff ────────────────────────────────────────────────────────
     println!("{}", "Manifest changes:".bold().underline());
 
+    // BUG NAPRAWIONY (znaleziony podczas testów `hpm diff`/`hpm search`/`hpm
+    // info` na pakietach spoza GitHub): `fetch_manifest_for_version` sprawdzał
+    // TYLKO czy repo jest już w lokalnym cache'u gita — jeśli nie, cicho
+    // zwracał "nie znaleziono", mimo komunikatu "fetching from repo..."
+    // sugerującego że coś faktycznie spróbuje pobrać. Teraz faktycznie
+    // klonuje (przez RepoManager, z tym samym cache'em co `hpm install`),
+    // co przy okazji naprawia też ograniczenie "tylko GitHub" — klonowanie
+    // gitem działa dla każdego hosta, w przeciwieństwie do szybkiej ścieżki
+    // HTTP (raw.githubusercontent.com), która faktycznie jest GitHub-only.
+    let repo_mgr = crate::repo::RepoManager::load_sync().ok();
+    let repo_url = repo_mgr.as_ref().and_then(|rm| rm.get_package_url(pkg_name)).map(|s| s.to_string());
+
     let m1 = if in_store1 {
         crate::manifest::Manifest::load_from_path(path1.to_str().unwrap()).ok()
     } else {
-        fetch_manifest_for_version(pkg_name, ver1)?
+        fetch_manifest_for_version(pkg_name, ver1, repo_mgr.as_ref(), repo_url.as_deref())?
     };
 
     let m2 = if in_store2 {
         crate::manifest::Manifest::load_from_path(path2.to_str().unwrap()).ok()
     } else {
-        fetch_manifest_for_version(pkg_name, &ver2)?
+        fetch_manifest_for_version(pkg_name, &ver2, repo_mgr.as_ref(), repo_url.as_deref())?
     };
 
     match (&m1, &m2) {
@@ -62,13 +76,13 @@ pub fn diff(args: Vec<String>) -> Result<()> {
             diff_manifests(old, new, ver1, &ver2);
         }
         (None, Some(_)) => {
-            println!("  {} Version {} manifest not available", "⚠".yellow(), ver1);
+            println!("  {} Version {} manifest not available", "⚠".bright_black(), ver1);
         }
         (Some(_), None) => {
-            println!("  {} Version {} manifest not available", "⚠".yellow(), ver2);
+            println!("  {} Version {} manifest not available", "⚠".bright_black(), ver2);
         }
         (None, None) => {
-            println!("  {} Neither version manifest available locally", "⚠".yellow());
+            println!("  {} Neither version manifest available locally", "⚠".bright_black());
         }
     }
 
@@ -86,7 +100,7 @@ pub fn diff(args: Vec<String>) -> Result<()> {
         let missing = if !in_store1 { ver1 } else { &ver2 };
         println!();
         println!("{} Version {} not in store — file diff unavailable.", "→".dimmed(), missing);
-        println!("  Install it to compare: {}", format!("hpm install {}@{}", pkg_name, missing).yellow());
+        println!("  Install it to compare: {}", format!("hpm install {}@{}", pkg_name, missing).bright_black());
     }
 
     // ── Checksum diff ─────────────────────────────────────────────────────────
@@ -101,10 +115,10 @@ pub fn diff(args: Vec<String>) -> Result<()> {
 
     match (ck1, ck2) {
         (Some(c1), Some(c2)) => {
-            println!("  {} {} {}", ver1.yellow(), "→".dimmed(), c1.dimmed());
-            println!("  {} {} {}", ver2.green(),  "→".dimmed(), c2.dimmed());
+            println!("  {} {} {}", ver1.bright_black(), "→".dimmed(), c1.dimmed());
+            println!("  {} {} {}", ver2.red(),  "→".dimmed(), c2.dimmed());
             if c1 == c2 {
-                println!("  {} Contents appear identical.", "→".yellow());
+                println!("  {} Contents appear identical.", "→".bright_black());
             }
         }
         _ => println!("  {} Checksum data not available for one or both versions.", "→".dimmed()),
@@ -130,8 +144,8 @@ fn diff_manifests(
         ($field:expr, $label:expr) => {
             if $field.0 != $field.1 {
                 println!("  {} {:<16} {} → {}",
-                    "~".yellow(), $label,
-                    $field.0.dimmed(), $field.1.cyan());
+                    "~".bright_black(), $label,
+                    $field.0.dimmed(), $field.1.white());
                 any = true;
             }
         };
@@ -152,11 +166,11 @@ fn diff_manifests(
         let d2 = deps2.get(*dep);
         match (d1, d2) {
             (Some(v1), Some(v2)) if v1 != v2 => {
-                println!("  {} dep {:<16} {} → {}", "~".yellow(), dep, v1.dimmed(), v2.cyan());
+                println!("  {} dep {:<16} {} → {}", "~".bright_black(), dep, v1.dimmed(), v2.white());
                 any = true;
             }
             (None, Some(v2)) => {
-                println!("  {} dep {:<16} {} (new dependency)", "+".green(), dep, v2.green());
+                println!("  {} dep {:<16} {} (new dependency)", "+".red(), dep, v2.red());
                 any = true;
             }
             (Some(v1), None) => {
@@ -171,7 +185,7 @@ fn diff_manifests(
     let bins1: HashSet<&str> = old.bins.iter().map(|s| s.as_str()).collect();
     let bins2: HashSet<&str> = new.bins.iter().map(|s| s.as_str()).collect();
     for b in bins2.difference(&bins1) {
-        println!("  {} bin {:<16} (new binary)", "+".green(), b);
+        println!("  {} bin {:<16} (new binary)", "+".red(), b);
         any = true;
     }
     for b in bins1.difference(&bins2) {
@@ -183,7 +197,7 @@ fn diff_manifests(
     let t1: HashSet<&str> = old.tags.iter().map(|s| s.as_str()).collect();
     let t2: HashSet<&str> = new.tags.iter().map(|s| s.as_str()).collect();
     for t in t2.difference(&t1) {
-        println!("  {} tag @{}", "+".green(), t);
+        println!("  {} tag @{}", "+".red(), t);
         any = true;
     }
     for t in t1.difference(&t2) {
@@ -194,21 +208,21 @@ fn diff_manifests(
     // Sandbox changes
     if old.sandbox.network != new.sandbox.network {
         println!("  {} sandbox.network {} → {}",
-            "~".yellow(),
+            "~".bright_black(),
             old.sandbox.network.to_string().dimmed(),
-            new.sandbox.network.to_string().cyan());
+            new.sandbox.network.to_string().white());
         any = true;
     }
     if old.sandbox.gui != new.sandbox.gui {
         println!("  {} sandbox.gui {} → {}",
-            "~".yellow(),
+            "~".bright_black(),
             old.sandbox.gui.to_string().dimmed(),
-            new.sandbox.gui.to_string().cyan());
+            new.sandbox.gui.to_string().white());
         any = true;
     }
 
     if !any {
-        println!("  {} No manifest changes between {} and {}", "→".dimmed(), ver1.yellow(), ver2.green());
+        println!("  {} No manifest changes between {} and {}", "→".dimmed(), ver1.bright_black(), ver2.red());
     }
 }
 
@@ -243,7 +257,7 @@ fn diff_files(path1: &Path, path2: &Path, ver1: &str, ver2: &str) -> Result<()> 
     }
 
     for f in &added {
-        println!("  {} {}", "+".green(), f);
+        println!("  {} {}", "+".red(), f);
         any = true;
     }
     for f in &removed {
@@ -251,17 +265,17 @@ fn diff_files(path1: &Path, path2: &Path, ver1: &str, ver2: &str) -> Result<()> 
         any = true;
     }
     for f in &changed {
-        println!("  {} {}", "~".yellow(), f);
+        println!("  {} {}", "~".bright_black(), f);
         any = true;
     }
 
     if !any {
-        println!("  {} Files identical between {} and {}", "→".dimmed(), ver1.yellow(), ver2.green());
+        println!("  {} Files identical between {} and {}", "→".dimmed(), ver1.bright_black(), ver2.red());
     } else {
         println!();
         println!("  {} {} added  {} removed  {} modified",
-            "Summary:".bold(), added.len().to_string().green(),
-            removed.len().to_string().red(), changed.len().to_string().yellow());
+            "Summary:".bold(), added.len().to_string().red(),
+            removed.len().to_string().red(), changed.len().to_string().bright_black());
     }
 
     Ok(())
@@ -294,6 +308,8 @@ fn collect_files_rel(base: &Path) -> Result<HashMap<String, String>> {
 fn fetch_manifest_for_version(
     pkg_name: &str,
     version: &str,
+    repo_mgr: Option<&RepoManager>,
+    repo_url: Option<&str>,
 ) -> Result<Option<crate::manifest::Manifest>> {
     let repos_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
@@ -301,11 +317,31 @@ fn fetch_manifest_for_version(
         .join(pkg_name);
 
     if !repos_dir.exists() {
-        return Ok(None);
+        // Wcześniej: cicho poddawało się tutaj, mimo komunikatu sugerującego
+        // że coś próbuje pobrać. Teraz faktycznie klonuje, jeśli mamy skąd.
+        match (repo_mgr, repo_url) {
+            (Some(rm), Some(url)) => { rm.clone_package_repo(pkg_name, url)?; }
+            _ => return Ok(None),
+        }
     }
 
     let repo = git2::Repository::open(&repos_dir).into_diagnostic()?;
     let tags = repo.tag_names(None).into_diagnostic()?;
+
+    // BUG NAPRAWIONY (znaleziony testując `hpm diff` na pakiecie z nowo
+    // dodanym tagiem): jeśli lokalny klon JUŻ istniał (np. z wcześniejszego
+    // `hpm install`), ale nie ma jeszcze szukanego tagu — poprzednio po
+    // prostu zwracaliśmy "nie znaleziono" zamiast spróbować odświeżyć.
+    // Odśwież (git fetch) i tylko wtedy poddaj się na dobre.
+    let have_tag = tags.iter().flatten().any(|t| t.trim_start_matches('v') == version);
+    let tags = if !have_tag {
+        if let (Some(rm), Some(url)) = (repo_mgr, repo_url) {
+            let _ = rm.clone_package_repo(pkg_name, url); // update-if-exists wewnątrz
+        }
+        repo.tag_names(None).into_diagnostic()?
+    } else {
+        tags
+    };
 
     let tag_name = tags.iter().flatten()
         .find(|t| t.trim_start_matches('v') == version)
