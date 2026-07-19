@@ -22,7 +22,7 @@ pub fn update() -> Result<()> {
     let repo_mgr  = RepoManager::load_sync()?;
     let mut state = State::load()?;
 
-    println!("{} Checking for updates...\n", "→".cyan());
+    println!("{} Checking for updates...\n", "→".white());
 
     let mut to_update: Vec<(String, String, String)> = Vec::new();
 
@@ -40,7 +40,7 @@ pub fn update() -> Result<()> {
         }
         let pkg_url = match repo_mgr.get_package_url(pkg_name) {
             Some(u) => u,
-            None    => { println!("  {} {} not in index — skipping", "⚠".yellow(), pkg_name); continue; }
+            None    => { println!("  {} {} not in index — skipping", "⚠".bright_black(), pkg_name); continue; }
         };
 
         let repo_path = repos_dir().join(pkg_name);
@@ -65,14 +65,14 @@ pub fn update() -> Result<()> {
     }
 
     if to_update.is_empty() {
-        println!("{} All packages are up to date.", "✔".green());
+        println!("{} All packages are up to date.", "✔".red());
         return Ok(());
     }
 
-    println!("{} Updates available:\n", "→".yellow());
+    println!("{} Updates available:\n", "→".bright_black());
     for (name, old, new) in &to_update {
         println!("  {} {} {} → {}",
-                 "↑".cyan(), name.cyan(), old.red(), new.green());
+                 "↑".white(), name.white(), old.red(), new.red());
     }
     println!();
 
@@ -81,9 +81,9 @@ pub fn update() -> Result<()> {
     // czy jego nowe wymagania dep nie kolidują z innymi zainstalowanymi pakietami.
     let issues = check_dep_compatibility_before_update(&to_update, &state, &repo_mgr);
     if !issues.is_empty() {
-        println!("{} Dependency compatibility warnings:\n", "⚠".yellow());
+        println!("{} Dependency compatibility warnings:\n", "⚠".bright_black());
         for issue in &issues {
-            println!("  {} {}", "⚠".yellow(), issue);
+            println!("  {} {}", "⚠".bright_black(), issue);
         }
         println!();
         println!("  These will be resolved automatically (deps updated if possible).");
@@ -98,25 +98,48 @@ pub fn update() -> Result<()> {
 
     for (pkg_name, old_ver, new_ver) in &to_update {
         println!("{} Updating {} {} → {}",
-                 "→".yellow(), pkg_name.cyan(), old_ver.red(), new_ver.green());
+                 "→".bright_black(), pkg_name.white(), old_ver.red(), new_ver.red());
 
         match install_single(pkg_name, Some(new_ver), &repo_mgr, &mut state, true) {
             Ok(()) => {
                 if let Err(e) = remove_version(pkg_name, old_ver, &mut state) {
                     eprintln!("  {} Could not remove old {}@{}: {}",
-                              "⚠".yellow(), pkg_name, old_ver, e);
+                              "⚠".bright_black(), pkg_name, old_ver, e);
                 }
+
+                // Post-update: nowa wersja jest już w store — hook może np.
+                // zmigrować dane konfiguracyjne z formatu starej wersji.
+                let new_pkg_path = std::path::Path::new(crate::store_path())
+                    .join(pkg_name).join(new_ver);
+                let _ = crate::squash::ensure_mounted(&new_pkg_path);
+                if crate::hooks::hook_exists(&new_pkg_path, crate::hooks::HookKind::PostUpdate) {
+                    if let Ok(new_manifest) = crate::manifest::Manifest::load_from_path(
+                        new_pkg_path.to_str().unwrap_or_default()
+                    ) {
+                        let ctx = crate::hooks::HookContext {
+                            pkg_name: pkg_name, pkg_version: new_ver,
+                            store_path: crate::store_path(), old_version: Some(old_ver),
+                        };
+                        if let Err(e) = crate::hooks::run_hook(
+                            &new_pkg_path, crate::hooks::HookKind::PostUpdate, &ctx, &new_manifest,
+                        ) {
+                            eprintln!("  {} post-update hook failed for {}: {}",
+                                      "⚠".bright_black(), pkg_name, e);
+                        }
+                    }
+                }
+
                 updated += 1;
             }
             Err(e) => {
-                eprintln!("  {} Failed to update {}: {}", "✗".red(), pkg_name.cyan(), e);
+                eprintln!("  {} Failed to update {}: {}", "✗".red(), pkg_name.white(), e);
                 failed.push(pkg_name.clone());
             }
         }
     }
 
     state.save()?;
-    println!("\n{} Updated {} package(s).", "✔".green(), updated);
+    println!("\n{} Updated {} package(s).", "✔".red(), updated);
     if !failed.is_empty() {
         println!("{} Failed: {}", "✗".red(), failed.join(", "));
     }
