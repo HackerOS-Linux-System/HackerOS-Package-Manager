@@ -23,12 +23,12 @@ pub fn deps(spec: String) -> Result<()> {
     let repo_pkg = index.get(pkg_name)
         .ok_or_else(|| miette::miette!(
             "Package '{}' not found. Run {} first.",
-            pkg_name, "hpm refresh".yellow()
+            pkg_name, "hpm refresh".bright_black()
         ))?;
 
     if repo_pkg.versions.is_empty() {
         eprintln!("{} No versions found for '{}'. Run {} to clone repo.",
-                  "⚠".yellow(), pkg_name, "hpm install".yellow());
+                  "⚠".bright_black(), pkg_name, "hpm install".bright_black());
         return Ok(());
     }
 
@@ -50,9 +50,9 @@ pub fn deps(spec: String) -> Result<()> {
 
         let indent = "  ".repeat(depth);
         if depth == 0 {
-            output.push(format!("{}{}@{}", indent, pkg.cyan(), ver.green()));
+            output.push(format!("{}{}@{}", indent, pkg.white(), ver.red()));
         } else {
-            output.push(format!("{}└─ {}@{}", indent, pkg.cyan(), ver.green()));
+            output.push(format!("{}└─ {}@{}", indent, pkg.white(), ver.red()));
         }
 
         if let Some(pkg_entry) = index.get(&pkg) {
@@ -66,13 +66,13 @@ pub fn deps(spec: String) -> Result<()> {
                         } else {
                             let indent2 = "  ".repeat(depth + 1);
                             output.push(format!("{}└─ {}@{} {}",
-                                indent2, dep_name.cyan(),
+                                indent2, dep_name.white(),
                                 dep_req.red(), "(not found)".red()));
                         }
                     } else {
                         let indent2 = "  ".repeat(depth + 1);
                         output.push(format!("{}└─ {} {}",
-                            indent2, dep_name.cyan(), "(not in index)".dimmed()));
+                            indent2, dep_name.white(), "(not in index)".dimmed()));
                     }
                 }
             }
@@ -80,7 +80,7 @@ pub fn deps(spec: String) -> Result<()> {
     }
 
     println!("{} Dependency tree for {}@{}:\n",
-             "→".blue(), pkg_name.cyan(), chosen_ver.green());
+             "→".white(), pkg_name.white(), chosen_ver.red());
     for line in &output {
         println!("{}", line);
     }
