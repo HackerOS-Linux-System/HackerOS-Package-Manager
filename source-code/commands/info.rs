@@ -19,7 +19,7 @@ pub fn info(package: String) -> Result<()> {
     let repo_url = repo_mgr.get_package_url(&package)
         .ok_or_else(|| miette::miette!(
             "Package '{}' not found in repository index.\n  Run {} to refresh.",
-            package, "hpm refresh".yellow()
+            package, "hpm refresh".bright_black()
         ))?
         .to_string();
 
@@ -41,9 +41,9 @@ pub fn info(package: String) -> Result<()> {
 
     // ── Wydruk ───────────────────────────────────────────────────────────────
     println!();
-    println!("  {} {}", "◆".cyan(), package.bold().cyan());
+    println!("  {} {}", "◆".white(), package.bold().white());
     println!("  {}", "─".repeat(60).dimmed());
-    println!("  {:<16} {}", "Version:".bold(),    meta.version.green());
+    println!("  {:<16} {}", "Version:".bold(),    meta.version.red());
     println!("  {:<16} {}", "Author:".bold(),     meta.authors);
     println!("  {:<16} {}", "License:".bold(),    meta.license);
     println!("  {:<16} {}", "Repository:".bold(), repo_url.dimmed());
@@ -51,7 +51,7 @@ pub fn info(package: String) -> Result<()> {
     // Tagi (z info.hk, nie z repo.json)
     if !meta.tags.is_empty() {
         let tags_str = meta.tags.iter()
-            .map(|t| format!("@{}", t).cyan().to_string())
+            .map(|t| format!("@{}", t).white().to_string())
             .collect::<Vec<_>>().join("  ");
         println!("  {:<16} {}", "Tags:".bold(), tags_str);
     }
@@ -79,15 +79,16 @@ pub fn info(package: String) -> Result<()> {
     // Status instalacji
     println!();
     if let Some(ref ver) = installed_ver {
-        let pin_tag = if pinned { format!(" {}", "(pinned)".yellow()) } else { String::new() };
-        println!("  {:<16} {}{}", "Installed:".bold(), ver.cyan(), pin_tag);
+        let pin_tag = if pinned { format!(" {}", "(pinned)".bright_black()) } else { String::new() };
+        println!("  {:<16} {}{}", "Installed:".bold(), ver.white(), pin_tag);
 
         // Pokaż niestandardowe nazwy wrapperów
         let wn = crate::state::WrapperNames::load();
-        let store_path = std::path::Path::new(crate::STORE_PATH).join(&package).join(ver);
+        let store_path = std::path::Path::new(crate::store_path()).join(&package).join(ver);
+        let _ = crate::squash::ensure_mounted(&store_path);
         if let Ok(manifest) = crate::manifest::Manifest::load_from_path(store_path.to_str().unwrap_or("")) {
             let custom: Vec<_> = manifest.bins.iter()
-                .filter_map(|b| wn.get(&package, b).filter(|&w| w != b).map(|w| format!("{} → /usr/bin/{}", b, w)))
+                .filter_map(|b| wn.get(&package, b).filter(|&w| w != b).map(|w| format!("{} → {}/{}", b, crate::bin_dir(), w)))
                 .collect();
             if !custom.is_empty() {
                 println!("  {:<16} {}", "Wrappers:".bold(), custom.join(", ").dimmed());
@@ -103,16 +104,16 @@ pub fn info(package: String) -> Result<()> {
         println!("  {}", "Available versions (from git tags):".bold());
         for v in &local_versions {
             let cur = if installed_ver.as_deref() == Some(v.as_str()) {
-                format!(" {}", "← current".green())
+                format!(" {}", "← current".red())
             } else { String::new() };
-            println!("    • {}{}", v.cyan(), cur);
+            println!("    • {}{}", v.white(), cur);
         }
     } else {
         println!();
         println!("  {} Run {} or {} to see all versions.",
-                 "ℹ".blue(),
-                 "hpm refresh".yellow(),
-                 format!("hpm install {}@<ver>", package).yellow());
+                 "ℹ".white(),
+                 "hpm refresh".bright_black(),
+                 format!("hpm install {}@<ver>", package).bright_black());
     }
 
     // Powiązane pakiety z tych samych tagów
@@ -124,10 +125,10 @@ pub fn info(package: String) -> Result<()> {
             if !related.is_empty() {
                 if !any_related {
                     println!();
-                    println!("  {} Related packages (same tags):", "ℹ".blue());
+                    println!("  {} Related packages (same tags):", "ℹ".white());
                     any_related = true;
                 }
-                println!("    @{}: {}", tag.cyan(),
+                println!("    @{}: {}", tag.white(),
                     related.iter().map(|p| p.magenta().to_string()).collect::<Vec<_>>().join(", "));
             }
         }
@@ -136,8 +137,8 @@ pub fn info(package: String) -> Result<()> {
     // Hint instalacji
     println!();
     if installed_ver.is_none() {
-        println!("  {} Install: {}", "→".yellow(),
-                 format!("hpm install {}", package).bold().yellow());
+        println!("  {} Install: {}", "→".bright_black(),
+                 format!("hpm install {}", package).bold().bright_black());
     }
     println!();
     Ok(())
