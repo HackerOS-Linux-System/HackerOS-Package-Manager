@@ -1,5 +1,6 @@
 use miette::{Result, miette, IntoDiagnostic};
 use colored::Colorize;
+use crate::manifest::Manifest;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -102,8 +103,8 @@ fn select_interpreter(hook_path: &Path, default_interpreter: &str) -> String {
                     // Fallback dla hl → sh (kompatybilność gdy hl niezainstalowany)
                     if interp == "hl" {
                         eprintln!("  {} Hacker Lang (hl) not found — falling back to /bin/sh",
-                                  "⚠".yellow());
-                        eprintln!("    Install hl: {}", "hpm install hacker-lang".yellow());
+                                  "⚠".bright_black());
+                        eprintln!("    Install hl: {}", "hpm install hacker-lang".bright_black());
                         return "sh".to_string();
                     }
                 }
@@ -136,38 +137,39 @@ pub fn hook_exists(dir: &Path, kind: HookKind) -> bool {
     find_hook_file(dir, kind).is_some()
 }
 
-/// Uruchom hook z timeoutem.
+/// Uruchom hook z timeoutem, w piaskownicy (namespaces + seccomp + landlock +
+/// rlimity — patrz `sandbox::run_hook_sandboxed`).
 /// Zwraca Ok(true) jeśli hook uruchomiony, Ok(false) jeśli nie istnieje.
-pub fn run_hook(dir: &Path, kind: HookKind, ctx: &HookContext) -> Result<bool> {
+pub fn run_hook(dir: &Path, kind: HookKind, ctx: &HookContext, manifest: &Manifest) -> Result<bool> {
     let (hook_path, default_interp) = match find_hook_file(dir, kind) {
         Some(h) => h,
         None    => return Ok(false),
     };
 
-    println!("  {} Running {} hook ({})...",
-             "→".cyan(), kind.display().bold(),
-             hook_path.file_name().unwrap_or_default().to_string_lossy().dimmed());
-
     crate::utils::make_executable(&hook_path)?;
-
     let interpreter = select_interpreter(&hook_path, default_interp);
 
-    // Przygotuj zmienne środowiskowe
-    let mut cmd = Command::new(&interpreter);
-    cmd.arg(&hook_path)
-       .current_dir(dir)
-       .env("HPM_PKG_NAME",    ctx.pkg_name)
-       .env("HPM_PKG_VERSION", ctx.pkg_version)
-       .env("HPM_STORE_PATH",  ctx.store_path)
-       .env("HPM_HOOK_TYPE",   kind.display())
-       .env("HPM_HOOK_LANG",   &interpreter);
+    println!("  {} Running {} hook ({}, sandboxed via {}{})...",
+             "→".white(), kind.display().bold(),
+             hook_path.file_name().unwrap_or_default().to_string_lossy().dimmed(),
+             interpreter.dimmed(),
+             if manifest.sandbox.hooks_network { ", network: allowed".bright_black().to_string() } else { String::new() });
 
+    let mut env_vars = vec![
+        ("HPM_PKG_NAME".to_string(),    ctx.pkg_name.to_string()),
+        ("HPM_PKG_VERSION".to_string(), ctx.pkg_version.to_string()),
+        ("HPM_STORE_PATH".to_string(),  ctx.store_path.to_string()),
+        ("HPM_HOOK_TYPE".to_string(),   kind.display().to_string()),
+        ("HPM_HOOK_LANG".to_string(),   interpreter.clone()),
+    ];
     if let Some(old) = ctx.old_version {
-        cmd.env("HPM_OLD_VERSION", old);
+        env_vars.push(("HPM_OLD_VERSION".to_string(), old.to_string()));
     }
 
-    // Uruchom z timeoutem przez wait_timeout lub przez osobny wątek
-    let output = run_with_timeout(cmd, Duration::from_secs(HOOK_TIMEOUT_SECS))?;
+    let output = crate::sandbox::run_hook_sandboxed(
+        dir, manifest, &interpreter, &hook_path, &env_vars,
+        Duration::from_secs(HOOK_TIMEOUT_SECS),
+    )?;
 
     // Wydrukuj stdout/stderr hooka
     if !output.stdout.is_empty() {
@@ -182,7 +184,7 @@ pub fn run_hook(dir: &Path, kind: HookKind, ctx: &HookContext) -> Result<bool> {
     }
 
     if output.status.success() {
-        println!("  {} Hook {} completed", "✔".green(), kind.display());
+        println!("  {} Hook {} completed", "✔".red(), kind.display());
         Ok(true)
     } else {
         let code = output.status.code().unwrap_or(1);
@@ -199,34 +201,8 @@ pub fn run_hook(dir: &Path, kind: HookKind, ctx: &HookContext) -> Result<bool> {
             ))
         } else {
             eprintln!("  {} Hook '{}' failed (code {}), continuing",
-                      "⚠".yellow(), kind.display(), code);
+                      "⚠".bright_black(), kind.display(), code);
             Ok(true)
-        }
-    }
-}
-
-/// Uruchom komendę z timeoutem.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output> {
-    use std::sync::mpsc;
-    use std::thread;
-
-    let (tx, rx) = mpsc::channel();
-
-    let handle = thread::spawn(move || {
-        let output = cmd.output();
-        let _ = tx.send(output);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            let _ = handle.join();
-            result.into_diagnostic()
-        }
-        Err(_) => {
-            // Timeout — nie możemy łatwo kill() spawned procesu bez nix
-            // W praktyce: proces zostanie orphaned ale hpm będzie kontynuować
-            eprintln!("  {} Hook timed out after {}s — killed", "✗".red(), timeout.as_secs());
-            Err(miette!("Hook timed out after {} seconds", timeout.as_secs()))
         }
     }
 }
