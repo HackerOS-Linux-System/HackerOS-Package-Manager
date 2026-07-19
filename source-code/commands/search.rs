@@ -9,8 +9,8 @@ const PAGE_SIZE: usize = 20;
 pub fn search(query: String) -> Result<()> {
     if query.is_empty() {
         eprintln!("{} Usage: hpm search <query|@tag>", "✗".red());
-        eprintln!("  {}  search by tag group", "hpm search @development".yellow());
-        eprintln!("  {}  search by name/description", "hpm search editor".yellow());
+        eprintln!("  {}  search by tag group", "hpm search @development".bright_black());
+        eprintln!("  {}  search by name/description", "hpm search editor".bright_black());
         std::process::exit(1);
     }
 
@@ -34,9 +34,9 @@ pub fn search(query: String) -> Result<()> {
     pb.finish_and_clear();
 
     if results.is_empty() {
-        println!("{} No results for '{}'.", "✗".red(), query.cyan());
-        println!("  Try a different keyword or run {} to refresh.", "hpm refresh".yellow());
-        println!("  Search by tag: {}", "hpm search @<tag>".yellow());
+        println!("{} No results for '{}'.", "✗".red(), query.white());
+        println!("  Try a different keyword or run {} to refresh.", "hpm refresh".bright_black());
+        println!("  Search by tag: {}", "hpm search @<tag>".bright_black());
         return Ok(());
     }
 
@@ -44,7 +44,7 @@ pub fn search(query: String) -> Result<()> {
 
     println!(
         "{} Results for '{}' ({} found):\n",
-        "→".blue(), query.cyan(), total
+        "→".white(), query.white(), total
     );
 
     // Paginacja
@@ -125,18 +125,18 @@ fn search_by_tag(
     let pkgs = repo_mgr.packages_for_tag(tag);
 
     if pkgs.is_empty() {
-        println!("{} No packages found for tag '{}'.", "✗".red(), query.cyan());
+        println!("{} No packages found for tag '{}'.", "✗".red(), query.white());
         let all = repo_mgr.all_tags();
         if !all.is_empty() {
             println!("  Available tags: {}",
-                all.iter().map(|t| format!("@{}", t).cyan().to_string()).collect::<Vec<_>>().join("  "));
+                all.iter().map(|t| format!("@{}", t).white().to_string()).collect::<Vec<_>>().join("  "));
         }
-        println!("  List all tags: {}", "hpm tags".yellow());
+        println!("  List all tags: {}", "hpm tags".bright_black());
         return Ok(());
     }
 
     let total = pkgs.len();
-    println!("{} Packages with tag '{}' ({} total):\n", "→".blue(), query.cyan(), total);
+    println!("{} Packages with tag '{}' ({} total):\n", "→".white(), query.white(), total);
 
     // Pobierz metadane dla pakietów z tego tagu
     let tag_results = rt.block_on(repo_mgr.search_lightweight(query))?;
@@ -160,7 +160,7 @@ fn search_by_tag(
             println!();
         }
 
-        println!("  {:<22} {:<12} {}", "Package".bold().cyan(), "Version".bold().cyan(), "Description".bold().cyan());
+        println!("  {:<22} {:<12} {}", "Package".bold().white(), "Version".bold().white(), "Description".bold().white());
         println!("  {}", "─".repeat(72).dimmed());
 
         for pkg_name in page_pkgs {
@@ -179,7 +179,7 @@ fn search_by_tag(
 
             println!("  {:<22} {:<12} {} {}",
                 pkg_name.magenta(),
-                version.green(),
+                version.red(),
                 desc,
                 tags_str.dimmed()
             );
@@ -208,9 +208,9 @@ fn search_by_tag(
     }
 
     println!();
-    println!("  Install all: {}", format!("hpm install @{}", tag).yellow());
+    println!("  Install all: {}", format!("hpm install @{}", tag).bright_black());
     println!("  Run {} for details, {} to install single package.",
-             "hpm info <package>".yellow(), "hpm install <package>".yellow());
+             "hpm info <package>".bright_black(), "hpm install <package>".bright_black());
     Ok(())
 }
 
@@ -220,10 +220,10 @@ fn print_results_table(
     end: usize,
 ) {
     println!("  {:<22} {:<12} {:<32} {}",
-        "Package".bold().cyan(),
-        "Version".bold().cyan(),
-        "Description".bold().cyan(),
-        "Tags".bold().cyan()
+        "Package".bold().white(),
+        "Version".bold().white(),
+        "Description".bold().white(),
+        "Tags".bold().white()
     );
     println!("  {}", "─".repeat(80).dimmed());
 
@@ -242,7 +242,7 @@ fn print_results_table(
             };
         println!("  {:<22} {:<12} {:<32} {}",
             meta.name.magenta(),
-            meta.version.green(),
+            meta.version.red(),
             desc,
             tags_str
         );
@@ -252,7 +252,7 @@ fn print_results_table(
 fn print_hints() {
     println!();
     println!("  Run {} for details, {} to install.",
-             "hpm info <package>".yellow(),
-             "hpm install <package>".yellow());
-    println!("  Search by tag: {}", "hpm search @<tag>".yellow());
+             "hpm info <package>".bright_black(),
+             "hpm install <package>".bright_black());
+    println!("  Search by tag: {}", "hpm search @<tag>".bright_black());
 }
