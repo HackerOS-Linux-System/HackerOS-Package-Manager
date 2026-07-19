@@ -28,29 +28,29 @@ pub fn refresh() -> Result<()> {
     let ok     = results.len();
     let failed = total.saturating_sub(ok);
 
-    println!("{} Get package index from HackerOS Package Repository", "→".blue());
-    println!("{} Reading package lists...   {}", "→".blue(), "Done".green());
-    println!("{} Fetching metadata...        {} / {} packages", "→".blue(),
-             ok.to_string().green(), total.to_string().cyan());
+    println!("{} Get package index from HackerOS Package Repository", "→".white());
+    println!("{} Reading package lists...   {}", "→".white(), "Done".red());
+    println!("{} Fetching metadata...        {} / {} packages", "→".white(),
+             ok.to_string().red(), total.to_string().white());
 
     if failed > 0 {
         println!("{} {} package(s) could not be reached (network error or no info.hk)",
-                 "⚠".yellow(), failed);
+                 "⚠".bright_black(), failed);
     }
 
     // Pokaż tagi grupowe zebrane z info.hk
     let tags = repo_mgr.all_tags();
     if !tags.is_empty() {
         println!("{} Group tags (from info.hk): {}",
-            "→".blue(),
-            tags.iter().map(|t| format!("@{}", t).cyan().to_string())
+            "→".white(),
+            tags.iter().map(|t| format!("@{}", t).white().to_string())
                 .collect::<Vec<_>>().join("  "));
     }
 
     println!();
-    println!("{} packages available.", total.to_string().cyan());
+    println!("{} packages available.", total.to_string().white());
     println!("  Versions and tags are read from each package's {} — not from repo.json.",
-             "info.hk".yellow());
+             "info.hk".bright_black());
     println!();
     Ok(())
 }
