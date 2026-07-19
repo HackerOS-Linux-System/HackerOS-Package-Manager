@@ -14,6 +14,6 @@ pub fn unpin(package: String) -> Result<()> {
         .ok_or_else(|| miette::miette!("Current version not found in state"))?;
     info.pinned = false;
     state.save()?;
-    println!("{} Unpinned {} (current version {})", "✔".green(), package.cyan(), current_ver.cyan());
+    println!("{} Unpinned {} (current version {})", "✔".red(), package.white(), current_ver.white());
     Ok(())
 }
