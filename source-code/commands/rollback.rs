@@ -1,5 +1,3 @@
-// src/commands/rollback.rs
-
 use miette::{Result, IntoDiagnostic, bail};
 use colored::Colorize;
 use std::collections::HashSet;
@@ -7,7 +5,6 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use crate::{
-    STORE_PATH,
     state::State,
     utils::{acquire_lock, release_lock},
 };
@@ -43,16 +40,16 @@ Only one version is installed — nothing to roll back to.",
     let current_ver = state.get_current_version(pkg_name).unwrap_or_default();
 
     println!("{} Rolling back {} from {} to {}",
-             "→".yellow(), pkg_name.cyan(), current_ver.cyan(), prev_ver.cyan());
+             "→".bright_black(), pkg_name.white(), current_ver.white(), prev_ver.white());
 
-    let prev_dir = Path::new(STORE_PATH).join(pkg_name).join(&prev_ver);
-    let curr_dir = Path::new(STORE_PATH).join(pkg_name).join(&current_ver);
+    let prev_dir = Path::new(crate::store_path()).join(pkg_name).join(&prev_ver);
+    let curr_dir = Path::new(crate::store_path()).join(pkg_name).join(&current_ver);
 
     if !prev_dir.exists() {
         return Err(miette::miette!(
             "Version {}@{} files not found in store.\n\
 Run {} to diagnose.",
-            pkg_name, prev_ver, "hpm doctor".yellow()
+            pkg_name, prev_ver, "hpm doctor".bright_black()
         ));
     }
 
@@ -63,7 +60,7 @@ Run {} to diagnose.",
     // Usuń wrappery które istniały w bieżącej wersji (zarówno te które zostaną
     // zastąpione, jak i te których nie ma w poprzedniej wersji).
     for bin_name in &current_bins {
-        let wrapper = Path::new("/usr/bin").join(bin_name);
+        let wrapper = Path::new(crate::bin_dir()).join(bin_name);
         if wrapper.exists() {
             // Sprawdź czy to nasz wrapper
             if let Ok(content) = fs::read_to_string(&wrapper) {
@@ -79,12 +76,13 @@ Run {} to diagnose.",
     remove_all_wrappers_for_package(pkg_name)?;
 
     // ── Przestaw current symlink ─────────────────────────────────────────────
-    let current_link = Path::new(STORE_PATH).join(pkg_name).join("current");
+    let current_link = Path::new(crate::store_path()).join(pkg_name).join("current");
     let _ = fs::remove_file(&current_link);
     std::os::unix::fs::symlink(&prev_ver, &current_link).into_diagnostic()?;
 
     // ── Utwórz nowe wrappery dla poprzedniej wersji ──────────────────────────
-    let hpm_exe = std::env::current_exe().into_diagnostic()?;
+    crate::squash::ensure_mounted(&prev_dir)?;
+    let hpm_exe = crate::commands::install::which_hpm_for_wrappers();
     if let Ok(manifest) = crate::manifest::Manifest::load_from_path(prev_dir.to_str().unwrap()) {
         for bin_name in &manifest.bins {
             let bin_rel = if let Some(explicit) = manifest.bin_paths.get(bin_name) {
@@ -95,31 +93,31 @@ Run {} to diagnose.",
             };
 
             if let Some(rel) = bin_rel {
-                let wrapper_path = Path::new("/usr/bin").join(bin_name);
+                let wrapper_path = Path::new(crate::bin_dir()).join(bin_name);
                 let content = format!(
                     "#!/bin/sh\nexec {} run {} {} \"$@\"\n",
-                    hpm_exe.display(), pkg_name, rel
+                    hpm_exe, pkg_name, rel
                 );
                 fs::write(&wrapper_path, &content).into_diagnostic()?;
                 crate::utils::make_executable(&wrapper_path)?;
-                println!("  {} Wrapper: /usr/bin/{} → {}@{}/{}", 
-                         "✔".green(), bin_name.cyan(), pkg_name, prev_ver, rel.dimmed());
+                println!("  {} Wrapper: {}/{} → {}@{}/{}",
+                         "✔".red(), crate::bin_dir(), bin_name.white(), pkg_name, prev_ver, rel.dimmed());
             } else {
                 eprintln!("  {} Binary '{}' not found in {}@{}", 
-                          "⚠".yellow(), bin_name, pkg_name, prev_ver);
+                          "⚠".bright_black(), bin_name, pkg_name, prev_ver);
             }
         }
 
         // Desktop integration dla GUI
         if manifest.is_gui || manifest.sandbox.gui || manifest.sandbox.full_gui {
             crate::commands::install::install_desktop_integration_pub(
-                &prev_dir, &manifest, pkg_name, &hpm_exe.display().to_string(),
+                &prev_dir, &manifest, pkg_name, &hpm_exe.to_string(),
             )?;
         }
     }
 
     println!("{} {}@{} is now the current version",
-             "✔".green(), pkg_name.cyan(), prev_ver.cyan());
+             "✔".red(), pkg_name.white(), prev_ver.white());
     Ok(())
 }
 
@@ -134,7 +132,7 @@ fn collect_bin_names_from_dir(dir: &Path) -> HashSet<String> {
 
 /// Usuń wszystkie wrappery w /usr/bin które wskazują na `pkg_name` przez `hpm run`.
 fn remove_all_wrappers_for_package(pkg_name: &str) -> Result<()> {
-    let usr_bin = Path::new("/usr/bin");
+    let usr_bin = Path::new(crate::bin_dir());
     if !usr_bin.exists() { return Ok(()); }
 
     let rd = match fs::read_dir(usr_bin) {
@@ -171,15 +169,15 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     let history = state.list_history();
 
     if history.is_empty() {
-        println!("{} No rollback history available.", "→".yellow());
+        println!("{} No rollback history available.", "→".bright_black());
         println!("  History is recorded automatically before install/update/remove operations.");
         return Ok(());
     }
 
-    println!("{} Rollback history (most recent last):\n", "→".cyan());
+    println!("{} Rollback history (most recent last):\n", "→".white());
     for (i, timestamp, desc) in &history {
         let dt = format_timestamp(*timestamp);
-        println!("  [{}]  {}  {}", i.to_string().cyan(), dt.dimmed(), desc);
+        println!("  [{}]  {}  {}", i.to_string().white(), dt.dimmed(), desc);
     }
 
     println!();
@@ -191,7 +189,7 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     let input = input.trim();
 
     if input.eq_ignore_ascii_case("q") || input.is_empty() {
-        println!("{} Aborted.", "→".yellow());
+        println!("{} Aborted.", "→".bright_black());
         return Ok(());
     }
 
@@ -203,7 +201,7 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     }
 
     let snapshot_desc = state.history[index].description.clone();
-    println!("\n{} Restoring to: {}", "→".yellow(), snapshot_desc);
+    println!("\n{} Restoring to: {}", "→".bright_black(), snapshot_desc);
 
     let target_snapshot = state.history[index].snapshot.clone();
     let current_pkgs    = state.packages.clone();
@@ -233,20 +231,20 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     }
 
     if to_install.is_empty() && to_remove.is_empty() {
-        println!("{} Current state matches the selected snapshot. Nothing to do.", "✔".green());
+        println!("{} Current state matches the selected snapshot. Nothing to do.", "✔".red());
         return Ok(());
     }
 
     if !to_install.is_empty() {
         println!("\n  Packages to reinstall (files must already be in store):");
         for (name, ver) in &to_install {
-            println!("    {} {}@{}", "+".green(), name.cyan(), ver);
+            println!("    {} {}@{}", "+".red(), name.white(), ver);
         }
     }
     if !to_remove.is_empty() {
         println!("\n  Packages to remove:");
         for (name, ver) in &to_remove {
-            println!("    {} {}@{}", "–".red(), name.cyan(), ver);
+            println!("    {} {}@{}", "–".red(), name.white(), ver);
         }
     }
 
@@ -256,35 +254,35 @@ fn rollback_full_state(state: &mut State) -> Result<()> {
     let mut confirm = String::new();
     std::io::stdin().read_line(&mut confirm).into_diagnostic()?;
     if !confirm.trim().eq_ignore_ascii_case("y") {
-        println!("{} Aborted.", "→".yellow());
+        println!("{} Aborted.", "→".bright_black());
         return Ok(());
     }
 
     for (name, ver) in &to_remove {
-        let pkg_path = Path::new(STORE_PATH).join(name).join(ver);
+        let pkg_path = Path::new(crate::store_path()).join(name).join(ver);
         if pkg_path.exists() {
             crate::commands::remove::remove_version(name, ver, state)?;
-            println!("  {} Removed {}@{}", "✔".green(), name.cyan(), ver);
+            println!("  {} Removed {}@{}", "✔".red(), name.white(), ver);
         }
     }
 
     for (name, ver) in &to_install {
-        let pkg_path = Path::new(STORE_PATH).join(name).join(ver);
+        let pkg_path = Path::new(crate::store_path()).join(name).join(ver);
         if pkg_path.exists() {
-            let current_link = Path::new(STORE_PATH).join(name).join("current");
+            let current_link = Path::new(crate::store_path()).join(name).join("current");
             let _ = fs::remove_file(&current_link);
             std::os::unix::fs::symlink(ver, &current_link).into_diagnostic()?;
-            println!("  {} Restored {}@{} (files in store)", "✔".green(), name.cyan(), ver);
+            println!("  {} Restored {}@{} (files in store)", "✔".red(), name.white(), ver);
         } else {
             println!("  {} {}@{} not in store — reinstall manually: {}",
-                     "⚠".yellow(), name.cyan(), ver,
-                     format!("sudo hpm install {}@{}", name, ver).yellow());
+                     "⚠".bright_black(), name.white(), ver,
+                     format!("sudo hpm install {}@{}", name, ver).bright_black());
         }
     }
 
     state.restore_snapshot(index);
 
-    println!("\n{} Rollback complete.", "✔".green());
+    println!("\n{} Rollback complete.", "✔".red());
     Ok(())
 }
 
