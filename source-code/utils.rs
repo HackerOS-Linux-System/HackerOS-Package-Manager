@@ -12,7 +12,23 @@ pub const LOCK_PATH: &str = "/tmp/hpm.lock";
 pub fn acquire_lock() -> Result<fs::File> {
     use fs2::FileExt;
     let file = fs::File::create(LOCK_PATH).into_diagnostic()?;
-    file.try_lock_exclusive().into_diagnostic()?;
+    // BUG NAPRAWIONY (znaleziony przez realny test dwóch nakładających się
+    // `hpm install`): blokada poprawnie zapobiega współbieżnym operacjom
+    // (bezpieczeństwo działa), ale błąd był surowym "Resource temporarily
+    // unavailable (os error 11)" — nic nie mówiącym użytkownikowi, co się
+    // stało. Teraz jasno tłumaczymy, że to inny hpm trzyma blokadę.
+    file.try_lock_exclusive().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            miette::miette!(
+                "Another hpm process is already running (install/remove/update/...).\n  \
+  Wait for it to finish, or if you're sure nothing is running, remove the stale lock:\n  \
+  {}",
+                LOCK_PATH
+            )
+        } else {
+            miette::miette!("Failed to acquire lock at {}: {}", LOCK_PATH, e)
+        }
+    })?;
     Ok(file)
 }
 
@@ -35,6 +51,16 @@ pub fn compute_dir_hash(dir: &Path) -> Result<String> {
     }
     let hash = hasher.finalize();
     Ok(hex::encode(hash))
+}
+
+/// SHA-256 pojedynczego pliku (np. archiwum .hpm) — używane przez
+/// `hpm build` (suma kontrolna obok archiwum) i `hpm install --release`
+/// (weryfikacja integralności pobranego .hpm przed rozpakowaniem).
+pub fn compute_file_hash(path: &Path) -> Result<String> {
+    let data = fs::read(path).into_diagnostic()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
@@ -137,7 +163,7 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    println!("{} The following system packages are required:", "→".yellow());
+    println!("{} The following system packages are required:", "→".bright_black());
     for p in &missing {
         println!("  - {}", p);
     }
@@ -158,6 +184,26 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
         }
     } else {
         bail!("Missing system packages");
+    }
+    Ok(())
+}
+
+/// Rekurencyjnie kopiuje zawartość katalogu `src` do `dst` (dst musi już
+/// istnieć). Używane m.in. do zachowania `hooks/` przed usunięciem pakietu,
+/// żeby post-remove hook mógł się uruchomić już po skasowaniu store'u.
+pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(src).min_depth(1) {
+        let entry = entry.into_diagnostic()?;
+        let rel = entry.path().strip_prefix(src).into_diagnostic()?;
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).into_diagnostic()?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).into_diagnostic()?;
+            }
+            fs::copy(entry.path(), &target).into_diagnostic()?;
+        }
     }
     Ok(())
 }
