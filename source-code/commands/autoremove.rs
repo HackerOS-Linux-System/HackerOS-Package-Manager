@@ -18,9 +18,9 @@ pub fn autoremove() -> Result<()> {
         if orphans.is_empty() { break; }
 
         println!("{} The following packages were installed as dependencies and are no longer needed:\n",
-                 "→".yellow());
+                 "→".bright_black());
         for (name, ver) in &orphans {
-            println!("  {} {}@{}", "–".red(), name.cyan(), ver);
+            println!("  {} {}@{}", "–".red(), name.white(), ver);
         }
         println!();
 
@@ -29,23 +29,23 @@ pub fn autoremove() -> Result<()> {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).into_diagnostic()?;
         if !input.trim().eq_ignore_ascii_case("y") {
-            println!("{} Aborted.", "→".yellow());
+            println!("{} Aborted.", "→".bright_black());
             return Ok(());
         }
 
         state.push_snapshot(&format!("pre-autoremove {} packages", orphans.len()));
         for (name, ver) in &orphans {
             remove_version(name, ver, &mut state)?;
-            println!("  {} Removed {}@{}", "✔".green(), name.cyan(), ver);
+            println!("  {} Removed {}@{}", "✔".red(), name.white(), ver);
             removed_total += 1;
         }
     }
 
     if removed_total == 0 {
-        println!("{} Nothing to remove — no orphaned packages found.", "✔".green());
+        println!("{} Nothing to remove — no orphaned packages found.", "✔".red());
     } else {
         state.save()?;
-        println!("\n{} Removed {} orphaned package(s).", "✔".green(), removed_total);
+        println!("\n{} Removed {} orphaned package(s).", "✔".red(), removed_total);
     }
     Ok(())
 }
