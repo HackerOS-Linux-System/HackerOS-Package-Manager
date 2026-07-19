@@ -2,42 +2,134 @@ mod error;
 mod manifest;
 mod sandbox;
 mod state;
+mod db;
+mod squash;
 mod repo;
 mod commands;
 mod utils;
 mod hooks;
 
-use lexopt::prelude::*;
 use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
+use std::sync::OnceLock;
 
-pub const STORE_PATH: &str = "/usr/lib/HackerOS/hpm/store/";
-pub const CACHE_DIR:  &str = "/var/cache/hpm";
+// ---------------------------------------------------------------------------
+// Lokalizacje danych hpm
+//
+// Od wersji 0.9 pakiety NIE są już instalowane systemowo w
+// /usr/lib/HackerOS/hpm/store — hpm działa teraz w całości w przestrzeni
+// użytkownika, bez roota:
+//
+//   ~/.hackeros/hpm/store/   — zainstalowane pakiety (dawniej STORE_PATH)
+//   ~/.hackeros/hpm/cache/   — indeks repo (repo-list.json/repo.json) oraz
+//                              pobrane archiwa .hpm (dawniej /var/cache/hpm)
+//   ~/.hackeros/hpm/db/      — baza stanu (zainstalowane wersje, blokady,
+//                              historia rollbacków) — patrz `state.rs`
+//
+// Zachowane jako funkcje (nie `const`), bo zależą od $HOME w czasie
+// wykonania — każda wołana raz i cache'owana w `OnceLock`.
+// ---------------------------------------------------------------------------
+
+fn hackeros_home() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/root"))
+        .join(".hackeros")
+        .join("hpm")
+}
+
+pub fn store_path() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = hackeros_home().join("store");
+        let _ = std::fs::create_dir_all(&p);
+        format!("{}/", p.display())
+    })
+}
+
+pub fn cache_dir() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = hackeros_home().join("cache");
+        let _ = std::fs::create_dir_all(&p);
+        p.display().to_string()
+    })
+}
+
+pub fn db_dir() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = hackeros_home().join("db");
+        let _ = std::fs::create_dir_all(&p);
+        p.display().to_string()
+    })
+}
+
+// Integracja z systemem (wrappery binarek, pliki .desktop, ikony) też
+// przeniesiona do przestrzeni użytkownika — cały `hpm` (od 0.9) działa bez
+// roota. Odpowiednik $HOME/.local/{bin,share/...} ze specyfikacji XDG.
+pub fn bin_dir() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/root"))
+            .join(".local").join("bin");
+        let _ = std::fs::create_dir_all(&p);
+        p.display().to_string()
+    })
+}
+
+pub fn desktop_dir() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/root"))
+            .join(".local").join("share").join("applications");
+        let _ = std::fs::create_dir_all(&p);
+        p.display().to_string()
+    })
+}
+
+pub fn icon_dir() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/root"))
+            .join(".local").join("share").join("icons").join("hicolor");
+        let _ = std::fs::create_dir_all(&p);
+        p.display().to_string()
+    })
+}
+
+pub fn pixmap_dir() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/root"))
+            .join(".local").join("share").join("pixmaps");
+        let _ = std::fs::create_dir_all(&p);
+        p.display().to_string()
+    })
+}
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut parser    = lexopt::Parser::from_args(args);
+    // UWAGA: to musi być zwykłe, pozycyjne parsowanie, NIE lexopt na całym
+    // wektorze argumentów. Bug znaleziony przez realny test `hpm dev <path>
+    // run <bin> --version`: lexopt przechwytywał `--version`/`--help`
+    // WSZĘDZIE w linii poleceń jako flagi hpm, więc `hpm run pkg bin
+    // --version` pokazywał wersję hpm zamiast przekazać `--version` do
+    // opakowanej binarki. Flagi `-h`/`--help`/`-V`/`--version` liczą się
+    // jako globalne TYLKO zanim ustalimy nazwę komendy — wszystko po niej
+    // (włącznie z `-h`/`--version` należącymi do subkomendy albo do binarki,
+    // którą subkomenda uruchamia) leci dalej bez zmian.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut command:  Option<String> = None;
     let mut sub_args: Vec<String>    = Vec::new();
 
-    while let Some(arg) = parser.next().into_diagnostic()? {
-        match arg {
-            Short('h') | Long("help") => { print_help(); return Ok(()); }
-            Short('V') | Long("version") => {
-                println!("hpm {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
+    for arg in raw_args {
+        if command.is_none() {
+            match arg.as_str() {
+                "-h" | "--help"    => { print_help(); return Ok(()); }
+                "-V" | "--version" => { println!("hpm {}", env!("CARGO_PKG_VERSION")); return Ok(()); }
+                _ => { command = Some(arg); }
             }
-            Value(val) if command.is_none() => {
-                command = Some(val.to_string_lossy().to_string());
-            }
-            Value(val) => {
-                sub_args.push(val.to_string_lossy().to_string());
-            }
-            _ => {
-                eprintln!("{} Unknown option: {:?}", "✗".red(), arg);
-                print_help();
-                return Ok(());
-            }
+        } else {
+            sub_args.push(arg);
         }
     }
 
@@ -75,7 +167,7 @@ fn main() -> Result<()> {
         "deps"       => commands::deps::deps(sub_args.first().cloned().unwrap_or_default()),
         "tags"       => cmd_tags(),
         "diff"       => commands::diff::diff(sub_args),
-        "build"      => commands::build::build(sub_args.first().cloned().unwrap_or_default()),
+        "build"      => commands::build::build(sub_args),
         "clean"      => {
             // hpm clean         — czyści cache
             // hpm clean --all   — czyści cache + stare wersje ze store
@@ -103,6 +195,22 @@ fn main() -> Result<()> {
             commands::pin::pin(sub_args[0].clone(), sub_args[1].clone())
         }
         "unpin"      => commands::unpin::unpin(sub_args.first().cloned().unwrap_or_default()),
+        "__debug_hash" => {
+            let dir = sub_args.first().cloned().unwrap_or_default();
+            let h = crate::utils::compute_dir_hash(std::path::Path::new(&dir))?;
+            println!("{}", h);
+            Ok(())
+        }
+        "__debug_gpg" => {
+            let data = sub_args.first().cloned().unwrap_or_default();
+            let sig  = sub_args.get(1).cloned().unwrap_or_default();
+            match commands::verify::verify_gpg_signature(
+                std::path::Path::new(&data), std::path::Path::new(&sig)
+            ) {
+                Ok(signer) => { println!("OK: {}", signer); Ok(()) }
+                Err(e)     => { println!("FAIL: {}", e); Ok(()) }
+            }
+        }
         "doctor"     => commands::doctor::doctor(),
         "repair"     => commands::repair::repair(),
         "lock"       => commands::lock::lock(sub_args),
@@ -149,33 +257,27 @@ fn print_sudo_hint(command: &str) {
     println!("{} {}", "✗".red().bold(), "Permission denied".red().bold());
     println!();
 
-    // Operacje które zawsze wymagają sudo
-    let needs_root = matches!(command,
-        "install" | "remove" | "update" | "upgrade" | "rollback" |
-        "autoremove" | "repair" | "switch" | "refresh"
-    );
-
-    if needs_root {
-        println!("  {} This command writes to system directories and requires root privileges.",
-                 "→".yellow());
-        println!();
-        println!("  Please run with sudo:");
-        println!();
-        // Zrekonstruuj oryginalne wywołanie z args
-        let original_args: Vec<String> = std::env::args().skip(1).collect();
-        println!("    {}", format!("sudo hpm {}", original_args.join(" ")).bold().cyan());
-        println!();
-        println!("  {} hpm installs packages to {} which requires root.",
-                 "ℹ".blue(), "/usr/lib/HackerOS/hpm/store/".dimmed());
-        println!("  {} Wrappers are created in {} which also requires root.",
-                 "ℹ".blue(), "/usr/bin/".dimmed());
-    } else {
-        println!("  {} Operation failed with permission error.", "→".yellow());
-        println!();
-        println!("  Try running with sudo:");
-        let original_args: Vec<String> = std::env::args().skip(1).collect();
-        println!("    {}", format!("sudo hpm {}", original_args.join(" ")).bold().cyan());
-    }
+    // Od 0.9 hpm działa WYŁĄCZNIE w przestrzeni użytkownika
+    // (~/.hackeros/hpm/{store,cache,db} + ~/.local/{bin,share/...}) — żadna
+    // z komend nie wymaga już roota. `sudo hpm ...` jest teraz ZŁYM
+    // pomysłem: root ma inny $HOME, więc `sudo` rozjechałby store między
+    // /root/.hackeros a katalogiem prawdziwego użytkownika. Ten błąd
+    // najczęściej oznacza, że wcześniej coś (np. stara wersja hpm sprzed
+    // 0.9, albo ręczne `sudo`) już utworzyło te katalogi jako root.
+    let _ = command; // zachowane w sygnaturze na wypadek przyszłego zróżnicowania per-komenda
+    println!("  {} hpm no longer needs root — packages live under your own home directory:",
+             "ℹ".white());
+    println!("      {}", crate::store_path().dimmed());
+    println!("      {}", crate::bin_dir().dimmed());
+    println!();
+    println!("  {} This usually means those directories (or their parent ~/.hackeros / ~/.local)",
+             "→".bright_black());
+    println!("    are owned by someone else — often because they were created by root");
+    println!("    (e.g. a stray `sudo hpm ...` before 0.9, or a previous install as another user).");
+    println!();
+    println!("  Fix ownership, then retry without sudo:");
+    println!();
+    println!("    {}", format!("sudo chown -R $USER: ~/.hackeros ~/.local/bin ~/.local/share").bold().white());
     println!();
 }
 
@@ -187,28 +289,28 @@ fn cmd_tags() -> Result<()> {
     let repo_mgr = crate::repo::RepoManager::load_sync()?;
     let tags     = repo_mgr.all_tags();
     if tags.is_empty() {
-        println!("{} No group tags found.", "→".yellow());
-        println!("  Tags are defined in each package's {} file.", "info.hk".yellow());
-        println!("  Run {} to fetch metadata from all packages.", "hpm refresh".yellow());
+        println!("{} No group tags found.", "→".bright_black());
+        println!("  Tags are defined in each package's {} file.", "info.hk".bright_black());
+        println!("  Run {} to fetch metadata from all packages.", "hpm refresh".bright_black());
         return Ok(());
     }
-    println!("{} Available group tags:\n", "→".blue());
+    println!("{} Available group tags:\n", "→".white());
     for tag in &tags {
         let pkgs  = repo_mgr.packages_for_tag(tag);
         let count = pkgs.len();
         let preview: Vec<&str> = pkgs.iter().take(5).map(|p| p.as_str()).collect();
         let suffix = if count > 5 { format!(" +{} more", count - 5) } else { String::new() };
         println!("  {} {:20} {} package(s): {}{}",
-            "◆".cyan(),
-            format!("@{}", tag).green(),
+            "◆".white(),
+            format!("@{}", tag).red(),
             count,
             preview.join(", ").dimmed(),
             suffix.dimmed()
         );
     }
     println!();
-    println!("  Install a tag group : {}", "hpm install @<tag>".yellow());
-    println!("  Search by tag       : {}", "hpm search @<tag>".yellow());
+    println!("  Install a tag group : {}", "hpm install @<tag>".bright_black());
+    println!("  Search by tag       : {}", "hpm search @<tag>".bright_black());
     Ok(())
 }
 
@@ -219,65 +321,71 @@ fn cmd_tags() -> Result<()> {
 fn print_help() {
     let version = env!("CARGO_PKG_VERSION");
     println!("\n{} {}\n", "Hacker Package Manager (hpm)".bold().red(), version.red());
-    println!("{}  hpm {} [options]\n", "Usage:".bold(), "<command>".yellow());
+    println!("{}  hpm {} [options]\n", "Usage:".bold(), "<command>".bright_black());
 
     println!("{}", "Package Commands:".bold().underline());
-    println!("  {:<38} {}", "refresh".green(),                    "Update index and pre-fetch metadata");
-    println!("  {:<38} {}", "install <pkg>[@<ver>]...".green(),   "Install packages (requires sudo)");
-    println!("  {:<38} {}", "install @<tag>".green(),             "Install all packages with group tag");
-    println!("  {:<38} {}", "remove <pkg>[@<ver>]".green(),       "Remove package (requires sudo)");
-    println!("  {:<38} {}", "autoremove".green(),                 "Remove orphaned packages");
-    println!("  {:<38} {}", "update".green(),                     "Update all packages");
-    println!("  {:<38} {}", "upgrade".green(),                    "Upgrade hpm itself");
-    println!("  {:<38} {}", "switch <pkg> <ver>".green(),         "Switch active version");
-    println!("  {:<38} {}", "rollback [<pkg>]".green(),           "Restore previous state");
+    println!("  {:<38} {}", "refresh".red(),                    "Update index and pre-fetch metadata");
+    println!("  {:<38} {}", "install <pkg>[@<ver>]...".red(),   "Install packages (no root needed)");
+    println!("  {:<38} {}", "install <pkg> --release".red(),    "Install from a GitHub Release .hpm instead of git clone");
+    println!("  {:<38} {}", "install <pkg> --release --require-signed".red(), "...and refuse if it isn't GPG-signed");
+    println!("  {:<38} {}", "install @<tag>".red(),             "Install all packages with group tag");
+    println!("  {:<38} {}", "remove <pkg>[@<ver>]".red(),       "Remove package");
+    println!("  {:<38} {}", "autoremove".red(),                 "Remove orphaned packages");
+    println!("  {:<38} {}", "update".red(),                     "Update all packages");
+    println!("  {:<38} {}", "upgrade".red(),                    "Upgrade hpm itself");
+    println!("  {:<38} {}", "switch <pkg> <ver>".red(),         "Switch active version");
+    println!("  {:<38} {}", "rollback [<pkg>]".red(),           "Restore previous state");
 
     println!();
     println!("{}", "Query Commands:".bold().underline());
-    println!("  {:<38} {}", "search <query|@tag>".green(),        "Search packages");
-    println!("  {:<38} {}", "info <package>".green(),             "Show package details");
-    println!("  {:<38} {}", "list".green(),                       "List installed packages");
-    println!("  {:<38} {}", "outdated".green(),                   "Show packages with updates");
-    println!("  {:<38} {}", "deps <pkg>[@<ver>]".green(),         "Show dependency tree");
-    println!("  {:<38} {}", "tags".green(),                       "List available group tags");
-    println!("  {:<38} {}", "diff <pkg> <v1> [<v2>]".green(),    "Compare two package versions");
+    println!("  {:<38} {}", "search <query|@tag>".red(),        "Search packages");
+    println!("  {:<38} {}", "info <package>".red(),             "Show package details");
+    println!("  {:<38} {}", "list".red(),                       "List installed packages");
+    println!("  {:<38} {}", "outdated".red(),                   "Show packages with updates");
+    println!("  {:<38} {}", "deps <pkg>[@<ver>]".red(),         "Show dependency tree");
+    println!("  {:<38} {}", "tags".red(),                       "List available group tags");
+    println!("  {:<38} {}", "diff <pkg> <v1> [<v2>]".red(),    "Compare two package versions");
 
     println!();
     println!("{}", "Maintenance Commands:".bold().underline());
-    println!("  {:<38} {}", "run <pkg> <bin> [args]".green(),     "Run binary (sandboxed)");
-    println!("  {:<38} {}", "build [name]".green(),               "Package current directory");
-    println!("  {:<38} {}", "clean".green(),                      "Remove cached repos + temp files");
-    println!("  {:<38} {}", "clean --all".green(),                "Also remove old store versions");
-    println!("  {:<38} {}", "verify <package>".green(),           "Verify SHA-256 + GPG signature");
-    println!("  {:<38} {}", "verify --import-key <key>".green(),  "Import GPG key to trusted keyring");
-    println!("  {:<38} {}", "pin <pkg> <ver>".green(),            "Pin a package version");
-    println!("  {:<38} {}", "unpin <pkg>".green(),                "Unpin current version");
-    println!("  {:<38} {}", "doctor".green(),                     "Diagnose consistency issues");
-    println!("  {:<38} {}", "repair".green(),                     "Auto-fix issues found by doctor");
-    println!("  {:<38} {}", "lock <subcmd>".green(),              "Manage hpm.lock (reproducible installs)");
+    println!("  {:<38} {}", "run <pkg> <bin> [args]".red(),     "Run binary (sandboxed)");
+    println!("  {:<38} {}", "build [name]".red(),               "Package current directory into a .hpm archive");
+    println!("  {:<38} {}", "build --output <path>".red(),      "Custom output path for the .hpm archive");
+    println!("  {:<38} {}", "build --sign <key-id>".red(),      "Also produce a detached GPG .sig (like pacman)");
+    println!("  {:<38} {}", "clean".red(),                      "Remove cached repos + temp files");
+    println!("  {:<38} {}", "clean --all".red(),                "Also remove old store versions");
+    println!("  {:<38} {}", "verify <package>".red(),           "Verify SHA-256 + GPG signature");
+    println!("  {:<38} {}", "verify --import-key <key>".red(),  "Import GPG key to trusted keyring");
+    println!("  {:<38} {}", "pin <pkg> <ver>".red(),            "Pin a package version");
+    println!("  {:<38} {}", "unpin <pkg>".red(),                "Unpin current version");
+    println!("  {:<38} {}", "doctor".red(),                     "Diagnose consistency issues");
+    println!("  {:<38} {}", "repair".red(),                     "Auto-fix issues found by doctor");
+    println!("  {:<38} {}", "lock <subcmd>".red(),              "Manage hpm.lock (reproducible installs)");
 
     println!();
     println!("{}", "Development Commands:".bold().underline());
-    println!("  {:<38} {}", "create [<name>]".green(),            "Interactive package creation wizard");
+    println!("  {:<38} {}", "create [<name>]".red(),            "Interactive package creation wizard");
+    println!("  {:<38} {}", "dev <path>".red(),                 "Test a local package dir (not in repo-list.json)");
+    println!("  {:<38} {}", "dev <path> run <bin> [args]".red(),"...and run one of its binaries, sandboxed");
 
     println!();
     println!("{}", "Options:".bold().underline());
-    println!("  {}, {:<28} {}", "-h".yellow(), "--help".yellow(),    "Show this help");
-    println!("  {}, {:<28} {}", "-V".yellow(), "--version".yellow(), "Show version");
+    println!("  {}, {:<28} {}", "-h".bright_black(), "--help".bright_black(),    "Show this help");
+    println!("  {}, {:<28} {}", "-V".bright_black(), "--version".bright_black(), "Show version");
 
     println!();
     println!("{}", "Group tags:".bold().underline());
-    println!("  {}  →  install all @development packages", "hpm install @development".yellow());
-    println!("  {}  →  list all available tags",           "hpm tags".yellow());
+    println!("  {}  →  install all @development packages", "hpm install @development".bright_black());
+    println!("  {}  →  list all available tags",           "hpm tags".bright_black());
 
     println!();
     println!("{}", "Hooks (Hacker Lang):".bold().underline());
-    println!("  Package hooks are placed in {} subdirectory:", "hooks/".cyan());
-    println!("  {:<30} {}", "pre-install.hl".cyan(),  "runs before install (blocks on failure)");
-    println!("  {:<30} {}", "post-install.hl".cyan(), "runs after install");
-    println!("  {:<30} {}", "pre-remove.hl".cyan(),   "runs before removal (blocks on failure)");
-    println!("  {:<30} {}", "post-remove.hl".cyan(),  "runs after removal");
-    println!("  {:<30} {}", "post-update.hl".cyan(),  "runs after update");
+    println!("  Package hooks are placed in {} subdirectory:", "hooks/".white());
+    println!("  {:<30} {}", "pre-install.hl".white(),  "runs before install (blocks on failure)");
+    println!("  {:<30} {}", "post-install.hl".white(), "runs after install");
+    println!("  {:<30} {}", "pre-remove.hl".white(),   "runs before removal (blocks on failure)");
+    println!("  {:<30} {}", "post-remove.hl".white(),  "runs after removal");
+    println!("  {:<30} {}", "post-update.hl".white(),  "runs after update");
     println!("  Also supported: {} {} {}", ".py".dimmed(), ".rb".dimmed(), ".sh".dimmed());
 
     println!();
@@ -288,6 +396,7 @@ fn print_help() {
     println!("  hooks/           Hacker Lang hooks (.hl) — pre/post install/remove");
     println!("  info.hk.sig      GPG signature (optional)");
     println!();
-    println!("  {} Most package operations require {}", "ℹ".blue(), "sudo hpm <command>".yellow());
+    println!("  {} hpm runs entirely as your user — {} is only needed", "ℹ".white(), "no sudo".red().bold());
+    println!("    if {} or {} are owned by root from before 0.9.", crate::store_path().dimmed(), crate::bin_dir().dimmed());
     println!();
 }
