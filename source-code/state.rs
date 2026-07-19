@@ -3,14 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use crate::STORE_PATH;
 
-const STATE_PATH: &str = "/var/lib/hpm/state.json";
-
-/// Persystentna mapa nazw wrapperów: bin_name → rzeczywista nazwa w /usr/bin.
-/// Zapisywana gdy użytkownik wybierze alternatywną nazwę podczas konfliktu,
-/// żeby przy reinstalacji nie pytać ponownie.
-const WRAPPER_NAMES_PATH: &str = "/var/lib/hpm/wrapper-names.json";
+// Uwaga: ścieżki do starych plików JSON (state.json, wrapper-names.json) nie
+// są już tu potrzebne — od 0.9 both State i WrapperNames są trzymane w
+// ~/.hackeros/hpm/db/hpm.db (SQLite, patrz `db.rs`). Jednorazowa migracja ze
+// starych plików JSON żyje w `db::migrate_legacy_json`.
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -73,24 +70,11 @@ pub struct WrapperNames {
 
 impl WrapperNames {
     pub fn load() -> Self {
-        if !Path::new(WRAPPER_NAMES_PATH).exists() { return Self::default(); }
-        let data = match fs::read(WRAPPER_NAMES_PATH) {
-            Ok(d)  => d,
-            Err(_) => return Self::default(),
-        };
-        serde_json::from_slice(&data).unwrap_or_default()
+        crate::db::load_wrapper_names().unwrap_or_default()
     }
 
     pub fn save(&self) {
-        if let Some(parent) = Path::new(WRAPPER_NAMES_PATH).parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(data) = serde_json::to_vec_pretty(self) {
-            let tmp = format!("{}.tmp", WRAPPER_NAMES_PATH);
-            if fs::write(&tmp, &data).is_ok() {
-                let _ = fs::rename(&tmp, WRAPPER_NAMES_PATH);
-            }
-        }
+        let _ = crate::db::save_wrapper_names(self);
     }
 
     /// Klucz do mapy.
@@ -134,22 +118,11 @@ impl State {
     // ── Load / Save ─────────────────────────────────────────────────────────
 
     pub fn load() -> Result<Self> {
-        if !Path::new(STATE_PATH).exists() {
-            return Ok(State::default());
-        }
-        let data = fs::read(STATE_PATH).into_diagnostic()?;
-        Ok(serde_json::from_slice(&data).into_diagnostic()?)
+        crate::db::load_state()
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = Path::new(STATE_PATH).parent() {
-            fs::create_dir_all(parent).into_diagnostic()?;
-        }
-        let data = serde_json::to_vec_pretty(self).into_diagnostic()?;
-        let tmp  = format!("{}.tmp", STATE_PATH);
-        fs::write(&tmp, &data).into_diagnostic()?;
-        fs::rename(&tmp, STATE_PATH).into_diagnostic()?;
-        Ok(())
+        crate::db::save_state(self)
     }
 
     // ── Snapshot / rollback ──────────────────────────────────────────────────
@@ -324,7 +297,7 @@ impl State {
     }
 
     pub fn get_current_version(&self, package: &str) -> Option<String> {
-        let current_link = format!("{}{}/current", STORE_PATH, package);
+        let current_link = format!("{}{}/current", crate::store_path(), package);
         if let Ok(target) = fs::read_link(&current_link) {
             if let Some(ver) = target.file_name()?.to_str() {
                 return Some(ver.to_string());
