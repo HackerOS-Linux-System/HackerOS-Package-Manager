@@ -41,16 +41,16 @@ pub fn outdated() -> Result<()> {
     }
 
     if outdated_list.is_empty() {
-        println!("{} All packages are up to date.", "✔".green());
+        println!("{} All packages are up to date.", "✔".red());
     } else {
-        println!("{} Outdated packages:\n", "→".yellow());
-        println!("  {:<20} {:<15} {}", "Package".cyan(), "Current".cyan(), "Latest".cyan());
+        println!("{} Outdated packages:\n", "→".bright_black());
+        println!("  {:<20} {:<15} {}", "Package".white(), "Current".white(), "Latest".white());
         println!("  {}", "─".repeat(55).dimmed());
         for (pkg, cur, lat) in &outdated_list {
-            println!("  {:<20} {:<15} {}", pkg.magenta(), cur.red(), lat.green());
+            println!("  {:<20} {:<15} {}", pkg.magenta(), cur.red(), lat.red());
         }
         println!();
-        println!("  Run {} to update all.", "hpm update".yellow());
+        println!("  Run {} to update all.", "hpm update".bright_black());
     }
     Ok(())
 }
