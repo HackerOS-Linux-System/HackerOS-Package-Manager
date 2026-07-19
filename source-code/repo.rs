@@ -15,7 +15,7 @@ const SEARCH_CONCURRENCY: usize = 20;
 /// Blokuje file://, ftp://, i inne niebezpieczne schematy.
 const ALLOWED_SCHEMES: &[&str] = &["https://", "http://", "ssh://", "git@"];
 
-fn meta_cache_dir() -> PathBuf { PathBuf::from("/var/cache/hpm/meta") }
+fn meta_cache_dir() -> PathBuf { PathBuf::from(format!("{}/meta", crate::cache_dir())) }
 
 fn repos_dir() -> PathBuf {
     dirs::cache_dir()
@@ -85,6 +85,27 @@ impl RepoIndex {
         v
     }
     pub fn len(&self) -> usize { self.packages.len() }
+
+    /// Waliduje wszystkie URL-e w indeksie (schemat, brak localhost/path
+    /// traversal — patrz `validate_repo_url`). Używane zarówno przy
+    /// pobieraniu prawdziwego repo.json, jak i przy ładowaniu lokalnego
+    /// mirrora przez `HPM_REPO_JSON_URL=file://...`.
+    pub fn validate_urls(&self) -> Result<()> {
+        let mut bad_urls = Vec::new();
+        for (name, url) in &self.packages {
+            if let Err(e) = validate_repo_url(url) {
+                bad_urls.push(format!("  {}: {}", name, e));
+            }
+        }
+        if !bad_urls.is_empty() {
+            bail!(
+                "repo.json contains invalid repository URLs:\n{}\n\
+  Contact the maintainer to fix repo.json.",
+                bad_urls.join("\n")
+            );
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +206,19 @@ fn raw_base_url(repo_url: &str) -> Option<String> {
     if url.contains("github.com") {
         Some(url.replace("https://github.com/", "https://raw.githubusercontent.com/"))
     } else { None }
+}
+
+/// Nazwa katalogu cache dla klonów-jako-fallback metadanych (nie mylić z
+/// prawdziwym cache instalacji, który używa nazwy pakietu) — pochodna z
+/// samego URL-a, bo funkcje `fetch_raw_*` nie zawsze mają nazwę pakietu pod
+/// ręką (tylko `repo_url`).
+fn slug_for_url(url: &str) -> String {
+    let base = url.trim_end_matches('/').trim_end_matches(".git");
+    let last = base.rsplit('/').next().unwrap_or("repo");
+    let slug: String = last.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if slug.is_empty() { "repo".to_string() } else { format!("_meta_{}", slug) }
 }
 
 async fn fetch_raw_file(client: &reqwest::Client, repo_url: &str, filename: &str) -> Result<String> {
@@ -328,11 +362,33 @@ pub struct RepoManager {
 }
 
 impl RepoManager {
+    /// Zwraca URL indeksu pakietów. Domyślnie oficjalny `repo.json`, ale
+    /// respektuje `HPM_REPO_JSON_URL` jeśli ustawione — przydatne dla
+    /// self-hosted mirrorów firmowych, offline testów, i CI (podobnie jak
+    /// `NPM_CONFIG_REGISTRY` / `PIP_INDEX_URL` w innych ekosystemach).
+    fn repo_json_url() -> String {
+        std::env::var("HPM_REPO_JSON_URL").unwrap_or_else(|_| REPO_JSON_URL.to_string())
+    }
+
     pub async fn load() -> Result<Self> {
         let client = make_client()?;
         let pb = ProgressBar::new_spinner();
         pb.set_message("Downloading package index...");
-        let resp = client.get(REPO_JSON_URL).send().await
+        let url = Self::repo_json_url();
+
+        // `file://` tylko dla HPM_REPO_JSON_URL (lokalny/self-hosted mirror
+        // indeksu, NIE dla URL-i pakietów w repo.json samym — te nadal
+        // przechodzą przez `validate_repo_url` i normalny `ALLOWED_SCHEMES`).
+        if let Some(local_path) = url.strip_prefix("file://") {
+            let data = std::fs::read_to_string(local_path)
+                .map_err(|e| miette!("Failed to read local repo index '{}': {}", local_path, e))?;
+            let index: RepoIndex = serde_json::from_str(&data).into_diagnostic()?;
+            index.validate_urls()?;
+            pb.finish_with_message(format!("Index loaded from {} ({} packages)", local_path, index.len()));
+            return Ok(RepoManager { index, client });
+        }
+
+        let resp = client.get(&url).send().await
             .map_err(|e| {
                 let msg = e.to_string();
                 if msg.contains("certificate") || msg.contains("SSL") {
@@ -348,20 +404,8 @@ impl RepoManager {
         }
         let index: RepoIndex = resp.json().await.into_diagnostic()?;
 
-        // NOWE: waliduj wszystkie URL z repo.json przy ładowaniu
-        let mut bad_urls = Vec::new();
-        for (name, url) in &index.packages {
-            if let Err(e) = validate_repo_url(url) {
-                bad_urls.push(format!("  {}: {}", name, e));
-            }
-        }
-        if !bad_urls.is_empty() {
-            bail!(
-                "repo.json contains invalid repository URLs:\n{}\n\
-  Contact the maintainer to fix repo.json.",
-                bad_urls.join("\n")
-            );
-        }
+        // Waliduj wszystkie URL z repo.json przy ładowaniu
+        index.validate_urls()?;
 
         pb.finish_with_message(format!("Index loaded ({} packages)", index.len()));
         Ok(RepoManager { index, client })
@@ -371,6 +415,13 @@ impl RepoManager {
         tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap()
             .block_on(Self::load())
+    }
+
+    /// Konstruktor z gotowego indeksu, bez pobierania repo.json z sieci —
+    /// używane przez `hpm dev test-full` do testowania solvera wersji na
+    /// lokalnych repo git, bez zależności od prawdziwej sieci.
+    pub fn from_index(index: RepoIndex) -> Result<Self> {
+        Ok(RepoManager { index, client: make_client()? })
     }
 
     pub fn get_package_url(&self, name: &str) -> Option<&str> { self.index.url_of(name) }
@@ -406,12 +457,56 @@ impl RepoManager {
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
     pub async fn fetch_raw_info_hk(&self, repo_url: &str) -> Result<String> {
-        fetch_raw_file(&self.client, repo_url, "info.hk").await
+        match fetch_raw_file(&self.client, repo_url, "info.hk").await {
+            Ok(text) => Ok(text),
+            // BUG NAPRAWIONY (znaleziony testując `hpm info`/`hpm search` na
+            // pakietach spoza GitHub): szybka ścieżka HTTP
+            // (raw.githubusercontent.com) z definicji działa tylko dla
+            // GitHub — dla każdego innego hosta po prostu się poddawała.
+            // Teraz spada do (cache'owanego) `git clone` i czyta info.hk
+            // lokalnie z czubka domyślnej gałęzi — wolniejsze niż HTTP, ale
+            // rzeczywiście DZIAŁA zamiast twardo wymagać GitHub.
+            Err(_) if raw_base_url(repo_url).is_none() => {
+                self.fetch_info_hk_via_clone(repo_url)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn fetch_info_hk_via_clone(&self, repo_url: &str) -> Result<String> {
+        let slug = slug_for_url(repo_url);
+        let repo_path = self.clone_package_repo(&slug, repo_url)?;
+        let repo   = Repository::open(&repo_path).into_diagnostic()?;
+        let head   = repo.head().into_diagnostic()?;
+        let commit = head.peel_to_commit().into_diagnostic()?;
+        let tree   = commit.tree().into_diagnostic()?;
+        let entry  = tree.get_path(Path::new("info.hk"))
+            .map_err(|_| miette!("info.hk not found in {} (default branch)", repo_url))?;
+        let blob = repo.find_blob(entry.id()).into_diagnostic()?;
+        String::from_utf8(blob.content().to_vec()).into_diagnostic()
     }
 
     pub async fn fetch_raw_build_config(&self, repo_url: &str) -> Option<BuildConfig> {
-        let text = fetch_raw_file(&self.client, repo_url, "build.toml").await.ok()?;
+        let text = match fetch_raw_file(&self.client, repo_url, "build.toml").await {
+            Ok(t) => t,
+            Err(_) if raw_base_url(repo_url).is_none() => {
+                self.fetch_build_toml_via_clone(repo_url).ok()?
+            }
+            Err(_) => return None,
+        };
         toml::from_str(&text).ok()
+    }
+
+    fn fetch_build_toml_via_clone(&self, repo_url: &str) -> Result<String> {
+        let slug = slug_for_url(repo_url);
+        let repo_path = self.clone_package_repo(&slug, repo_url)?;
+        let repo   = Repository::open(&repo_path).into_diagnostic()?;
+        let head   = repo.head().into_diagnostic()?;
+        let commit = head.peel_to_commit().into_diagnostic()?;
+        let tree   = commit.tree().into_diagnostic()?;
+        let entry  = tree.get_path(Path::new("build.toml")).into_diagnostic()?;
+        let blob = repo.find_blob(entry.id()).into_diagnostic()?;
+        String::from_utf8(blob.content().to_vec()).into_diagnostic()
     }
 
     pub async fn fetch_package_meta(&self, name: &str) -> Result<PackageMeta> {
@@ -475,7 +570,25 @@ impl RepoManager {
                     }
 
                     // Network fetch — z fallbackiem do stale cache przy błędzie sieci
-                    match fetch_raw_file(&client, &repo_url, "info.hk").await {
+                    let fetch_result = match fetch_raw_file(&client, &repo_url, "info.hk").await {
+                        Ok(content) => Ok(content),
+                        // Nie-GitHub: szybka ścieżka HTTP nie ma zastosowania —
+                        // sklonuj (cache'owane) i przeczytaj lokalnie zamiast
+                        // po prostu dawać "Could not fetch (offline?)".
+                        Err(_) if raw_base_url(&repo_url).is_none() => {
+                            let name2 = name.clone();
+                            let url2  = repo_url.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let idx = RepoIndex { packages: std::collections::HashMap::new() };
+                                let rm  = RepoManager::from_index(idx)?;
+                                rm.fetch_info_hk_via_clone(&url2)
+                                    .map_err(|e| miette!("clone fallback failed for {}: {}", name2, e))
+                            }).await.into_diagnostic().and_then(|r| r)
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    match fetch_result {
                         Ok(content) => {
                             let mut meta = parse_meta_from_content(&name, &content);
                             meta.available_versions = get_local_versions(&name);
@@ -630,4 +743,78 @@ impl RepoManager {
         }
         Ok(index)
     }
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Releases — `.hpm` jako alternatywa dla pełnego `git clone`
+//
+// repo.json / repo-list.json NIE zmienia formatu: pakiet nadal jest po prostu
+// URL-em repozytorium git (`"name": "https://github.com/owner/repo"`). Kiedy
+// użytkownik doda `--release` do `hpm install`, hpm bierze ten sam URL,
+// wywnioskowuje z niego owner/repo, i pyta GitHub API o Release zamiast
+// klonować całe repo — pod warunkiem że maintainer faktycznie coś tam
+// wrzucił (`hpm build` + załącznik do Release). Jeśli nie ma Release albo
+// assetu .hpm, zwracamy jasny błąd z podpowiedzią, nie fallbackujemy po cichu
+// na git clone (żeby `--release` zawsze znaczyło dokładnie to, o co proszono).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct GithubAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GithubRelease {
+    pub tag_name: String,
+    #[serde(default)]
+    pub assets: Vec<GithubAsset>,
+}
+
+/// Wyciąga (owner, repo) z URL-a github.com w dowolnym popularnym formacie:
+/// https://github.com/owner/repo, https://github.com/owner/repo.git,
+/// git@github.com:owner/repo.git.
+pub fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    let cleaned = url.trim().trim_end_matches(".git").trim_end_matches('/');
+    let rest = if let Some(r) = cleaned.strip_prefix("https://github.com/") { r }
+        else if let Some(r) = cleaned.strip_prefix("http://github.com/") { r }
+        else if let Some(r) = cleaned.strip_prefix("git@github.com:") { r }
+        else { return None };
+    let mut parts = rest.splitn(2, '/');
+    let owner = parts.next()?.to_string();
+    let repo  = parts.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() { return None; }
+    Some((owner, repo))
+}
+
+pub fn fetch_github_release(owner: &str, repo: &str, tag: Option<&str>) -> Result<GithubRelease> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().into_diagnostic()?
+        .block_on(fetch_github_release_async(owner, repo, tag))
+}
+
+async fn fetch_github_release_async(owner: &str, repo: &str, tag: Option<&str>) -> Result<GithubRelease> {
+    let url = match tag {
+        Some(t) => format!("https://api.github.com/repos/{}/{}/releases/tags/{}", owner, repo, t),
+        None    => format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo),
+    };
+    let client = make_client()?;
+    let resp = client.get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "hpm-package-manager")
+        .send().await
+        .map_err(|e| miette!("Failed to reach GitHub API: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(miette!(
+            "No {} found for {}/{} on GitHub.\n  \
+  The maintainer needs to publish one (see `hpm build`), or drop --release to use git clone instead.",
+            match tag { Some(t) => format!("release tagged '{}'", t), None => "releases".to_string() },
+            owner, repo
+        ));
+    }
+    if !resp.status().is_success() {
+        bail!("GitHub API returned {} for {}/{}", resp.status(), owner, repo);
+    }
+    resp.json::<GithubRelease>().await.into_diagnostic()
 }
