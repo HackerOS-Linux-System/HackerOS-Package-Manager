@@ -65,7 +65,7 @@ pub fn create(name: Option<String>) -> Result<()> {
     if pkg_dir.exists() {
         if !prompt_bool(
             &format!("Directory '{}' already exists. Continue?", pkg_name), false)? {
-            println!("{} Aborted.", "→".yellow());
+            println!("{} Aborted.", "→".bright_black());
             return Ok(());
         }
     }
@@ -145,16 +145,16 @@ pub fn create(name: Option<String>) -> Result<()> {
         .into_diagnostic()?;
 
     // ── Summary ──────────────────────────────────────────────────────────────
-    println!("\n{} Package '{}' created!\n", "✔".green(), pkg_name.cyan());
+    println!("\n{} Package '{}' created!\n", "✔".red(), pkg_name.white());
     if !tags.is_empty() {
-        println!("  {} Tags: {}", "◆".blue(), tags.iter().map(|t| format!("@{}", t)).collect::<Vec<_>>().join(", ").cyan());
+        println!("  {} Tags: {}", "◆".white(), tags.iter().map(|t| format!("@{}", t)).collect::<Vec<_>>().join(", ").white());
     }
     println!("{}", "Next steps:".bold());
-    println!("  1. cd {}", pkg_name.cyan());
+    println!("  1. cd {}", pkg_name.white());
     if has_binary && build_type == "Already in contents/ (prebuilt)" {
-        println!("  2. Replace {} with your actual binary", format!("contents/bin/{}", bin_name).cyan());
+        println!("  2. Replace {} with your actual binary", format!("contents/bin/{}", bin_name).white());
         println!("  3. Make it executable in git:");
-        println!("     {}", format!("git update-index --chmod=+x contents/bin/{}", bin_name).cyan());
+        println!("     {}", format!("git update-index --chmod=+x contents/bin/{}", bin_name).white());
     }
     println!("  n. git tag v1.0.0 && git push origin main --tags");
     println!("  n. Submit PR to add package to HPM index\n");
@@ -312,7 +312,7 @@ jobs:
 
 fn prompt(label: &str, default: Option<&str>) -> Result<String> {
     let default_str = default.map(|d| format!(" [{}]", d)).unwrap_or_default();
-    print!("  {} {}{}: ", "?".cyan(), label.bold(), default_str.dimmed());
+    print!("  {} {}{}: ", "?".white(), label.bold(), default_str.dimmed());
     io::stdout().flush().into_diagnostic()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input).into_diagnostic()?;
@@ -322,7 +322,7 @@ fn prompt(label: &str, default: Option<&str>) -> Result<String> {
 
 fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     let hint = if default { "[Y/n]" } else { "[y/N]" };
-    print!("  {} {} {}: ", "?".cyan(), label.bold(), hint.dimmed());
+    print!("  {} {} {}: ", "?".white(), label.bold(), hint.dimmed());
     io::stdout().flush().into_diagnostic()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input).into_diagnostic()?;
@@ -334,15 +334,15 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
 }
 
 fn prompt_choice(label: &str, choices: &[&str], default_idx: usize) -> Result<String> {
-    println!("  {} {}:", "?".cyan(), label.bold());
+    println!("  {} {}:", "?".white(), label.bold());
     for (i, choice) in choices.iter().enumerate() {
         if i == default_idx {
-            println!("    {} {} {}", format!("[{}]", i).cyan(), choice, "(default)".dimmed());
+            println!("    {} {} {}", format!("[{}]", i).white(), choice, "(default)".dimmed());
         } else {
             println!("    {} {}", format!("[{}]", i).dimmed(), choice);
         }
     }
-    print!("  Choice [{}]: ", default_idx.to_string().cyan());
+    print!("  Choice [{}]: ", default_idx.to_string().white());
     io::stdout().flush().into_diagnostic()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input).into_diagnostic()?;
