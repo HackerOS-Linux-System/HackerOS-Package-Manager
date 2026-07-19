@@ -57,11 +57,19 @@ pub struct Manifest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Sandbox {
-    #[serde(default)] pub network:    bool,
-    #[serde(default)] pub filesystem: Vec<String>,
-    #[serde(default)] pub gui:        bool,
-    #[serde(default)] pub dev:        bool,
-    #[serde(default)] pub full_gui:   bool,
+    #[serde(default)] pub network:      bool,
+    #[serde(default)] pub filesystem:   Vec<String>,
+    #[serde(default)] pub gui:          bool,
+    #[serde(default)] pub dev:          bool,
+    #[serde(default)] pub full_gui:     bool,
+    /// Jawna zgoda na sieć DLA HOOKÓW (pre/post-install itd.), niezależna od
+    /// `network` (które dotyczy tylko samej aplikacji przy `hpm run`). Hooki
+    /// domyślnie NIE dostają sieci nawet gdy `network = true` — patrz
+    /// `sandbox::run_hook_sandboxed`. Ustaw `hooks_network => true` tylko dla
+    /// pakietów, których hooki naprawdę tego wymagają (np. rejestracja w
+    /// zewnętrznym serwisie telemetrycznym przy pierwszym uruchomieniu) —
+    /// każdy taki pakiet powinien to jasno tłumaczyć w opisie.
+    #[serde(default)] pub hooks_network: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +141,7 @@ pub fn check_arch_compatibility(declared: &str) -> Result<()> {
             "Architecture mismatch: package requires '{}' but running on '{}'.\n\
   If this is a cross-arch install, use {} to override.",
             declared, current,
-            "hpm install --force-arch".yellow()
+            "hpm install --force-arch".bright_black()
         ));
     }
     Ok(())
@@ -210,7 +218,7 @@ impl Manifest {
         }
 
         let sandbox_sec = config.get("sandbox").and_then(|v| v.as_map().ok());
-        let (network, gui, dev, full_gui, filesystem, sandbox_disabled) =
+        let (network, gui, dev, full_gui, filesystem, sandbox_disabled, hooks_network) =
             if let Some(s) = sandbox_sec {
                 (
                     get_bool(s, "network"),
@@ -219,8 +227,9 @@ impl Manifest {
                     get_bool(s, "full_gui"),
                     get_string_list(s, "filesystem"),
                     get_bool(s, "disabled"),
+                    get_bool(s, "hooks_network"),
                 )
-            } else { (false, is_gui, false, false, Vec::new(), false) };
+            } else { (false, is_gui, false, false, Vec::new(), false, false) };
 
         let install_sec      = config.get("install").and_then(|v| v.as_map().ok());
         let install_commands = install_sec.map(|is| get_string_list(is, "commands")).unwrap_or_default();
@@ -252,7 +261,7 @@ impl Manifest {
         Ok(Manifest {
             name, version, authors, license, summary, long,
             system_specs, deps, tags, bins, bin_paths, is_gui, conflicts, arch, has_hooks,
-            sandbox: Sandbox { network, filesystem, gui, dev, full_gui },
+            sandbox: Sandbox { network, filesystem, gui, dev, full_gui, hooks_network },
             sandbox_disabled, install_commands,
             build:   BuildInfo   { commands: build_commands,  deb_deps: build_deb_deps },
             runtime: RuntimeInfo { deb_deps: runtime_deb_deps },
