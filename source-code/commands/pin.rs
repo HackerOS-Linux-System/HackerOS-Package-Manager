@@ -12,6 +12,6 @@ pub fn pin(package: String, version: String) -> Result<()> {
         .ok_or_else(|| miette::miette!("Version '{}' of '{}' not installed", version, package))?;
     info.pinned = true;
     state.save()?;
-    println!("{} Pinned {}@{}", "✔".green(), package.cyan(), version.cyan());
+    println!("{} Pinned {}@{}", "✔".red(), package.white(), version.white());
     Ok(())
 }
