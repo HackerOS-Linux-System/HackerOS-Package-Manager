@@ -5,9 +5,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use crate::state::State;
-use crate::STORE_PATH;
 
-const SYSTEM_LOCK_PATH: &str = "/var/lib/hpm/system.lock";
+fn system_lock_path() -> String { format!("{}/system.lock", crate::db_dir()) }
 
 // ---------------------------------------------------------------------------
 // Lock file structure
@@ -57,7 +56,7 @@ impl LockFile {
         if !path.exists() {
             bail!(
                 "Lock file not found at {}.\nRun {} to generate one.",
-                path.display(), "hpm lock generate".yellow()
+                path.display(), "hpm lock generate".bright_black()
             );
         }
         let data = fs::read(path).into_diagnostic()?;
@@ -137,7 +136,7 @@ fn resolve_lock_path(project_path: Option<&str>) -> PathBuf {
         if cwd_lock.parent().map(|p| p.join("info.hk").exists()).unwrap_or(false) {
             cwd_lock
         } else {
-            PathBuf::from(SYSTEM_LOCK_PATH)
+            PathBuf::from(system_lock_path())
         }
     }
 }
@@ -170,13 +169,13 @@ fn cmd_generate(project: Option<&str>) -> Result<()> {
     let state     = State::load()?;
 
     if state.packages.is_empty() {
-        println!("{} No packages installed — lock file will be empty.", "→".yellow());
+        println!("{} No packages installed — lock file will be empty.", "→".bright_black());
     }
 
     let repo_mgr = crate::repo::RepoManager::load_sync()?;
     let mut lock = LockFile::new();
 
-    println!("{} Generating lock file...", "→".cyan());
+    println!("{} Generating lock file...", "→".white());
 
     for (pkg_name, versions) in &state.packages {
         let current_ver = match state.get_current_version(pkg_name) {
@@ -215,13 +214,13 @@ fn cmd_generate(project: Option<&str>) -> Result<()> {
             installed_at:         info.installed_at,
         });
 
-        println!("  {} {}@{}", "✔".green(), pkg_name.cyan(), current_ver.green());
+        println!("  {} {}@{}", "✔".red(), pkg_name.white(), current_ver.red());
     }
 
     lock.save(&lock_path)?;
 
     println!();
-    println!("{} Lock file written: {}", "✔".green(), lock_path.display().to_string().cyan());
+    println!("{} Lock file written: {}", "✔".red(), lock_path.display().to_string().white());
     println!("  {} packages locked", lock.packages.len());
     println!("  Commit to version control to ensure reproducible installs.");
     Ok(())
@@ -233,7 +232,7 @@ fn cmd_check(project: Option<&str>) -> Result<()> {
     let lock      = LockFile::load(&lock_path)?;
     let state     = State::load()?;
 
-    println!("{} Checking lock file consistency...", "→".cyan());
+    println!("{} Checking lock file consistency...", "→".white());
     println!("  Lock: {}", lock_path.display().to_string().dimmed());
     println!("  Generated: {} by hpm {}", format_ts(lock.generated_at), lock.hpm_version.dimmed());
     println!();
@@ -241,7 +240,7 @@ fn cmd_check(project: Option<&str>) -> Result<()> {
     let diffs = lock.check_against_state(&state);
 
     if diffs.is_empty() {
-        println!("{} Lock file matches installed packages. Reproducible install verified.", "✔".green());
+        println!("{} Lock file matches installed packages. Reproducible install verified.", "✔".red());
         Ok(())
     } else {
         println!("{} {} discrepancy(ies) found:\n", "✗".red(), diffs.len());
@@ -250,7 +249,7 @@ fn cmd_check(project: Option<&str>) -> Result<()> {
         }
         println!();
         println!("  Run {} to update lock, or {} to restore.",
-                 "hpm lock generate".yellow(), "hpm lock restore".yellow());
+                 "hpm lock generate".bright_black(), "hpm lock restore".bright_black());
         bail!("Lock file check failed");
     }
 }
@@ -260,8 +259,8 @@ fn cmd_status(project: Option<&str>) -> Result<()> {
     let lock_path = resolve_lock_path(project);
 
     if !lock_path.exists() {
-        println!("{} No lock file at {}", "→".yellow(), lock_path.display());
-        println!("  Run {} to create one.", "hpm lock generate".yellow());
+        println!("{} No lock file at {}", "→".bright_black(), lock_path.display());
+        println!("  Run {} to create one.", "hpm lock generate".bright_black());
         return Ok(());
     }
 
@@ -269,7 +268,7 @@ fn cmd_status(project: Option<&str>) -> Result<()> {
     let state = State::load()?;
     let diffs = lock.check_against_state(&state);
 
-    println!("{} Lock file: {}", "→".blue(), lock_path.display().to_string().cyan());
+    println!("{} Lock file: {}", "→".white(), lock_path.display().to_string().white());
     println!("  Lock version : {}", lock.lock_version);
     println!("  hpm version  : {}", lock.hpm_version.dimmed());
     println!("  Generated    : {}", format_ts(lock.generated_at));
@@ -277,11 +276,11 @@ fn cmd_status(project: Option<&str>) -> Result<()> {
     println!();
 
     if diffs.is_empty() {
-        println!("{} In sync with installed packages.", "✔".green());
+        println!("{} In sync with installed packages.", "✔".red());
     } else {
-        println!("{} {} discrepancy(ies):", "⚠".yellow(), diffs.len());
+        println!("{} {} discrepancy(ies):", "⚠".bright_black(), diffs.len());
         for d in &diffs {
-            println!("  {} {}", "⚠".yellow(), d);
+            println!("  {} {}", "⚠".bright_black(), d);
         }
     }
 
@@ -296,9 +295,9 @@ fn cmd_diff(project: Option<&str>) -> Result<()> {
     let diffs     = lock.check_against_state(&state);
 
     if diffs.is_empty() {
-        println!("{} No differences — lock matches state.", "✔".green());
+        println!("{} No differences — lock matches state.", "✔".red());
     } else {
-        println!("{} Differences (lock ↔ state):\n", "→".yellow());
+        println!("{} Differences (lock ↔ state):\n", "→".bright_black());
         for d in &diffs {
             let (prefix, color) = if d.starts_with("missing") || d.starts_with("checksum") {
                 ("−", "\033[0;31m")
@@ -377,12 +376,12 @@ fn format_ts(ts: u64) -> String {
 
 fn print_help() {
     println!("\n{} {}\n", "hpm lock".bold().red(), "— Reproducible install lock file");
-    println!("{}  hpm lock {} [project_dir]\n", "Usage:".bold(), "<subcommand>".yellow());
+    println!("{}  hpm lock {} [project_dir]\n", "Usage:".bold(), "<subcommand>".bright_black());
     println!("{}", "Subcommands:".bold().underline());
-    println!("  {:<20} {}", "generate".green(), "Generate/update hpm.lock from current installs");
-    println!("  {:<20} {}", "check".green(),    "Verify state matches lock file (exits 1 if not)");
-    println!("  {:<20} {}", "status".green(),   "Show lock file info and sync status");
-    println!("  {:<20} {}", "diff".green(),     "Show differences between lock and installed state");
+    println!("  {:<20} {}", "generate".red(), "Generate/update hpm.lock from current installs");
+    println!("  {:<20} {}", "check".red(),    "Verify state matches lock file (exits 1 if not)");
+    println!("  {:<20} {}", "status".red(),   "Show lock file info and sync status");
+    println!("  {:<20} {}", "diff".red(),     "Show differences between lock and installed state");
     println!();
     println!("{}", "Files:".bold().underline());
     println!("  ./hpm.lock                Local lock (when info.hk present in CWD)");
