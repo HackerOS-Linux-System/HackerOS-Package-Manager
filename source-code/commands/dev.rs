@@ -1,4 +1,4 @@
-use miette::{Result, IntoDiagnostic, bail};
+use miette::{Result, IntoDiagnostic, bail, miette};
 use colored::Colorize;
 use std::fs;
 use std::io::Write;
@@ -18,7 +18,7 @@ impl TestSuite {
         println!();
         println!("{}", "─".repeat(60).dimmed());
         println!("{}", "Test Results:".bold());
-        println!("  {} Passed:  {}", "✔".green(),  self.passed.len());
+        println!("  {} Passed:  {}", "✔".red(),  self.passed.len());
         println!("  {} Failed:  {}", "✗".red(),    self.failed.len());
         println!("  {} Skipped: {}", "○".dimmed(), self.skipped.len());
         println!("  Total:    {}", total);
@@ -31,13 +31,22 @@ impl TestSuite {
         }
         println!();
         if self.failed.is_empty() {
-            println!("{} All tests passed!", "✔".green().bold());
+            println!("{} All tests passed!", "✔".red().bold());
         } else {
             println!("{} {} test(s) failed.", "✗".red().bold(), self.failed.len());
         }
     }
 }
 
+/// `hpm dev` obsługuje dwa tryby:
+///   1. Znane subkomendy: `test`, `test-full`, `check-env` (jak dotychczas).
+///   2. Ścieżka do katalogu (relatywna lub pełna): `hpm dev <katalog>` —
+///      testowanie lokalnego pakietu, KTÓRY NIE MUSI być w repo-list.json /
+///      repo.json. Idealne do portowania/weryfikacji pakietów przed publikacją
+///      w oficjalnym indeksie: `hpm dev ./moj-pakiet` albo
+///      `hpm dev /home/user/paczki/firefox`.
+///      Wspiera dalej: `hpm dev <katalog> run <bin> [args...]` żeby od razu
+///      odpalić skompilowany plik binarny przez tę samą piaskownicę co `hpm run`.
 pub fn dev(args: Vec<String>) -> Result<()> {
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("test");
     match subcmd {
@@ -45,14 +54,195 @@ pub fn dev(args: Vec<String>) -> Result<()> {
         "test-full" => run_tests(true),
         "check-env" => check_environment(),
         _ => {
-            eprintln!("{} Unknown dev subcommand: {} (test|test-full|check-env)", "✗".red(), subcmd);
+            // Nie jest to znana subkomenda — sprawdź czy to ścieżka do katalogu
+            // pakietu (zawiera info.hk). Rozróżnienie: subkomendy nigdy nie
+            // wyglądają jak ścieżka (nie zawierają '/', nie zaczynają się od
+            // '.', nie istnieją jako katalog w cwd) — ale zamiast zgadywać po
+            // składni, po prostu sprawdzamy istnienie katalogu na dysku, co
+            // jest jednoznaczne i działa zarówno dla ścieżek względnych jak
+            // i pełnych.
+            let candidate = PathBuf::from(subcmd);
+            if candidate.is_dir() {
+                return dev_local(subcmd, args[1..].to_vec());
+            }
+            eprintln!(
+                "{} Unknown dev subcommand or path: '{}'\n  \
+  Expected one of: test | test-full | check-env\n  \
+  ...or a path to a local package directory (containing info.hk), e.g.:\n  \
+    hpm dev ./my-package\n  \
+    hpm dev /home/user/packages/firefox run firefox",
+                "✗".red(), subcmd
+            );
             std::process::exit(1);
         }
     }
 }
 
+/// Testuje lokalny katalog pakietu bez wymogu obecności w repo-list.json /
+/// repo.json i bez dotykania systemowego crate::store_path() (nie wymaga roota).
+/// Odtwarza cykl życia instalacji (walidacja → build → pre-install hook →
+/// post-install hook) dokładnie tymi samymi mechanizmami co `hpm install`
+/// (ten sam parser manifestu, ta sama piaskownica na hooki, ten sam resolver
+/// binarek), więc jeśli coś tu przejdzie, przejdzie też przy realnym `hpm
+/// install` po opublikowaniu pakietu.
+fn dev_local(path_arg: &str, rest: Vec<String>) -> Result<()> {
+    let dir_raw = PathBuf::from(path_arg);
+    if !dir_raw.exists() {
+        bail!("Path '{}' does not exist", path_arg);
+    }
+    if !dir_raw.is_dir() {
+        bail!("'{}' is not a directory (expected a package directory containing info.hk)", path_arg);
+    }
+    let dir = dir_raw.canonicalize().into_diagnostic()?;
+
+    if !dir.join("info.hk").exists() {
+        bail!(
+            "'{}' has no info.hk — not a valid hpm package directory.\n  \
+  Expected layout: <dir>/info.hk (+ optionally contents/, hooks/, build.toml)",
+            dir.display()
+        );
+    }
+
+    println!("\n{} {}\n", "hpm dev".bold().red(),
+              format!("— local package test: {}", dir.display()).dimmed());
+
+    let manifest = crate::manifest::Manifest::load_from_path(dir.to_str().unwrap())
+        .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
+
+    print_manifest_summary(&manifest);
+
+    // Informacyjnie: czy ten pakiet jest też zarejestrowany w skonfigurowanym
+    // indeksie repo — to NIE blokuje testu, `hpm dev` działa niezależnie od
+    // repo-list.json / repo.json, ale warto wiedzieć czy testujemy nową
+    // paczkę, czy nadpisujemy lokalnie coś, co jest już opublikowane.
+    if let Ok(rm) = crate::repo::RepoManager::load_sync() {
+        if rm.get_package_url(&manifest.name).is_some() {
+            println!("  {} Note: '{}' is ALSO present in the configured repo index — \
+this local directory is used instead for this test run only.",
+                     "ℹ".white(), manifest.name);
+        } else {
+            println!("  {} '{}' is not in repo-list.json / repo.json — \
+that's expected for local dev testing.", "ℹ".white(), manifest.name);
+        }
+    }
+
+    crate::manifest::check_arch_compatibility(&manifest.arch)?;
+
+    let warnings = crate::hooks::validate_hooks(&dir);
+    if warnings.is_empty() {
+        println!("  {} No hook validation warnings", "✔".red());
+    } else {
+        println!("  {} Hook validation warnings:", "⚠".bright_black());
+        for w in &warnings { println!("      - {}", w); }
+    }
+
+    let contents_dir = dir.join("contents");
+    if !contents_dir.exists() {
+        // Ujednolicone z `hpm install`: najpierw build.toml (BuildConfig —
+        // download/build/prebuilt źródła), potem klasyczny [build] commands /
+        // build.info z info.hk. To ta sama ścieżka kodu co realna instalacja,
+        // więc jeśli build przejdzie tutaj, przejdzie też przy `hpm install`.
+        let pb = indicatif::ProgressBar::new_spinner();
+        pb.set_message("Building...");
+        if let Some(cfg) = crate::repo::BuildConfig::load_from_dir(&dir) {
+            println!("  {} Found build.toml — running BuildConfig pipeline...", "→".white());
+            crate::commands::install::run_build_config(&cfg, &dir, &manifest.version, &manifest, &pb, &manifest.name)?;
+        } else if !manifest.build.commands.is_empty()
+            || dir.join("build.info").exists() {
+            println!("  {} No contents/ yet — running [build] commands in sandbox...", "→".white());
+            crate::commands::install::run_classic_build(&dir, &manifest, &pb)?;
+        } else {
+            pb.finish_and_clear();
+            bail!(
+                "No 'contents/' directory, no build.toml, and no [build] commands in info.hk — \
+nothing to test.\n  Either provide a pre-built contents/, or add a build step \
+(same as a real package needs for 'hpm install')."
+            );
+        }
+        pb.finish_and_clear();
+        if !contents_dir.exists() {
+            bail!("Build finished but 'contents/' is still missing — check build.toml / [build] in info.hk");
+        }
+        println!("  {} Build finished", "✔".red());
+    } else {
+        println!("  {} contents/ already present — skipping build step", "✔".red());
+    }
+
+    crate::commands::install::make_all_binaries_executable(&dir, &manifest)?;
+
+    // Symuluj cykl życia instalacji: pre-install hook -> post-install hook —
+    // dokładnie jak `hpm install`, ale bez crate::store_path() i bez roota.
+    let fake_store_path = format!("(dev) {}", dir.display());
+    let ctx = crate::hooks::HookContext {
+        pkg_name:    &manifest.name,
+        pkg_version: &manifest.version,
+        store_path:  &fake_store_path,
+        old_version: None,
+    };
+    if crate::hooks::hook_exists(&dir, crate::hooks::HookKind::PreInstall) {
+        crate::hooks::run_hook(&dir, crate::hooks::HookKind::PreInstall, &ctx, &manifest)?;
+    }
+    if crate::hooks::hook_exists(&dir, crate::hooks::HookKind::PostInstall) {
+        crate::hooks::run_hook(&dir, crate::hooks::HookKind::PostInstall, &ctx, &manifest)?;
+    }
+
+    if manifest.bins.is_empty() {
+        println!("\n  {} Package declares no [metadata] bins — nothing to run.", "ℹ".white());
+    } else {
+        println!("\n  {} Binaries declared:", "→".white());
+        for b in &manifest.bins {
+            match crate::commands::install::find_binary_in_dir(&dir, b) {
+                Some(rel) => println!("    {} {} → {}", "✔".red(), b, rel.dimmed()),
+                None      => println!("    {} {} — NOT FOUND in contents/", "✗".red(), b),
+            }
+        }
+        println!("\n  Try it: hpm dev {} run <bin> [args...]", path_arg);
+    }
+
+    // Opcjonalnie: od razu odpal binarkę: `hpm dev <path> run <bin> [args...]`
+    if let Some(sub) = rest.first() {
+        if sub == "run" {
+            let bin = rest.get(1).ok_or_else(|| {
+                miette!("Usage: hpm dev {} run <bin> [args...]", path_arg)
+            })?;
+            let extra_args = rest[2..].to_vec();
+            let bin_rel = crate::commands::install::find_binary_in_dir(&dir, bin)
+                .ok_or_else(|| miette!("Binary '{}' not found in '{}'", bin, dir.display()))?;
+            println!("\n  {} Running '{}' via sandbox...\n", "→".white(), bin);
+            crate::sandbox::setup_sandbox(
+                dir.to_str().unwrap(), &manifest, false, Some(&bin_rel), extra_args, false,
+            )?;
+        } else {
+            eprintln!(
+                "  {} Unknown 'hpm dev {} {}' — did you mean: run <bin> [args...]?",
+                "⚠".bright_black(), path_arg, sub
+            );
+        }
+    }
+
+    println!("\n{} Local dev test finished for '{}@{}'.",
+              "✔".red().bold(), manifest.name, manifest.version);
+    Ok(())
+}
+
+fn print_manifest_summary(m: &crate::manifest::Manifest) {
+    println!("  {:<12} {}", "Name:", m.name.white());
+    println!("  {:<12} {}", "Version:",  m.version);
+    println!("  {:<12} {}", "Authors:",  if m.authors.is_empty() { "-" } else { &m.authors });
+    println!("  {:<12} {}", "License:",  if m.license.is_empty() { "-" } else { &m.license });
+    println!("  {:<12} {}", "Arch:",     if m.arch.is_empty() { "any" } else { &m.arch });
+    if !m.tags.is_empty() {
+        println!("  {:<12} {}", "Tags:", m.tags.join(", ").dimmed());
+    }
+    println!("  {:<12} network={} gui={} full_gui={} disabled={} filesystem={:?}",
+             "Sandbox:", m.sandbox.network, m.sandbox.gui, m.sandbox.full_gui,
+             m.sandbox_disabled, m.sandbox.filesystem);
+    println!("  {:<12} {}", "Hooks:", if m.has_hooks { "yes".red().to_string() } else { "no".dimmed().to_string() });
+    println!();
+}
+
 fn check_environment() -> Result<()> {
-    println!("{} Checking hpm development environment...\n", "→".cyan());
+    println!("{} Checking hpm development environment...\n", "→".white());
     let checks: &[(&str, &str, bool)] = &[
         ("git",      "Git",                        true),
         ("tar",      "tar",                        true),
@@ -73,7 +263,7 @@ fn check_environment() -> Result<()> {
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.lines().next().unwrap_or("").trim().to_string())
             .unwrap_or_default();
-            println!("  {} {:<35} {}", "✔".green(), desc, version.dimmed());
+            println!("  {} {:<35} {}", "✔".red(), desc, version.dimmed());
         } else if *required {
             println!("  {} {:<35} MISSING (required)", "✗".red(), desc);
             all_ok = false;
@@ -87,7 +277,7 @@ fn check_environment() -> Result<()> {
     check_kf("Landlock LSM",     "/proc/sys/kernel/landlock/abi",       "");
     check_kf("eBPF JIT",         "/proc/sys/net/core/bpf_jit_enable",  "0");
     println!();
-    if all_ok { println!("{} Environment ready.", "✔".green()); }
+    if all_ok { println!("{} Environment ready.", "✔".red()); }
     else       { println!("{} Some required tools missing.", "✗".red()); }
     Ok(())
 }
@@ -95,8 +285,8 @@ fn check_environment() -> Result<()> {
 fn check_kf(name: &str, path: &str, bad_value: &str) {
     if let Ok(val) = fs::read_to_string(path) {
         let val = val.trim();
-        if val == bad_value { println!("  {} {:<30} {} (disabled)", "⚠".yellow(), name, val.red()); }
-        else                { println!("  {} {:<30} {}", "✔".green(), name, val.dimmed()); }
+        if val == bad_value { println!("  {} {:<30} {} (disabled)", "⚠".bright_black(), name, val.red()); }
+        else                { println!("  {} {:<30} {}", "✔".red(), name, val.dimmed()); }
     } else {
         println!("  {} {:<30} not available", "○".dimmed(), name);
     }
@@ -104,12 +294,12 @@ fn check_kf(name: &str, path: &str, bad_value: &str) {
 
 fn run_tests(full: bool) -> Result<()> {
     println!("\n{} {}\n", "hpm dev test".bold().red(), "— Integration Test Suite");
-    println!("  hpm version : {}", env!("CARGO_PKG_VERSION").cyan());
-    println!("  full mode   : {}", if full { "yes".green() } else { "no (quick)".dimmed() });
+    println!("  hpm version : {}", env!("CARGO_PKG_VERSION").white());
+    println!("  full mode   : {}", if full { "yes".red() } else { "no (quick)".dimmed() });
     println!();
 
     let test_env = TestEnvironment::setup()?;
-    println!("{} Test environment: {}\n", "→".cyan(), test_env.root.display().to_string().dimmed());
+    println!("{} Test environment: {}\n", "→".white(), test_env.root.display().to_string().dimmed());
 
     let mut suite   = TestSuite::default();
     let total_start = Instant::now();
@@ -143,6 +333,8 @@ fn run_tests(full: bool) -> Result<()> {
         run_test(&mut suite, "search-pagination",   || test_search_pagination());
         run_test(&mut suite, "sandbox-compat-mode", || test_sandbox_compat());
         run_test(&mut suite, "rollback-full-state", || test_rollback_state());
+        run_test(&mut suite, "solver-picks-older-version-to-avoid-conflict", || test_solver_conflict_resolution());
+        run_test(&mut suite, "solver-fails-clearly-when-unsatisfiable",      || test_solver_unsatisfiable());
     } else {
         suite.skipped.push("search-pagination".to_string());
         suite.skipped.push("sandbox-compat-mode".to_string());
@@ -150,9 +342,9 @@ fn run_tests(full: bool) -> Result<()> {
     }
 
     println!();
-    print!("{} Cleaning up test environment...", "→".cyan());
+    print!("{} Cleaning up test environment...", "→".white());
     test_env.cleanup();
-    println!(" {}", "done".green());
+    println!(" {}", "done".red());
     println!("\n  Total time: {:.2}s", total_start.elapsed().as_secs_f32());
     suite.print_summary();
     if !suite.failed.is_empty() { std::process::exit(1); }
@@ -166,7 +358,7 @@ fn run_test<F: FnOnce() -> Result<()>>(suite: &mut TestSuite, id: &str, f: F) {
     match f() {
         Ok(()) => {
             let e = start.elapsed();
-            println!("{} {}", "OK".green().bold(), format!("({:.1}s)", e.as_secs_f32()).dimmed());
+            println!("{} {}", "OK".red().bold(), format!("({:.1}s)", e.as_secs_f32()).dimmed());
             suite.passed.push((id.to_string(), e));
         }
         Err(e) => {
@@ -191,9 +383,12 @@ struct TestEnvironment {
 impl TestEnvironment {
     fn setup() -> Result<Self> {
         let tmp = tempfile::tempdir().into_diagnostic()?;
-        // FIXED: TempDir::keep() zwraca PathBuf bezpośrednio (nie Result ani tuple)
-        // Dokumentacja: "Persist the temporary directory, returning the PathBuf where it is located"
-        let root      = tmp.keep();
+        // FIXED (real bug found via `cargo check`, was previously `tmp.keep()` which
+        // does not exist on `TempDir` in any tempfile version — `TempDir` only has
+        // `into_path(self) -> PathBuf`, which is what we actually want here: consume
+        // the guard so the directory survives past this function without auto-cleanup
+        // on Drop (cleanup happens explicitly via `TestEnvironment::cleanup`).
+        let root      = tmp.into_path();
         let store     = root.join("store");
         let lock_file = root.join("hpm.lock");
         fs::create_dir_all(&store).into_diagnostic()?;
@@ -425,14 +620,15 @@ fn test_hooks_pre_install(env: &TestEnvironment) -> Result<()> {
     let hooks_dir = dir.join("hooks");
     let sentinel  = env.root.join("hook-ran");
     fs::create_dir_all(&hooks_dir).into_diagnostic()?;
-    let script = format!("#!/usr/bin/env hl\n> touch {}\n", sentinel.display());
+    let script = format!("#!/usr/bin/env hl\ntouch {}\n", sentinel.display());
     fs::write(hooks_dir.join("pre-install.hl"), script.as_bytes()).into_diagnostic()?;
     crate::utils::make_executable(&hooks_dir.join("pre-install.hl"))?;
     let ctx = HookContext {
         pkg_name: "test-hook", pkg_version: "1.0.0",
         store_path: env.store.to_str().unwrap(), old_version: None,
     };
-    let ran = run_hook(&dir, HookKind::PreInstall, &ctx)?;
+    let manifest = crate::manifest::Manifest::default();
+    let ran = run_hook(&dir, HookKind::PreInstall, &ctx, &manifest)?;
     assert!(ran, "Hook should have run");
     Ok(())
 }
@@ -443,13 +639,14 @@ fn test_hooks_post_install(env: &TestEnvironment) -> Result<()> {
     let hooks_dir = dir.join("hooks");
     fs::create_dir_all(&hooks_dir).into_diagnostic()?;
     fs::write(hooks_dir.join("post-install.hl"),
-              b"#!/usr/bin/env hl\n~> post-install hook ran\n").into_diagnostic()?;
+              b"#!/usr/bin/env hl\necho post-install hook ran\n").into_diagnostic()?;
               crate::utils::make_executable(&hooks_dir.join("post-install.hl"))?;
               let ctx = HookContext {
                   pkg_name: "post-hook-pkg", pkg_version: "2.0.0",
                   store_path: env.store.to_str().unwrap(), old_version: None,
               };
-              run_hook(&dir, HookKind::PostInstall, &ctx)?;
+              let manifest = crate::manifest::Manifest::default();
+              run_hook(&dir, HookKind::PostInstall, &ctx, &manifest)?;
               Ok(())
 }
 
@@ -466,7 +663,8 @@ fn test_hooks_fail_blocks(env: &TestEnvironment) -> Result<()> {
                   pkg_name: "bad-hook-pkg", pkg_version: "1.0.0",
                   store_path: env.store.to_str().unwrap(), old_version: None,
               };
-              match run_hook(&dir, HookKind::PreInstall, &ctx) {
+              let manifest = crate::manifest::Manifest::default();
+              match run_hook(&dir, HookKind::PreInstall, &ctx, &manifest) {
                   Err(_) => Ok(()),
                   Ok(_)  => bail!("pre-install hook failure should have blocked install"),
               }
@@ -611,5 +809,77 @@ fn test_rollback_state() -> Result<()> {
     assert!(ok);
     assert!(state.packages.get("rollback-pkg")
     .map(|vs| vs.contains_key("1.0.0")).unwrap_or(false));
+    Ok(())
+}
+
+/// Testuje sam algorytm backtrackingu (bez git/sieci): pkg-a ma dwóch
+/// kandydatów — 2.0.0 (najnowszy, deklaruje konflikt z pkg-b) i 1.0.0 (bez
+/// konfliktu). pkg-b ma jedną wersję. Solver powinien wybrać pkg-a@1.0.0
+/// zamiast pkg-a@2.0.0, żeby uniknąć konfliktu — dokładnie to, czego
+/// wcześniej brakowało (byłby po prostu odrzucony cały `hpm install`).
+fn test_solver_conflict_resolution() -> Result<()> {
+    use crate::commands::install::{Candidate, backtrack_solve};
+    use crate::manifest::Manifest;
+    use crate::state::State;
+    use std::collections::HashMap;
+
+    let mut pkg_a_v2 = Manifest::default();
+    pkg_a_v2.name = "pkg-a".to_string();
+    pkg_a_v2.conflicts = vec!["pkg-b".to_string()];
+    let mut pkg_a_v1 = Manifest::default();
+    pkg_a_v1.name = "pkg-a".to_string();
+    // v1 nie deklaruje konfliktów
+
+    let mut pkg_b_v1 = Manifest::default();
+    pkg_b_v1.name = "pkg-b".to_string();
+
+    let mut candidates: HashMap<String, Vec<Candidate>> = HashMap::new();
+    candidates.insert("pkg-a".to_string(), vec![
+        Candidate { version: "2.0.0".to_string(), manifest: pkg_a_v2 }, // najnowszy, wypróbowany pierwszy
+        Candidate { version: "1.0.0".to_string(), manifest: pkg_a_v1 },
+    ]);
+    candidates.insert("pkg-b".to_string(), vec![
+        Candidate { version: "1.0.0".to_string(), manifest: pkg_b_v1 },
+    ]);
+
+    let order = vec!["pkg-a".to_string(), "pkg-b".to_string()];
+    let state = State::default();
+    let mut assignment = HashMap::new();
+    let mut steps = 2000;
+    let solved = backtrack_solve(&order, 0, &candidates, &state, &mut assignment, &mut steps);
+
+    assert!(solved, "solver should find a conflict-free combination");
+    assert_eq!(assignment.get("pkg-a").map(|(v, _)| v.as_str()), Some("1.0.0"),
+        "solver should have backed off pkg-a to 1.0.0 to avoid the conflict with pkg-b");
+    assert_eq!(assignment.get("pkg-b").map(|(v, _)| v.as_str()), Some("1.0.0"));
+    Ok(())
+}
+
+/// Testuje że solver poddaje się jasno, a nie zawiesza się/panikuje, gdy
+/// KAŻDY kandydat koliduje — tu obie jedyne wersje pkg-a i pkg-b wzajemnie
+/// się wykluczają, więc nie ma żadnej spójnej kombinacji.
+fn test_solver_unsatisfiable() -> Result<()> {
+    use crate::commands::install::{Candidate, backtrack_solve};
+    use crate::manifest::Manifest;
+    use crate::state::State;
+    use std::collections::HashMap;
+
+    let mut pkg_a = Manifest::default();
+    pkg_a.name = "pkg-a".to_string();
+    pkg_a.conflicts = vec!["pkg-b".to_string()];
+    let mut pkg_b = Manifest::default();
+    pkg_b.name = "pkg-b".to_string();
+
+    let mut candidates: HashMap<String, Vec<Candidate>> = HashMap::new();
+    candidates.insert("pkg-a".to_string(), vec![Candidate { version: "1.0.0".to_string(), manifest: pkg_a }]);
+    candidates.insert("pkg-b".to_string(), vec![Candidate { version: "1.0.0".to_string(), manifest: pkg_b }]);
+
+    let order = vec!["pkg-a".to_string(), "pkg-b".to_string()];
+    let state = State::default();
+    let mut assignment = HashMap::new();
+    let mut steps = 2000;
+    let solved = backtrack_solve(&order, 0, &candidates, &state, &mut assignment, &mut steps);
+
+    assert!(!solved, "solver must report failure, not silently pick a conflicting combination");
     Ok(())
 }
