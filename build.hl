@@ -3,6 +3,4 @@
 
 > cargo build --release
 ;; install dev dependeces:
-;; > sudo apt install libseccomp-dev
-;; > sudo apt install libgpgme-dev
-;; > sudo apt install libgpg-error-dev
+;; ^> apt install libgpg-error-dev libgpgme-dev libseccomp-dev libssl-dev
