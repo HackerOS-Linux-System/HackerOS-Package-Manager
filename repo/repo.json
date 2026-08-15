@@ -1,6 +1,6 @@
 {
   "packages": {
     "test": "https://github.com/michal92299/test",
-    "hyper-lang": "https://github.com/LegendaryOS-Linux-System/hyper-lang.git"
+    "cosmic": "https://github.com/HackerOS-Linux-System/cosmic.git"
   }
 }
