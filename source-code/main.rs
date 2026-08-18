@@ -12,6 +12,49 @@ mod hooks;
 use miette::{Result, IntoDiagnostic};
 use colored::Colorize;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ---------------------------------------------------------------------------
+// --verbose / -v
+//
+// Global, crate-wide flag (not threaded through every function signature —
+// that would mean touching dozens of call sites for a diagnostic feature).
+// Set as early as possible in `main()`, below, from either position:
+//   hpm --verbose install cosmic     (before the subcommand — works for
+//   hpm -v install cosmic             EVERY subcommand automatically)
+//   hpm install cosmic --verbose     (install-specific: see install.rs,
+//                                      which filters --verbose/-v out of
+//                                      its own args the same way it already
+//                                      does for --release/--require-signed)
+// Read from anywhere in the crate via `crate::is_verbose()`, or use the
+// `crate::vlog!(...)` macro below for a one-line "print only if verbose".
+// ---------------------------------------------------------------------------
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose(v: bool) {
+    if v {
+        VERBOSE.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn is_verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
+/// `crate::vlog!("spawning {:?} with args {:?}", cmd, args)` — prints to
+/// stderr, prefixed `[verbose]`, but ONLY when `--verbose`/`-v` was passed;
+/// otherwise a no-op. Intentionally uncolored (unlike the rest of hpm's
+/// output) so every call site works without needing `colored::Colorize`
+/// in scope, and so verbose lines are trivially `grep`-able.
+#[macro_export]
+macro_rules! vlog {
+    ($($arg:tt)*) => {
+        if $crate::is_verbose() {
+            eprintln!("[verbose] {}", format!($($arg)*));
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Lokalizacje danych hpm
@@ -126,6 +169,7 @@ fn main() -> Result<()> {
             match arg.as_str() {
                 "-h" | "--help"    => { print_help(); return Ok(()); }
                 "-V" | "--version" => { println!("hpm {}", env!("CARGO_PKG_VERSION")); return Ok(()); }
+                "-v" | "--verbose" => { set_verbose(true); }
                 _ => { command = Some(arg); }
             }
         } else {
@@ -372,6 +416,8 @@ fn print_help() {
     println!("{}", "Options:".bold().underline());
     println!("  {}, {:<28} {}", "-h".bright_black(), "--help".bright_black(),    "Show this help");
     println!("  {}, {:<28} {}", "-V".bright_black(), "--version".bright_black(), "Show version");
+    println!("  {}, {:<28} {}", "-v".bright_black(), "--verbose".bright_black(),
+        "Print diagnostic detail (spawned commands, paths, ...); before or after the subcommand");
 
     println!();
     println!("{}", "Group tags:".bold().underline());
