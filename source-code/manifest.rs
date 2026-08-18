@@ -154,10 +154,16 @@ pub fn check_arch_compatibility(declared: &str) -> Result<()> {
 impl Manifest {
     pub fn load_from_path(path: &str) -> Result<Self> {
         let info_path = format!("{}/info.hk", path);
-        let mut config = hk_parser::load_hk_file(&info_path)
-            .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
+        // Read the file ourselves (instead of hk_parser::load_hk_file) so we
+        // still have the raw source text around on error — hk-parser 0.3.2's
+        // `HkError::render(&source)` needs it to print the boxed snippet +
+        // caret instead of the old flat one-line message.
+        let contents = std::fs::read_to_string(&info_path)
+            .map_err(|e| miette!("Failed to read {}: {}", info_path, e))?;
+        let mut config = hk_parser::parse_hk(&contents)
+            .map_err(|e| miette!("Failed to load info.hk:\n{}", e.render(&contents)))?;
         hk_parser::resolve_interpolations(&mut config)
-            .map_err(|e| miette!("Failed to resolve interpolations: {}", e))?;
+            .map_err(|e| miette!("Failed to resolve interpolations:\n{}", e.render(&contents)))?;
 
         let metadata = config.get("metadata")
             .ok_or_else(|| miette!("Missing [metadata] section"))?
