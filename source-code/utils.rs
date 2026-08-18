@@ -151,15 +151,40 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
     if packages.is_empty() {
         return Ok(());
     }
+    crate::vlog!("ensure_deb_packages: checking {} package(s): {}", packages.len(), packages.join(", "));
+
+    // `dpkg-query` only exists on Debian/Ubuntu-family systems. On anything
+    // else (Arch, Fedora, a minimal container without dpkg tooling at all)
+    // this used to fail with a bare "No such file or directory (os error 2)"
+    // that gave no clue what was missing or what to do about it. Surface a
+    // clear message and let the caller (the build step) proceed instead —
+    // the required packages are still listed so the person can install them
+    // by hand with their own package manager.
+    if !command_exists("dpkg-query") {
+        crate::vlog!("'dpkg-query' not found on PATH — cannot check what's already installed");
+        println!(
+            "{} 'dpkg-query' not found — skipping the automatic system package \
+             check (this doesn't look like a Debian/Ubuntu system, or dpkg \
+             tooling isn't installed). You may need these installed manually:",
+            "⚠".yellow()
+        );
+        for p in packages { println!("  - {}", p); }
+        return Ok(());
+    }
+
+    crate::vlog!("spawning: dpkg-query -W -f=${{Package}}\\n");
     let output = Command::new("dpkg-query")
     .args(&["-W", "-f=${Package}\\n"])
     .output()
     .into_diagnostic()?;
+    crate::vlog!("dpkg-query exited with status {:?}", output.status.code());
     let installed = String::from_utf8(output.stdout).into_diagnostic()?;
     let installed_lines: Vec<&str> = installed.lines().collect();
     let missing: Vec<_> = packages.iter()
     .filter(|p| !installed_lines.contains(&p.as_str()))
     .collect();
+    crate::vlog!("{} of {} requested package(s) already installed; {} missing",
+        packages.len() - missing.len(), packages.len(), missing.len());
     if missing.is_empty() {
         return Ok(());
     }
@@ -172,13 +197,54 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).into_diagnostic()?;
     if input.trim().eq_ignore_ascii_case("y") {
-        let status = Command::new("sudo")
-        .arg("apt")
+        // FIXED: this used to unconditionally prefix `sudo`, which fails
+        // with a bare ENOENT ("No such file or directory (os error 2)")
+        // whenever `sudo` isn't on PATH — very common inside containers
+        // running as root, where `sudo` is unnecessary and often simply
+        // not installed. Skip it when we're already root; when we're not
+        // root AND `sudo` is missing, fail with an actionable message
+        // instead of a raw OS error.
+        let is_root = nix::unistd::Uid::effective().is_root();
+        crate::vlog!("effective UID is {}root", if is_root { "" } else { "NOT " });
+        let pkg_list = || missing.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(" ");
+
+        let sudo_found = command_exists("sudo");
+        let apt_found = command_exists("apt");
+        crate::vlog!("command_exists(\"sudo\") = {}, command_exists(\"apt\") = {}", sudo_found, apt_found);
+
+        if !is_root && !sudo_found {
+            bail!(
+                "Need root to install system packages, but 'sudo' isn't on PATH \
+                 and hpm isn't running as root.\n  \
+                 Either install 'sudo', re-run hpm as root, or install these \
+                 packages yourself:\n\n  apt install {}",
+                pkg_list()
+            );
+        }
+        if !apt_found {
+            bail!(
+                "'apt' isn't on PATH — install these packages yourself with \
+                 your system's package manager:\n\n  {}",
+                pkg_list()
+            );
+        }
+
+        let mut cmd = if is_root {
+            Command::new("apt")
+        } else {
+            let mut c = Command::new("sudo");
+            c.arg("apt");
+            c
+        };
+        crate::vlog!("spawning: {}{} install -y {}",
+            if is_root { "" } else { "sudo " }, "apt", pkg_list());
+        let status = cmd
         .arg("install")
         .arg("-y")
         .args(&missing)
         .status()
         .into_diagnostic()?;
+        crate::vlog!("apt install exited with status {:?}", status.code());
         if !status.success() {
             bail!("Failed to install system packages");
         }
@@ -186,6 +252,38 @@ pub fn ensure_deb_packages(packages: &[String]) -> Result<()> {
         bail!("Missing system packages");
     }
     Ok(())
+}
+
+/// Checks whether `name` resolves to an executable file somewhere on
+/// `$PATH`, without spawning a subprocess (so it works even on systems
+/// missing `which`/`command -v` themselves — exactly the kind of minimal
+/// container where this check matters most).
+fn command_exists(name: &str) -> bool {
+    let Ok(path_var) = std::env::var("PATH") else {
+        crate::vlog!("command_exists({:?}): $PATH is not set at all", name);
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        let Ok(meta) = candidate.metadata() else { continue; };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 != 0 {
+                crate::vlog!("command_exists({:?}): found at {}", name, candidate.display());
+                return true;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    crate::vlog!("command_exists({:?}): not found in any of {} PATH dir(s)", name, std::env::split_paths(&path_var).count());
+    false
 }
 
 /// Rekurencyjnie kopiuje zawartość katalogu `src` do `dst` (dst musi już
