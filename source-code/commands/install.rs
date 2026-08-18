@@ -258,8 +258,14 @@ pub fn install(specs: Vec<String>) -> Result<()> {
     // zamiast tylko ostrzegać. Ma sens tylko razem z --release (git clone
     // nie ma w ogóle koncepcji podpisu na tym etapie).
     let require_signed = specs.iter().any(|s| s == "--require-signed");
+    // --verbose/-v: to samo co globalne `hpm --verbose install ...`, tylko
+    // podane PO nazwie komendy — dokładnie tak, jak ktoś naturalnie by
+    // spróbował (`hpm install cosmic --verbose`). Oba miejsca działają.
+    if specs.iter().any(|s| s == "--verbose" || s == "-v") {
+        crate::set_verbose(true);
+    }
     let specs: Vec<String> = specs.into_iter()
-        .filter(|s| s != "--release" && s != "--require-signed")
+        .filter(|s| s != "--release" && s != "--require-signed" && s != "--verbose" && s != "-v")
         .collect();
 
     if require_signed && !use_release {
@@ -268,7 +274,7 @@ pub fn install(specs: Vec<String>) -> Result<()> {
     }
 
     if specs.is_empty() {
-        eprintln!("{} Usage: hpm install <package>[@<version>]... | @<tag>... [--release] [--require-signed]", "✗".red());
+        eprintln!("{} Usage: hpm install <package>[@<version>]... | @<tag>... [--release] [--require-signed] [--verbose]", "✗".red());
         std::process::exit(1);
     }
 
@@ -409,11 +415,26 @@ fn solve_batch_versions(
         let tags      = repo.tag_names(None).into_diagnostic()?;
 
         let mut cands: Vec<Candidate> = Vec::new();
+        // Track *why* candidates got rejected so that "no installable
+        // version" can point at the real cause instead of being a dead
+        // end. Two very different situations used to produce the exact
+        // same generic error:
+        //   (a) the repo genuinely has zero git tags, vs.
+        //   (b) tags exist, but info.hk failed to parse on all of them
+        //       (manifest_at_commit's error was silently discarded by
+        //       `if let Ok(m) = ... { }` with no `else`).
+        // (b) is exactly what a broken info.hk on a freshly-tagged repo
+        // looks like, and it deserves to show the actual parse error
+        // (already rendered nicely by hk-parser, see manifest.rs) right
+        // here at `hpm install` time — not just in `hpm dev`.
+        let mut last_manifest_err: Option<miette::Report> = None;
+        let total_tag_count = tags.iter().flatten().count();
 
         if let Some(ver) = &requested_ver {
             let (v, oid) = resolve_version(&repo, &tags, Some(ver.as_str()), &pkg_name)?;
-            if let Ok(m) = manifest_at_commit(&repo, oid) {
-                cands.push(Candidate { version: v, manifest: m });
+            match manifest_at_commit(&repo, oid) {
+                Ok(m) => cands.push(Candidate { version: v, manifest: m }),
+                Err(e) => last_manifest_err = Some(e),
             }
         } else {
             let mut tag_versions: Vec<(String, Oid)> = Vec::new();
@@ -427,14 +448,44 @@ fn solve_batch_versions(
             }
             tag_versions.sort_by(|a, b| compare_versions(&b.0, &a.0)); // newest first
             for (v, oid) in tag_versions.into_iter().take(MAX_CANDIDATES_PER_PKG) {
-                if let Ok(m) = manifest_at_commit(&repo, oid) {
-                    cands.push(Candidate { version: v, manifest: m });
+                match manifest_at_commit(&repo, oid) {
+                    Ok(m) => cands.push(Candidate { version: v, manifest: m }),
+                    // Keep only the FIRST failure we hit — since tag_versions
+                    // is sorted newest-first, that's the newest tag's error,
+                    // the one the user most likely wants to see.
+                    Err(e) => {
+                        if last_manifest_err.is_none() {
+                            last_manifest_err = Some(e);
+                        }
+                    }
                 }
             }
         }
 
         if cands.is_empty() {
-            bail!("No installable version found for '{}'", pkg_name);
+            if total_tag_count == 0 {
+                bail!(
+                    "No installable version found for '{pkg}' — this repository has no git tags.\n  \
+                     hpm reads installable versions ONLY from git tags — not from repo.json, not\n  \
+                     from a GitHub Release, and not from the default branch. Push one:\n\n  \
+                     git tag <version>          (e.g. git tag 1.0.15, matching info.hk's version)\n  \
+                     git push origin <version>\n\n  \
+                     Then run `hpm refresh` and try again.",
+                    pkg = pkg_name
+                );
+            } else if let Some(e) = last_manifest_err {
+                bail!(
+                    "No installable version found for '{pkg}' — {n} tag(s) exist, but info.hk \
+                     failed to load on every one of them. Most recent failure:\n\n{err}",
+                    pkg = pkg_name, n = total_tag_count, err = e
+                );
+            } else {
+                bail!(
+                    "No installable version found for '{}' — {} tag(s) exist but none could be \
+                     read (corrupt commit, missing info.hk in the tagged tree, or similar).",
+                    pkg_name, total_tag_count
+                );
+            }
         }
         order.push(pkg_name.clone());
         candidates.insert(pkg_name, cands);
@@ -1270,13 +1321,20 @@ pub(crate) fn run_build_config(
         }
         BuildSource::Build { commands, output } => {
             pb.set_message("Building from source...");
-            for (k, v) in &cfg.env { std::env::set_var(k, v); }
+            crate::vlog!("build.toml [source=build]: src_dir={}, output={}", src_dir.display(), output);
+            crate::vlog!("build commands ({} total):\n{}", commands.len(),
+                commands.iter().enumerate().map(|(i, c)| format!("  [{}] {c}", i + 1)).collect::<Vec<_>>().join("\n"));
+            for (k, v) in &cfg.env {
+                crate::vlog!("build env: {}={}", k, v);
+                std::env::set_var(k, v);
+            }
             let script = src_dir.join("_hpm_build.sh");
             fs::write(&script, format!("#!/bin/sh\nset -e\n{}", commands.join("\n"))).into_diagnostic()?;
             make_executable(&script)?;
             crate::sandbox::run_commands(src_dir.to_str().unwrap(), manifest, &["./_hpm_build.sh".to_string()])?;
             let _ = fs::remove_file(&script);
             let out = src_dir.join(output);
+            crate::vlog!("build finished; expecting output at {} (exists={})", out.display(), out.exists());
             if !out.exists() { bail!("Build output '{}' not found.", output); }
             if out.is_dir() { copy_dir_all(&out, &contents_dir)?; }
             else { fs::copy(&out, &dest).into_diagnostic()?; make_executable(&dest)?; }
