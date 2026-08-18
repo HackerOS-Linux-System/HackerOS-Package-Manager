@@ -18,7 +18,7 @@ lexopt       = "0.3"
 colored      = "2.1"
 indicatif    = "0.17"
 git2         = "0.18"
-hk-parser    = "0.3.1"
+hk-parser    = "0.3.2"
 indexmap     = { version = "2.2",  features = ["serde"] }
 sha2         = "0.10"
 hex          = "0.4"
