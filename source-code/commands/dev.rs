@@ -106,8 +106,13 @@ fn dev_local(path_arg: &str, rest: Vec<String>) -> Result<()> {
     println!("\n{} {}\n", "hpm dev".bold().red(),
               format!("— local package test: {}", dir.display()).dimmed());
 
-    let manifest = crate::manifest::Manifest::load_from_path(dir.to_str().unwrap())
-        .map_err(|e| miette!("Failed to load info.hk: {}", e))?;
+    // `Manifest::load_from_path` already wraps parse/interpolation failures
+    // with full context (including hk-parser's boxed, rustc-style snippet —
+    // see manifest.rs), so we propagate it as-is instead of wrapping it a
+    // second time with the same "Failed to load info.hk:" prefix, which
+    // used to double up and also flattened the boxed snippet back down to
+    // a single line via `{}` Display formatting.
+    let manifest = crate::manifest::Manifest::load_from_path(dir.to_str().unwrap())?;
 
     print_manifest_summary(&manifest);
 
