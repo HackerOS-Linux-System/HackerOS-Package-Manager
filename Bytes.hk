@@ -2,7 +2,7 @@
 -> name        => hpm
 -> version     => 1.0.0
 -> description => HackerOS Package Manager — zarzadzanie pakietami bez roota
--> author      => HackerOS Linux System <hackeros068@gmail.com>
+-> author      => HackerOS Team <hackeros068@gmail.com>
 -> license     => GPL-3.0
 
 [build]
