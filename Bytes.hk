@@ -1,1 +1,18 @@
+[package]
+-> name        => hpm
+-> version     => 1.0.0
+-> description => HackerOS Package Manager — zarzadzanie pakietami bez roota
+-> author      => HackerOS Linux System <hackeros068@gmail.com>
+-> license     => GPL-3.0
 
+[build]
+-> lang   => h#
+-> entry  => source-code/main.h#
+-> output => build/hpm
+-> emit   => bin
+
+[deps]
+-> nidus         => newest
+-> landlock      => newest
+-> libseccomp    => newest
+-> progress-bar  => newest
