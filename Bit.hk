@@ -2,17 +2,31 @@
 -> name        => hpm
 -> version     => 1.0.0
 -> description => HackerOS Package Manager — zarzadzanie pakietami bez roota
--> author      => HackerOS Team <hackeros068@gmail.com>
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
 -> license     => GPL-3.0
+-> lang        => h#
+
+[layout]
+-> src => source-code
 
 [build]
--> lang   => h#
--> entry  => source-code/main.h#
--> output => build/hpm
--> emit   => bin
+-> link => static
 
-[deps]
--> nidus         => newest
--> landlock      => newest
--> libseccomp    => newest
--> progress-bar  => newest
+[default-build]
+-> profile => release
+-> target  => h#
+-> emit    => bin
+
+[dependencies]
+-> nidus        => newest
+-> landlock     => newest
+-> libseccomp   => newest
+-> progress-bar => newest
+
+[commands]
+-> check
+--> run => bit check
+--> description => Type-check every module
+-> install-local
+--> run => install -Dm755 cache/build/release/hpm /usr/bin/hpm
+--> description => Install the release binary to /usr/bin
