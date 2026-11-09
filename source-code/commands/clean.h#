@@ -1,0 +1,223 @@
+mod colors
+mod error
+mod state
+mod squash
+mod paths
+mod utils
+
+use "std -> fs"  from "fs"
+use "std -> fmt" from "fmt"
+use "std -> io"  from "io"
+use "std -> env" from "env"
+
+pub fn clean_cache() -> error::HpmResult<bool> is
+    return clean_internal(false)
+end
+
+pub fn clean_all() -> error::HpmResult<bool> is
+    return clean_internal(true)
+end
+
+fn clean_internal(also_store: bool) -> error::HpmResult<bool> is
+    let mut removed_repos: int = 0
+    let mut removed_files: int = 0
+    let mut freed_bytes: int = 0
+
+    ;; 1. Cache git repo (~/.cache/hpm/repos lub $TMPDIR/hpm/repos — patrz repo.h#)
+    let repos_dir: string = env::temp_dir() + "/hpm/repos"
+    if fs::exists(repos_dir) is
+        let entries: [string] = fs::list_dir(repos_dir)
+        let mut i: int = 0
+        while i < array_len(entries) is
+            let path: string = repos_dir + "/" + entries[i]
+            if fs::is_dir(path) is
+                freed_bytes = freed_bytes + squash::dir_size(path)
+                fs::rmdir_all(path)
+                removed_repos = removed_repos + 1
+            end
+            i += 1
+        end
+    end
+
+    ;; 2. Cache metadanych/legacy
+    let cache_dir: string = paths::cache_dir()
+    if fs::exists(cache_dir) is
+        let entries2: [string] = fs::list_dir(cache_dir)
+        let mut j: int = 0
+        while j < array_len(entries2) is
+            let path2: string = cache_dir + "/" + entries2[j]
+            if fs::is_file(path2) is
+                freed_bytes = freed_bytes + fs::size(path2)
+                fs::remove(path2)
+                removed_files = removed_files + 1
+            end
+            j += 1
+        end
+    end
+
+    ;; 3. Katalogi staging (po przerwanej instalacji)
+    let store_path: string = paths::store_path()
+    let mut removed_staging: int = 0
+    if fs::exists(store_path) is
+        let pkg_entries: [string] = fs::list_dir(store_path)
+        let mut p: int = 0
+        while p < array_len(pkg_entries) is
+            let pkg_dir: string = store_path + pkg_entries[p]
+            if fs::is_dir(pkg_dir) is
+                let ver_entries: [string] = fs::list_dir(pkg_dir)
+                let mut v: int = 0
+                while v < array_len(ver_entries) is
+                    let name: string = ver_entries[v]
+                    if string_starts_with(name, ".staging-") is
+                        let staging_dir: string = pkg_dir + "/" + name
+                        freed_bytes = freed_bytes + squash::dir_size(staging_dir)
+                        fs::rmdir_all(staging_dir)
+                        removed_staging = removed_staging + 1
+                    end
+                    v += 1
+                end
+            end
+            p += 1
+        end
+    end
+    if removed_staging > 0 is
+        write(fmt::red("✔") + " Cleaned " + to_string(removed_staging) + " leftover staging dir(s) (from interrupted installs).")
+    end
+
+    if also_store is
+        let s_r: error::HpmResult<state::State> = state::state_load()
+        match s_r is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(s) => is
+                let r: error::HpmResult<int> = clean_old_store_versions(s)
+                match r is
+                    HpmResult::Err(e)     => return error::HpmResult::Err(e)
+                    HpmResult::Ok(extra)  => freed_bytes = freed_bytes + extra
+                end
+            end
+        end
+    end
+
+    if removed_repos == 0 && removed_files == 0 && removed_staging == 0 && !also_store is
+        write(fmt::red("✔") + " Cache is already empty.")
+    else is
+        write(fmt::red("✔") + " Cleaned: " + to_string(removed_repos) + " git repo(s), " +
+            to_string(removed_files) + " file(s) — " + human_bytes(freed_bytes) + " freed.")
+    end
+    return error::HpmResult::Ok(true)
+end
+
+struct RemovalCandidate is
+    pub pkg:   string
+    pub ver:   string
+    pub size_bytes: int
+end
+
+;; Usuwa stare (nie-bieżące) wersje pakietów ze store. Zwraca liczbę
+;; zwolnionych bajtów (odpowiednik `*freed +=` w Rust).
+fn clean_old_store_versions(initial_state: state::State) -> error::HpmResult<int> is
+    let store_path: string = paths::store_path()
+    if !fs::exists(store_path) is return error::HpmResult::Ok(0) end
+
+    let mut s: state::State = initial_state
+    let mut to_remove: [RemovalCandidate] = []
+
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(s.packages) is
+        if !contains_str(names, s.packages[i].name) is names = array_push(names, s.packages[i].name) end
+        i += 1
+    end
+
+    let mut n: int = 0
+    while n < array_len(names) is
+        let pkg_name: string = names[n]
+        let current_ver: string = state::get_current_version(pkg_name, store_path)
+        if current_ver != "" is
+            let versions: [state::VersionInfo] = state::versions_of(s.packages, pkg_name)
+            let mut v: int = 0
+            while v < array_len(versions) is
+                let ver: string = versions[v].version
+                if ver != current_ver is
+                    let ver_dir: string = store_path + pkg_name + "/" + ver
+                    if fs::exists(ver_dir) is
+                        let size: int = squash::on_disk_size(ver_dir)
+                        to_remove = array_push(to_remove, RemovalCandidate { pkg: pkg_name, ver: ver, size_bytes: size })
+                    end
+                end
+                v += 1
+            end
+        end
+        n += 1
+    end
+
+    if array_len(to_remove) == 0 is
+        write(fmt::red("✔") + " No old package versions in store.")
+        return error::HpmResult::Ok(0)
+    end
+
+    let mut total_size: int = 0
+    write("→ Old package versions to remove:\n")
+    let mut ti: int = 0
+    while ti < array_len(to_remove) is
+        let c: RemovalCandidate = to_remove[ti]
+        total_size = total_size + c.size_bytes
+        write("  – " + colors::white(c.pkg) + "@" + c.ver + "  " + fmt::dim(human_bytes(c.size_bytes)))
+        ti += 1
+    end
+    write("")
+    write("  Total: " + fmt::dim(human_bytes(total_size)))
+    write("")
+
+    let answer: string = io::read_line("Remove " + to_string(array_len(to_remove)) + " old version(s)? [y/N] ")
+    if string_lower(string_trim(answer)) != "y" is
+        write("→ Aborted.")
+        return error::HpmResult::Ok(0)
+    end
+
+    let mut freed: int = 0
+    let mut ri: int = 0
+    while ri < array_len(to_remove) is
+        let c: RemovalCandidate = to_remove[ri]
+        let ver_dir: string = store_path + c.pkg + "/" + c.ver
+        squash::unmount(ver_dir)
+        fs::rmdir_all(ver_dir)
+        squash::remove_sidecar(ver_dir)
+        s = state::remove_package_version(s, c.pkg, c.ver)
+        freed = freed + c.size_bytes
+        write("  ✔ Removed " + colors::white(c.pkg) + "@" + c.ver)
+        ri += 1
+    end
+
+    let save_r: error::HpmResult<bool> = state::state_save(s)
+    if error::is_err(save_r) is
+        match save_r is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(_)  => is end
+        end
+    end
+    write("\n✔ Removed " + to_string(array_len(to_remove)) + " old version(s), freed " + human_bytes(freed) + ".")
+    return error::HpmResult::Ok(freed)
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn human_bytes(size_bytes: int) -> string is
+    if size_bytes < 1024 is return to_string(size_bytes) + " B" end
+    if size_bytes < 1024 * 1024 is return format_f(size_bytes, 1024.0) + " KB" end
+    if size_bytes < 1024 * 1024 * 1024 is return format_f(size_bytes, 1048576.0) + " MB" end
+    return format_f(size_bytes, 1073741824.0) + " GB"
+end
+
+fn format_f(size_bytes: int, divisor: f64) -> string is
+    let val: f64 = size_bytes / divisor
+    let rounded: f64 = (val * 10.0).round() / 10.0
+    return to_string(rounded)
+end
