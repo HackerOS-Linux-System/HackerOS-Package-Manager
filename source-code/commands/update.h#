@@ -1,0 +1,276 @@
+mod colors
+mod error
+mod repo
+mod state
+mod utils
+mod installer
+mod remove
+mod manifest
+mod hooks
+mod squash
+mod paths
+
+use "std -> fmt" from "fmt"
+
+struct UpdateItem is
+    pub pkg:     string
+    pub old_ver: string
+    pub new_ver: string
+end
+
+pub fn update() -> error::HpmResult<bool> is
+    let lock_r: error::HpmResult<int> = utils::acquire_lock()
+    match lock_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lock_fd) => is
+            let result: error::HpmResult<bool> = update_inner()
+            utils::release_lock(lock_fd)
+            return result
+        end
+    end
+end
+
+fn update_inner() -> error::HpmResult<bool> is
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            let s_r: error::HpmResult<state::State> = state::state_load()
+            match s_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(initial_state) => is
+                    let mut s: state::State = initial_state
+                    write("→ Checking for updates...\n")
+
+                    let mut names: [string] = []
+                    let mut i: int = 0
+                    while i < array_len(s.packages) is
+                        if !contains_str(names, s.packages[i].name) is names = array_push(names, s.packages[i].name) end
+                        i += 1
+                    end
+
+                    let mut to_update: [UpdateItem] = []
+                    let mut n: int = 0
+                    while n < array_len(names) is
+                        let pkg_name: string = names[n]
+                        let current_ver: string = state::get_current_version(pkg_name, paths::store_path())
+                        if current_ver != "" is
+                            let idx: int = state::find_index(s.packages, pkg_name, current_ver)
+                            if idx >= 0 && s.packages[idx].pinned is
+                                write("  ⊙ " + fmt::dim(pkg_name) + " pinned at " + fmt::dim(current_ver) + " — skipping")
+                            else is
+                                let url: string = repo::get_package_url(rm, pkg_name)
+                                if url == "" is
+                                    write("  ⚠ " + pkg_name + " not in index — skipping")
+                                else is
+                                    let versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, pkg_name)
+                                    match versions_r is
+                                        HpmResult::Ok(versions) => is
+                                            if array_len(versions) > 0 is
+                                                let latest: string = versions[array_len(versions) - 1].version
+                                                if utils::compare_versions(latest, current_ver) > 0 is
+                                                    to_update = array_push(to_update, UpdateItem { pkg: pkg_name, old_ver: current_ver, new_ver: latest })
+                                                end
+                                            end
+                                        end
+                                        HpmResult::Err(_) => is end
+                                    end
+                                end
+                            end
+                        end
+                        n += 1
+                    end
+
+                    if array_len(to_update) == 0 is
+                        write(fmt::red("✔") + " All packages are up to date.")
+                        return error::HpmResult::Ok(true)
+                    end
+
+                    write("→ Updates available:\n")
+                    let mut ui: int = 0
+                    while ui < array_len(to_update) is
+                        let it: UpdateItem = to_update[ui]
+                        write("  ↑ " + colors::white(it.pkg) + " " + fmt::red(it.old_ver) + " → " + fmt::red(it.new_ver))
+                        ui += 1
+                    end
+                    write("")
+
+                    let issues: [string] = check_dep_compatibility_before_update(to_update, s, rm)
+                    if array_len(issues) > 0 is
+                        write("⚠ Dependency compatibility warnings:\n")
+                        let mut ii: int = 0
+                        while ii < array_len(issues) is
+                            write("  ⚠ " + issues[ii])
+                            ii += 1
+                        end
+                        write("")
+                        write("  These will be resolved automatically (deps updated if possible).")
+                        write("  If a dep cannot be updated to satisfy all constraints, update will abort.")
+                        write("")
+                    end
+
+                    s = state::push_snapshot(s, "pre-update " + to_string(array_len(to_update)) + " packages")
+
+                    let mut updated: int = 0
+                    let mut failed: [string] = []
+
+                    let mut ti: int = 0
+                    while ti < array_len(to_update) is
+                        let it: UpdateItem = to_update[ti]
+                        write("→ Updating " + colors::white(it.pkg) + " " + fmt::red(it.old_ver) + " → " + fmt::red(it.new_ver))
+
+                        let install_r: error::HpmResult<state::State> = installer::install_single(it.pkg, it.new_ver, rm, s, true)
+                        match install_r is
+                            HpmResult::Ok(new_s) => is
+                                s = new_s
+                                let remove_r: error::HpmResult<state::State> = remove::remove_version(it.pkg, it.old_ver, s)
+                                match remove_r is
+                                    HpmResult::Ok(s2) => s = s2
+                                    HpmResult::Err(e) => write("  ⚠ Could not remove old " + it.pkg + "@" + it.old_ver + ": " + error::message(e))
+                                end
+
+                                let new_pkg_path: string = paths::store_path() + it.pkg + "/" + it.new_ver
+                                squash::ensure_mounted(new_pkg_path)
+                                if hooks::hook_exists(new_pkg_path, hooks::HookKind::PostUpdate) is
+                                    let nm_r: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(new_pkg_path)
+                                    match nm_r is
+                                        HpmResult::Ok(new_manifest) => is
+                                            let ctx: hooks::HookContext = hooks::HookContext {
+                                                pkg_name: it.pkg, pkg_version: it.new_ver, store_path: paths::store_path(), old_version: it.old_ver,
+                                            }
+                                            let hr: error::HpmResult<bool> = hooks::run_hook(new_pkg_path, hooks::HookKind::PostUpdate, ctx, new_manifest)
+                                            match hr is
+                                                HpmResult::Err(e) => write("  ⚠ post-update hook failed for " + it.pkg + ": " + error::message(e))
+                                                HpmResult::Ok(_)  => is end
+                                            end
+                                        end
+                                        HpmResult::Err(_) => is end
+                                    end
+                                end
+                                updated = updated + 1
+                            end
+                            HpmResult::Err(e) => is
+                                write("  ✗ Failed to update " + colors::white(it.pkg) + ": " + error::message(e))
+                                failed = array_push(failed, it.pkg)
+                            end
+                        end
+                        ti += 1
+                    end
+
+                    let save_r: error::HpmResult<bool> = state::state_save(s)
+                    if error::is_err(save_r) is return save_r end
+
+                    write("\n" + fmt::red("✔") + " Updated " + to_string(updated) + " package(s).")
+                    if array_len(failed) > 0 is
+                        write(fmt::red("✗") + " Failed: " + failed.join(", "))
+                    end
+                    return error::HpmResult::Ok(true)
+                end
+            end
+        end
+    end
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+fn manifest_at_version(rm: repo::RepoManager, pkg: string, version: string) -> manifest::Manifest is
+    let versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, pkg)
+    match versions_r is
+        HpmResult::Ok(versions) => is
+            let mut i: int = 0
+            while i < array_len(versions) is
+                if versions[i].version == version is return versions[i].manifest end
+                i += 1
+            end
+        end
+        HpmResult::Err(_) => is end
+    end
+    return manifest::default_manifest(pkg)
+end
+
+;; Sprawdza kompatybilność zależności PRZED aktualizacją — czy nowa wersja
+;; wymaga czegoś sprzecznego z tym, co jest zainstalowane lub czego wymagają
+;; inne (nie-aktualizowane teraz) pakiety.
+fn check_dep_compatibility_before_update(to_update: [UpdateItem], s: state::State, rm: repo::RepoManager) -> [string] is
+    let mut issues: [string] = []
+
+    let mut ti: int = 0
+    while ti < array_len(to_update) is
+        let it: UpdateItem = to_update[ti]
+        let new_manifest: manifest::Manifest = manifest_at_version(rm, it.pkg, it.new_ver)
+
+        let mut di: int = 0
+        while di < array_len(new_manifest.deps.keys) is
+            let dep_name: string = new_manifest.deps.keys[di]
+            let dep_req: string = new_manifest.deps.vals[di]
+
+            let installed_dep_ver: string = state::get_current_version(dep_name, paths::store_path())
+            if installed_dep_ver != "" && !utils::satisfies(installed_dep_ver, dep_req) is
+                let req_note: string = if dep_req == "" then "" else " (" + dep_req + ")"
+                issues = array_push(issues, it.pkg + "@" + it.new_ver + " requires " + dep_name + req_note +
+                    " but " + dep_name + "@" + installed_dep_ver + " is installed")
+            end
+
+            ;; Inne zainstalowane (nie-aktualizowane teraz) pakiety z konfliktowym wymaganiem tej samej zależności.
+            let mut other_names: [string] = []
+            let mut oi: int = 0
+            while oi < array_len(s.packages) is
+                let on: string = s.packages[oi].name
+                if on != it.pkg && !contains_str(other_names, on) is other_names = array_push(other_names, on) end
+                oi += 1
+            end
+
+            let mut oj: int = 0
+            while oj < array_len(other_names) is
+                let other_pkg: string = other_names[oj]
+                if !is_being_updated(other_pkg, to_update) is
+                    let other_cur: string = state::get_current_version(other_pkg, paths::store_path())
+                    if other_cur != "" is
+                        let other_idx: int = state::find_index(s.packages, other_pkg, other_cur)
+                        if other_idx >= 0 is
+                            let other_info: state::VersionInfo = s.packages[other_idx]
+                            let mut depends_on_same: bool = false
+                            let mut dsi: int = 0
+                            while dsi < array_len(other_info.depends_on) is
+                                let parts: [string] = state::split_pkg_ver(other_info.depends_on[dsi])
+                                if parts[0] == dep_name is depends_on_same = true end
+                                dsi += 1
+                            end
+                            if depends_on_same is
+                                let other_manifest: manifest::Manifest = manifest_at_version(rm, other_pkg, other_cur)
+                                if manifest::osm_contains(other_manifest.deps, dep_name) is
+                                    let other_req: string = manifest::osm_get(other_manifest.deps, dep_name)
+                                    if dep_req != "" && other_req != "" && dep_req != other_req is
+                                        issues = array_push(issues, it.pkg + "@" + it.new_ver + " requires " + dep_name + " (" + dep_req +
+                                            ") but " + other_pkg + "@" + other_cur + " requires " + dep_name + " (" + other_req + ")")
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                oj += 1
+            end
+            di += 1
+        end
+        ti += 1
+    end
+
+    return issues
+end
+
+fn is_being_updated(pkg: string, to_update: [UpdateItem]) -> bool is
+    let mut i: int = 0
+    while i < array_len(to_update) is
+        if to_update[i].pkg == pkg is return true end
+        i += 1
+    end
+    return false
+end
