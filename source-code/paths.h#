@@ -1,0 +1,59 @@
+mod utils
+
+use "std -> env" from "env"
+use "std -> fs"  from "fs"
+
+fn home_or_root() -> string is
+    let h: string = env::home()
+    if h == "" is return "/root" end
+    return h
+end
+
+fn hackeros_home() -> string is
+    return home_or_root() + "/.hackeros/hpm"
+end
+
+pub fn store_path() -> string is
+    let p: string = hackeros_home() + "/store/"
+    utils::mkdir_all(p)
+    return p
+end
+
+pub fn cache_dir() -> string is
+    let p: string = hackeros_home() + "/cache"
+    utils::mkdir_all(p)
+    return p
+end
+
+pub fn db_dir() -> string is
+    let p: string = hackeros_home() + "/db"
+    utils::mkdir_all(p)
+    return p
+end
+
+;; Integracja z systemem (wrappery binarek, pliki .desktop, ikony) żyje w
+;; przestrzeni użytkownika — cały hpm działa bez roota, odpowiednik
+;; $HOME/.local/{bin,share/...} ze specyfikacji XDG — dokładnie jak w Rust.
+pub fn bin_dir() -> string is
+    let p: string = home_or_root() + "/.local/bin"
+    utils::mkdir_all(p)
+    return p
+end
+
+pub fn desktop_dir() -> string is
+    let p: string = home_or_root() + "/.local/share/applications"
+    utils::mkdir_all(p)
+    return p
+end
+
+pub fn icon_dir() -> string is
+    let p: string = home_or_root() + "/.local/share/icons/hicolor"
+    utils::mkdir_all(p)
+    return p
+end
+
+pub fn pixmap_dir() -> string is
+    let p: string = home_or_root() + "/.local/share/pixmaps"
+    utils::mkdir_all(p)
+    return p
+end
