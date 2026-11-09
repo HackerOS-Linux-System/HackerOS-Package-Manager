@@ -1,0 +1,316 @@
+mod error
+mod utils
+mod manifest
+mod sandbox
+
+use "std -> fs"  from "fs"
+use "std -> fmt" from "fmt"
+
+;; ── HookKind ─────────────────────────────────────────────────────────
+
+pub enum HookKind is
+    PreInstall
+    PostInstall
+    PreRemove
+    PostRemove
+    PostUpdate
+end
+
+pub fn base_name(k: HookKind) -> string is
+    match k is
+        HookKind::PreInstall  => return "pre-install"
+        HookKind::PostInstall => return "post-install"
+        HookKind::PreRemove   => return "pre-remove"
+        HookKind::PostRemove  => return "post-remove"
+        HookKind::PostUpdate  => return "post-update"
+    end
+end
+
+pub fn display(k: HookKind) -> string is
+    return base_name(k)
+end
+
+fn blocks_on_failure(k: HookKind) -> bool is
+    match k is
+        HookKind::PreInstall => return true
+        HookKind::PreRemove  => return true
+        _                    => return false
+    end
+end
+
+;; ── Kontekst wykonania hooka ─────────────────────────────────────────
+
+pub struct HookContext is
+    pub pkg_name:    string
+    pub pkg_version: string
+    pub store_path:  string
+    pub old_version: string ;; "" = brak (Rust `Option<&str>`)
+end
+
+;; ── Wybór interpretera ───────────────────────────────────────────────
+;; .hl jest domyślne (Hacker Lang), potem python3/ruby/sh — kolejność
+;; pierwszeństwa dokładnie jak w Rust `HOOK_EXTENSIONS`.
+
+fn hook_extensions() -> [[string]] is
+    return [
+        [".hl", "hl"],
+        [".py", "python3"],
+        [".rb", "ruby"],
+        [".sh", "sh"],
+    ]
+end
+
+fn hook_timeout_secs() -> int is return 60 end
+
+struct HookFile is
+    pub path:                string
+    pub default_interpreter: string
+    pub found:                bool
+end
+
+fn find_hook_file(dir: string, kind: HookKind) -> HookFile is
+    let hooks_dir: string = dir + "/hooks"
+    let exts: [[string]] = hook_extensions()
+    let mut i: int = 0
+    while i < array_len(exts) is
+        let ext: string = exts[i][0]
+        let interp: string = exts[i][1]
+        let candidate: string = hooks_dir + "/" + base_name(kind) + ext
+        if fs::exists(candidate) is
+            return HookFile { path: candidate, default_interpreter: interp, found: true }
+        end
+        i += 1
+    end
+    return HookFile { path: "", default_interpreter: "", found: false }
+end
+
+fn interpreter_available(interpreter: string) -> bool is
+    let r: error::HpmResult<int> = utils::run_command("which", [interpreter])
+    match r is
+        HpmResult::Ok(code) => return code == 0
+        HpmResult::Err(_)   => return false
+    end
+end
+
+;; Priorytety: 1) shebang z pliku, 2) interpreter domyślny rozszerzenia,
+;; 3) fallback /bin/sh.
+fn select_interpreter(hook_path: string, default_interpreter: string) -> string is
+    if fs::exists(hook_path) is
+        let content: string = fs::read(hook_path)
+        if string_starts_with(content, "#!") is
+            let nl: int = string_find(content, "\n")
+            if nl > 0 is
+                let shebang: string = string_trim(string_slice(content, 2, nl))
+                if string_starts_with(shebang, "/usr/bin/env ") is
+                    let rest: string = string_trim(string_slice(shebang, string_len("/usr/bin/env "), string_len(shebang)))
+                    let parts: [string] = string_split(rest, " ")
+                    let interp: string = if array_len(parts) > 0 then parts[0] else "sh"
+                    if interpreter_available(interp) is return interp end
+                    if interp == "hl" is
+                        write(fmt::dim("  ⚠ Hacker Lang (hl) not found — falling back to /bin/sh"))
+                        write("    Install hl: " + fmt::dim("hpm install hacker-lang"))
+                        return "sh"
+                    end
+                end
+                let segs: [string] = string_split(shebang, "/")
+                if array_len(segs) > 0 is
+                    let last: string = segs[array_len(segs) - 1]
+                    let last_parts: [string] = string_split(last, " ")
+                    let interp2: string = if array_len(last_parts) > 0 then last_parts[0] else "sh"
+                    if interp2 != "" && interpreter_available(interp2) is return interp2 end
+                end
+            end
+        end
+    end
+
+    if interpreter_available(default_interpreter) is return default_interpreter end
+    return "sh"
+end
+
+;; ── API publiczne ─────────────────────────────────────────────────────
+
+pub fn hook_exists(dir: string, kind: HookKind) -> bool is
+    return find_hook_file(dir, kind).found
+end
+
+fn env_pair(key: string, val: string) -> [string] is
+    return [key, val]
+end
+
+pub fn run_hook(dir: string, kind: HookKind, ctx: HookContext, m: manifest::Manifest) -> error::HpmResult<bool> is
+    let hf: HookFile = find_hook_file(dir, kind)
+    if !hf.found is return error::HpmResult::Ok(false) end
+
+    let exec_result: error::HpmResult<bool> = utils::make_executable(hf.path)
+    if error::is_err(exec_result) is return exec_result end
+
+    let interpreter: string = select_interpreter(hf.path, hf.default_interpreter)
+
+    let net_note: string = if m.sandbox.hooks_network then ", network: allowed" else ""
+    write("  → Running " + display(kind) + " hook (" + path_filename(hf.path) + ", sandboxed via " + interpreter + net_note + ")...")
+
+    let mut env_vars: [[string]] = [
+        env_pair("HPM_PKG_NAME", ctx.pkg_name),
+        env_pair("HPM_PKG_VERSION", ctx.pkg_version),
+        env_pair("HPM_STORE_PATH", ctx.store_path),
+        env_pair("HPM_HOOK_TYPE", display(kind)),
+        env_pair("HPM_HOOK_LANG", interpreter),
+    ]
+    if ctx.old_version != "" is
+        env_vars = array_push(env_vars, env_pair("HPM_OLD_VERSION", ctx.old_version))
+    end
+
+    let run_result: error::HpmResult<sandbox::SandboxOutput> = sandbox::run_hook_sandboxed(
+        dir, m, interpreter, hf.path, env_vars, hook_timeout_secs())
+
+    match run_result is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(output) => is
+            if output.stdout != "" is
+                let out_lines: [string] = string_split(output.stdout, "\n")
+                let mut oi: int = 0
+                while oi < array_len(out_lines) is
+                    if out_lines[oi] != "" is write("    " + fmt::dim(out_lines[oi])) end
+                    oi += 1
+                end
+            end
+            if output.stderr != "" is
+                let err_lines: [string] = string_split(output.stderr, "\n")
+                let mut ei: int = 0
+                while ei < array_len(err_lines) is
+                    if err_lines[ei] != "" is write("    " + fmt::dim("hook: ") + err_lines[ei]) end
+                    ei += 1
+                end
+            end
+
+            if output.exit_code == 0 is
+                write("  ✔ Hook " + display(kind) + " completed")
+                return error::HpmResult::Ok(true)
+            else is
+                if blocks_on_failure(kind) is
+                    let ext: string = path_extension(hf.path)
+                    return error::HpmResult::Err(error::HpmError::Sandbox(
+                        "Hook '" + display(kind) + "' failed with exit code " + to_string(output.exit_code) + ".\n" +
+                        "  Pre-install/pre-remove hooks block the operation on failure.\n" +
+                        "  Fix the hook script or remove hooks/" + base_name(kind) + ext + " to skip it."))
+                else is
+                    write(fmt::dim("  ⚠ Hook '" + display(kind) + "' failed (code " + to_string(output.exit_code) + "), continuing"))
+                    return error::HpmResult::Ok(true)
+                end
+            end
+        end
+    end
+end
+
+fn path_filename(p: string) -> string is
+    let parts: [string] = string_split(p, "/")
+    if array_len(parts) == 0 is return p end
+    return parts[array_len(parts) - 1]
+end
+
+fn path_extension(p: string) -> string is
+    let name: string = path_filename(p)
+    let dot: int = string_find(name, ".")
+    ;; szukamy OSTATNIEJ kropki
+    let mut last_dot: int = -1
+    let mut i: int = 0
+    while i < string_len(name) is
+        if string_at(name, i) == "." is last_dot = i end
+        i += 1
+    end
+    if last_dot < 0 is return "" end
+    return string_slice(name, last_dot, string_len(name))
+end
+
+;; Skopiuj hooki z src do dest przy instalacji.
+pub fn install_hooks(src_dir: string, dest_dir: string) -> error::HpmResult<bool> is
+    let hooks_src: string = src_dir + "/hooks"
+    if !fs::exists(hooks_src) is return error::HpmResult::Ok(true) end
+
+    let hooks_dst: string = dest_dir + "/hooks"
+    utils::mkdir_all(hooks_dst)
+
+    let entries: [string] = fs::list_dir(hooks_src)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let name: string = entries[i]
+        let src_path: string = hooks_src + "/" + name
+        if fs::is_file(src_path) is
+            let dst_path: string = hooks_dst + "/" + name
+            fs::copy(src_path, dst_path)
+            let r: error::HpmResult<bool> = utils::make_executable(dst_path)
+            if error::is_err(r) is return r end
+        end
+        i += 1
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; Waliduj hooki podczas `hpm build`.
+pub fn validate_hooks(dir: string) -> [string] is
+    let hooks_dir: string = dir + "/hooks"
+    if !fs::exists(hooks_dir) is return [] end
+
+    let valid_bases: [string] = ["pre-install", "post-install", "pre-remove", "post-remove", "post-update"]
+    let valid_exts: [string] = [".hl", ".py", ".rb", ".sh"]
+
+    let mut warnings: [string] = []
+    let entries: [string] = fs::list_dir(hooks_dir)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let filename: string = entries[i]
+        let path: string = hooks_dir + "/" + filename
+        if fs::is_file(path) is
+            let mut base_ok: bool = false
+            let mut b: int = 0
+            while b < array_len(valid_bases) is
+                let mut e: int = 0
+                while e < array_len(valid_exts) is
+                    if filename == valid_bases[b] + valid_exts[e] is base_ok = true end
+                    e += 1
+                end
+                b += 1
+            end
+
+            if !base_ok is
+                warnings = array_push(warnings, "Unknown hook file: hooks/" + filename +
+                    " — expected <name>.<ext> where name in " + valid_bases.join(", ") +
+                    " and ext in " + valid_exts.join(", "))
+            else is
+                let content: string = fs::read(path)
+                if !string_starts_with(content, "#!") is
+                    let ext: string = path_extension(path)
+                    let mut recommended: string = "#!/usr/bin/env hl"
+                    if ext == ".py" is recommended = "#!/usr/bin/env python3" end
+                    if ext == ".rb" is recommended = "#!/usr/bin/env ruby" end
+                    if ext == ".sh" is recommended = "#!/bin/sh" end
+                    warnings = array_push(warnings, "hooks/" + filename + " has no shebang line — add: " + recommended)
+                end
+
+                if string_ends_with(filename, ".hl") is
+                    if !string_contains(content, "using <gen 2>") && !string_contains(content, "using <gen 1>") is
+                        warnings = array_push(warnings, "hooks/" + filename +
+                            " missing 'using <gen 2>' declaration — Hacker Lang gen 2 is recommended")
+                    end
+                end
+
+                ;; Bit wykonywalności: `std -> fs` nie eksponuje trybu pliku
+                ;; (permissions) — sprawdzamy pośrednio próbą odczytu przez
+                ;; `test -x` w powłoce (bez efektów ubocznych na systemie).
+                let exec_check: error::HpmResult<int> = utils::run_command("test", ["-x", path])
+                match exec_check is
+                    HpmResult::Ok(code) => is
+                        if code != 0 is
+                            warnings = array_push(warnings, "hooks/" + filename +
+                                " is not executable — fix: git update-index --chmod=+x hooks/" + filename)
+                        end
+                    end
+                    HpmResult::Err(_) => is end
+                end
+            end
+        end
+        i += 1
+    end
+
+    return warnings
+end
