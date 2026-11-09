@@ -1,0 +1,255 @@
+mod colors
+mod error
+mod repo
+mod utils
+mod verbose
+
+use "std -> fmt" from "fmt"
+use "std -> io"  from "io"
+
+fn page_size() -> int is return 20 end
+
+pub fn search(query: string) -> error::HpmResult<bool> is
+    if query == "" is
+        write(fmt::red("✗") + " Usage: hpm search <query|@tag>")
+        write("  " + fmt::dim("hpm search @development") + "  search by tag group")
+        write("  " + fmt::dim("hpm search editor") + "  search by name/description")
+        exit(1)
+    end
+
+    let is_tag: bool = string_starts_with(query, "@")
+
+    write("Loading package index...")
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            verbose::vlog("search: index loaded, got RepoManager")
+            verbose::vlog("search: rm handle = " + to_string(rm))
+            verbose::vlog("search: is_tag = " + to_string(is_tag))
+            if is_tag is return search_by_tag(query, rm) end
+            verbose::vlog("search: not a tag query")
+
+            ;; Rozbite na kroki z `vlog`: `hpm -v search <q>` pokazuje, na którym kroku proces padł.
+            let idx: repo::RepoIndex = rm.index
+            verbose::vlog("search: rm.index read")
+            let pkg_count: int = repo::index_len(idx)
+            verbose::vlog("search: index_len = " + to_string(pkg_count))
+            write("Searching " + to_string(pkg_count) + " packages...")
+            let results: [repo::PackageMeta] = repo::search_lightweight(rm, query)
+            verbose::vlog("search: search_lightweight returned " + to_string(array_len(results)) + " result(s)")
+
+            if array_len(results) == 0 is
+                write(fmt::red("✗") + " No results for '" + colors::white(query) + "'.")
+                write("  Try a different keyword or run " + fmt::dim("hpm refresh") + " to refresh.")
+                write("  Search by tag: " + fmt::dim("hpm search @<tag>"))
+                return error::HpmResult::Ok(true)
+            end
+
+            let total: int = array_len(results)
+            write("→ Results for '" + colors::white(query) + "' (" + to_string(total) + " found):\n")
+
+            if total <= page_size() is
+                print_results_table(results, 0, total)
+                print_hints()
+            else is
+                paginate_results(results, total)
+                print_hints()
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+fn paginate_results(results: [repo::PackageMeta], total: int) is
+    let mut page: int = 0
+    let total_pages: int = (total + page_size() - 1) / page_size()
+    let mut looping: bool = true
+
+    while looping is
+        let start: int = page * page_size()
+        let end_raw: int = start + page_size()
+        let end_idx: int = if end_raw < total then end_raw else total
+
+        write(fmt::dim("Page " + to_string(page + 1) + "/" + to_string(total_pages) + " (" + to_string(start + 1) + "-" + to_string(end_idx) + " of " + to_string(total) + ")"))
+        write("")
+        print_results_table(results, start, end_idx)
+        write("")
+        write("  " + fmt::bold("Page " + to_string(page + 1) + "/" + to_string(total_pages)))
+
+        let mut prompt: string = ""
+        if page + 1 < total_pages is prompt = prompt + " [n]ext" end
+        if page > 0 is prompt = prompt + " [p]rev" end
+        prompt = prompt + " [q]uit"
+
+        let input: string = io::read_line("  " + fmt::dim(prompt) + ": ")
+        let cmd: string = string_lower(string_trim(input))
+
+        if cmd == "n" || cmd == "next" || cmd == "" is
+            if page + 1 < total_pages is
+                page = page + 1
+                write("")
+            else is
+                looping = false
+            end
+        elsif cmd == "p" || cmd == "prev" is
+            if page > 0 is
+                page = page - 1
+                write("")
+            end
+        elsif cmd == "q" || cmd == "quit" || cmd == "exit" is
+            looping = false
+        else is
+            let n: int? = parse_int(cmd)
+            if n != nil && n >= 1 && n <= total_pages is
+                page = n - 1
+                write("")
+            else is
+                looping = false
+            end
+        end
+    end
+end
+
+fn search_by_tag(query: string, rm: repo::RepoManager) -> error::HpmResult<bool> is
+    let tag: string = string_slice(query, 1, string_len(query))
+    let pkgs: [string] = repo::packages_for_tag(rm, tag)
+
+    if array_len(pkgs) == 0 is
+        write(fmt::red("✗") + " No packages found for tag '" + colors::white(query) + "'.")
+        let all: [string] = repo::all_tags(rm)
+        if array_len(all) > 0 is
+            let mut labels: [string] = []
+            let mut i: int = 0
+            while i < array_len(all) is
+                labels = array_push(labels, colors::white("@" + all[i]))
+                i += 1
+            end
+            write("  Available tags: " + labels.join("  "))
+        end
+        write("  List all tags: " + fmt::dim("hpm tags"))
+        return error::HpmResult::Ok(true)
+    end
+
+    let total: int = array_len(pkgs)
+    write("→ Packages with tag '" + colors::white(query) + "' (" + to_string(total) + " total):\n")
+
+    let tag_results: [repo::PackageMeta] = repo::search_lightweight(rm, query)
+
+    let total_pages: int = (total + page_size() - 1) / page_size()
+    let mut page: int = 0
+    let mut looping: bool = true
+
+    while looping is
+        let start: int = page * page_size()
+        let end_raw: int = start + page_size()
+        let end_idx: int = if end_raw < total then end_raw else total
+        let page_pkgs: [string] = utils::array_slice(pkgs, start, end_idx)
+
+        if total_pages > 1 is
+            write(fmt::dim("Page " + to_string(page + 1) + "/" + to_string(total_pages)))
+            write("")
+        end
+
+        write("  " + pad(fmt::bold(colors::white("Package")), 22) + " " + pad(fmt::bold(colors::white("Version")), 12) + " " + fmt::bold(colors::white("Description")))
+        write("  " + repeat("─", 72))
+
+        let mut i: int = 0
+        while i < array_len(page_pkgs) is
+            let pkg_name: string = page_pkgs[i]
+            let meta: repo::PackageMeta = find_meta(tag_results, pkg_name)
+            let mut version: string = "unknown"
+            let mut desc: string = "(run hpm refresh)"
+            let mut tags_str: string = ""
+            if meta.name != "" is
+                version = meta.version
+                desc = if string_len(meta.summary) > 45 then string_slice(meta.summary, 0, 44) + "…" else meta.summary
+                let mut labeled: [string] = []
+                let mut t: int = 0
+                while t < array_len(meta.tags) is
+                    labeled = array_push(labeled, "@" + meta.tags[t])
+                    t += 1
+                end
+                tags_str = labeled.join(" ")
+            end
+            write("  " + pad(colors::magenta(pkg_name), 22) + " " + pad(fmt::red(version), 12) + " " + desc + " " + fmt::dim(tags_str))
+            i += 1
+        end
+
+        if total_pages <= 1 is
+            looping = false
+        else is
+            write("")
+            let mut prompt: string = ""
+            if page + 1 < total_pages is prompt = prompt + " [n]ext" end
+            if page > 0 is prompt = prompt + " [p]rev" end
+            prompt = prompt + " [q]uit"
+            let input: string = io::read_line("  " + fmt::dim(prompt) + ": ")
+            let cmd: string = string_lower(string_trim(input))
+            if cmd == "n" || cmd == "" is
+                if page + 1 < total_pages is page = page + 1 write("") else is looping = false end
+            elsif cmd == "p" is
+                if page > 0 is page = page - 1 write("") end
+            else is
+                looping = false
+            end
+        end
+    end
+
+    write("")
+    write("  Install all: " + fmt::dim("hpm install @" + tag))
+    write("  Run " + fmt::dim("hpm info <package>") + " for details, " + fmt::dim("hpm install <package>") + " to install single package.")
+    return error::HpmResult::Ok(true)
+end
+
+fn find_meta(results: [repo::PackageMeta], name: string) -> repo::PackageMeta is
+    let mut i: int = 0
+    while i < array_len(results) is
+        if results[i].name == name is return results[i] end
+        i += 1
+    end
+    return repo::PackageMeta { name: "", version: "", summary: "", authors: "", license: "", tags: [], available_versions: [], fetched_at: 0 }
+end
+
+fn print_results_table(results: [repo::PackageMeta], start: int, end_idx: int) is
+    write("  " + pad(fmt::bold(colors::white("Package")), 22) + " " + pad(fmt::bold(colors::white("Version")), 12) + " " + pad(fmt::bold(colors::white("Description")), 32) + " " + fmt::bold(colors::white("Tags")))
+    write("  " + repeat("─", 80))
+
+    let mut i: int = start
+    while i < end_idx is
+        let meta: repo::PackageMeta = results[i]
+        let desc: string = if string_len(meta.summary) > 30 then string_slice(meta.summary, 0, 29) + "…" else meta.summary
+        let mut labeled: [string] = []
+        let mut t: int = 0
+        while t < array_len(meta.tags) is
+            labeled = array_push(labeled, fmt::dim("@" + meta.tags[t]))
+            t += 1
+        end
+        write("  " + pad(colors::magenta(meta.name), 22) + " " + pad(fmt::red(meta.version), 12) + " " + pad(desc, 32) + " " + labeled.join(" "))
+        i += 1
+    end
+end
+
+fn print_hints() is
+    write("")
+    write("  Run " + fmt::dim("hpm info <package>") + " for details, " + fmt::dim("hpm install <package>") + " to install.")
+    write("  Search by tag: " + fmt::dim("hpm search @<tag>"))
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is
+        out = out + " "
+    end
+    return out
+end
+
+fn repeat(c: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out = out + c
+        i += 1
+    end
+    return out
+end
