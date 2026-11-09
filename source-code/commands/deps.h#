@@ -1,0 +1,148 @@
+mod colors
+mod error
+mod repo
+mod utils
+mod manifest
+
+use "std -> fmt" from "fmt"
+
+struct StackItem is
+    pub pkg:   string
+    pub ver:   string
+    pub depth: int
+end
+
+pub fn deps(spec: string) -> error::HpmResult<bool> is
+    if spec == "" is
+        write(fmt::red("✗") + " Usage: hpm deps <package>[@<version>]")
+        exit(1)
+    end
+    let parts: [string] = string_split(spec, "@")
+    let pkg_name: string = parts[0]
+    let req: string = if array_len(parts) > 1 then "=" + parts[1] else ""
+
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            let versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, pkg_name)
+            match versions_r is
+                HpmResult::Err(_) => return error::HpmResult::Err(error::HpmError::PackageNotFound(
+                    pkg_name + "' not found. Run `hpm refresh` first."))
+                HpmResult::Ok(versions) => is
+                    if array_len(versions) == 0 is
+                        write("⚠ No versions found for '" + pkg_name + "'. Run " + fmt::dim("hpm install") + " to clone repo.")
+                        return error::HpmResult::Ok(true)
+                    end
+
+                    let mut chosen_ver: string = ""
+                    if req != "" is
+                        let mut i: int = 0
+                        while i < array_len(versions) && chosen_ver == "" is
+                            if utils::satisfies(versions[i].version, req) is chosen_ver = versions[i].version end
+                            i += 1
+                        end
+                        if chosen_ver == "" is
+                            return error::HpmResult::Err(error::HpmError::VersionNotFound(pkg_name, req))
+                        end
+                    else is
+                        chosen_ver = versions[array_len(versions) - 1].version
+                    end
+
+                    let mut visited: [string] = []
+                    let mut stack: [StackItem] = [StackItem { pkg: pkg_name, ver: chosen_ver, depth: 0 }]
+                    let mut output: [string] = []
+
+                    while array_len(stack) > 0 is
+                        let top: StackItem = stack[array_len(stack) - 1]
+                        stack = utils::array_slice(stack, 0, array_len(stack) - 1)
+                        let key: string = top.pkg + "@" + top.ver
+                        if contains_str(visited, key) is continue end
+                        visited = array_push(visited, key)
+
+                        let indent: string = repeat_str("  ", top.depth)
+                        if top.depth == 0 is
+                            output = array_push(output, indent + colors::white(top.pkg) + "@" + fmt::red(top.ver))
+                        else is
+                            output = array_push(output, indent + "└─ " + colors::white(top.pkg) + "@" + fmt::red(top.ver))
+                        end
+
+                        let pkg_versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, top.pkg)
+                        match pkg_versions_r is
+                            HpmResult::Ok(pkg_versions) => is
+                                let mut vi: int = 0
+                                let mut found_ver: repo::TagManifest = repo::TagManifest { version: "", commit: "", manifest: manifest::default_manifest("") }
+                                let mut have_ver: bool = false
+                                while vi < array_len(pkg_versions) is
+                                    if pkg_versions[vi].version == top.ver is
+                                        found_ver = pkg_versions[vi]
+                                        have_ver = true
+                                    end
+                                    vi += 1
+                                end
+                                if have_ver is
+                                    let dep_keys: [string] = found_ver.manifest.deps.keys
+                                    let mut di: int = 0
+                                    while di < array_len(dep_keys) is
+                                        let dep_name: string = dep_keys[di]
+                                        let dep_req: string = manifest::osm_get(found_ver.manifest.deps, dep_name)
+                                        let indent2: string = repeat_str("  ", top.depth + 1)
+                                        let dep_versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, dep_name)
+                                        match dep_versions_r is
+                                            HpmResult::Ok(dep_versions) => is
+                                                let mut found_dep_ver: string = ""
+                                                let mut dv: int = 0
+                                                while dv < array_len(dep_versions) && found_dep_ver == "" is
+                                                    if utils::satisfies(dep_versions[dv].version, dep_req) is found_dep_ver = dep_versions[dv].version end
+                                                    dv += 1
+                                                end
+                                                if found_dep_ver != "" is
+                                                    stack = array_push(stack, StackItem { pkg: dep_name, ver: found_dep_ver, depth: top.depth + 1 })
+                                                else is
+                                                    output = array_push(output, indent2 + "└─ " + colors::white(dep_name) + "@" + fmt::red(dep_req) + " " + fmt::red("(not found)"))
+                                                end
+                                            end
+                                            HpmResult::Err(_) => is
+                                                output = array_push(output, indent2 + "└─ " + colors::white(dep_name) + " " + fmt::dim("(not in index)"))
+                                            end
+                                        end
+                                        di += 1
+                                    end
+                                end
+                            end
+                            HpmResult::Err(_) => is end
+                        end
+                    end
+
+                    write("→ Dependency tree for " + colors::white(pkg_name) + "@" + fmt::red(chosen_ver) + ":\n")
+                    let mut oi: int = 0
+                    while oi < array_len(output) is
+                        write(output[oi])
+                        oi += 1
+                    end
+                    write("")
+                    return error::HpmResult::Ok(true)
+                end
+            end
+        end
+    end
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+fn repeat_str(s: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out = out + s
+        i += 1
+    end
+    return out
+end
