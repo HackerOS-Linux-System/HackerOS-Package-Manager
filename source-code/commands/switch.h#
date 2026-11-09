@@ -1,0 +1,72 @@
+mod colors
+mod error
+mod utils
+mod state
+mod paths
+mod squash
+mod manifest
+mod installer
+
+use "std -> fs"  from "fs"
+use "std -> fmt" from "fmt"
+
+pub fn switch_version(package: string, version: string) -> error::HpmResult<bool> is
+    let lock_r: error::HpmResult<int> = utils::acquire_lock()
+    match lock_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lock_fd) => is
+            let result: error::HpmResult<bool> = switch_inner(package, version)
+            utils::release_lock(lock_fd)
+            return result
+        end
+    end
+end
+
+fn switch_inner(package: string, version: string) -> error::HpmResult<bool> is
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            if !state::has_package(s.packages, package) is
+                return error::HpmResult::Err(error::HpmError::PackageNotFound(package))
+            end
+            if state::find_index(s.packages, package, version) < 0 is
+                return error::HpmResult::Err(error::HpmError::VersionNotFound(package, version))
+            end
+
+            let pkg_dir: string = paths::store_path() + package
+            let set_r: error::HpmResult<bool> = utils::set_current_version(pkg_dir, version)
+            if error::is_err(set_r) is return set_r end
+
+            let ver_dir: string = pkg_dir + "/" + version
+            let mount_r: error::HpmResult<bool> = squash::ensure_mounted(ver_dir)
+            if error::is_err(mount_r) is return mount_r end
+
+            let hpm_exe: string = installer::which_hpm_for_wrappers()
+            let wn: state::WrapperNames = state::wrapper_names_load()
+
+            let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(ver_dir)
+            match mr is
+                HpmResult::Ok(m) => is
+                    let mut b: int = 0
+                    while b < array_len(m.bins) is
+                        let bin_name: string = m.bins[b]
+                        let wrapper_name: string = if state::wn_has(wn, package, bin_name) then state::wn_get(wn, package, bin_name) else bin_name
+                        let wrapper: string = paths::bin_dir() + "/" + wrapper_name
+                        let rel: string = installer::find_binary_in_dir(ver_dir, bin_name)
+                        if rel != "" is
+                            let content: string = "#!/bin/sh\nexec " + hpm_exe + " run " + package + " " + rel + " \"$@\"\n"
+                            fs::write(wrapper, content)
+                            utils::make_executable(wrapper)
+                        end
+                        b += 1
+                    end
+                end
+                HpmResult::Err(_) => is end
+            end
+
+            write(fmt::red("✔") + " Switched " + colors::white(package) + " to version " + colors::white(version))
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
