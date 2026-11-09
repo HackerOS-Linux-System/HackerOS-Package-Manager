@@ -1,0 +1,43 @@
+mod colors
+mod error
+mod utils
+mod state
+
+use "std -> fmt" from "fmt"
+
+pub fn pin(package: string, version: string) -> error::HpmResult<bool> is
+    let lock_r: error::HpmResult<int> = utils::acquire_lock()
+    match lock_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lock_fd) => is
+            let result: error::HpmResult<bool> = pin_inner(package, version)
+            utils::release_lock(lock_fd)
+            return result
+        end
+    end
+end
+
+fn pin_inner(package: string, version: string) -> error::HpmResult<bool> is
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            let idx: int = state::find_index(s.packages, package, version)
+            if idx < 0 is
+                if !state::has_package(s.packages, package) is
+                    return error::HpmResult::Err(error::HpmError::PackageNotFound(package))
+                end
+                return error::HpmResult::Err(error::HpmError::VersionNotFound(package, version))
+            end
+            let mut new_packages: [state::VersionInfo] = s.packages
+            let mut info: state::VersionInfo = new_packages[idx]
+            info.pinned = true
+            new_packages[idx] = info
+            let new_state: state::State = state::State { packages: new_packages, history: s.history }
+            let save_r: error::HpmResult<bool> = state::state_save(new_state)
+            if error::is_err(save_r) is return save_r end
+            write(fmt::red("✔") + " Pinned " + colors::white(package) + "@" + colors::white(version))
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
