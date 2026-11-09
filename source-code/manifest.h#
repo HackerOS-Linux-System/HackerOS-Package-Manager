@@ -1,0 +1,348 @@
+mod hk_parser
+mod error
+
+use "std -> os"      from "os"
+use "std -> fs"      from "fs"
+use "std -> fmt"     from "fmt"
+use "std -> path"    from "path"
+
+;; ── Struktury 1:1 z Rust ──────────────────────────────────────────────
+
+pub struct BuildInfo is
+    pub commands: [string]
+    pub deb_deps: [string]
+end
+
+pub fn build_info_default() -> BuildInfo is
+    return BuildInfo { commands: [], deb_deps: [] }
+end
+
+pub struct RuntimeInfo is
+    pub deb_deps: [string]
+end
+
+pub fn runtime_info_default() -> RuntimeInfo is
+    return RuntimeInfo { deb_deps: [] }
+end
+
+pub struct DesktopInfo is
+    pub display_name: string
+    pub icon:         string
+    pub categories:   string
+    pub comment:      string
+    pub nodisplay:    bool
+    pub desktop_file: string
+    pub mime_types:   string
+    pub keywords:     string
+end
+
+pub fn desktop_info_default() -> DesktopInfo is
+    return DesktopInfo {
+        display_name: "", icon: "", categories: "", comment: "",
+        nodisplay: false, desktop_file: "", mime_types: "", keywords: "",
+    }
+end
+
+pub struct Sandbox is
+    pub network:       bool
+    pub filesystem:    [string]
+    pub gui:           bool
+    pub dev:           bool
+    pub full_gui:      bool
+    ;; Jawna zgoda na sieć DLA HOOKÓW (pre/post-install itd.), niezależna od
+    ;; `network` (patrz `sandbox::run_hook_sandboxed`).
+    pub hooks_network: bool
+end
+
+pub fn sandbox_default() -> Sandbox is
+    return Sandbox { network: false, filesystem: [], gui: false, dev: false, full_gui: false, hooks_network: false }
+end
+
+;; Pary (klucz, wartość) w kolejności wstawienia — odpowiednik `IndexMap`
+;; z Rust dla `system_specs` i `deps`, bo H# `col::HashMap` nie gwarantuje
+;; kolejności iteracji.
+pub struct OrderedStrMap is
+    pub keys: [string]
+    pub vals: [string]
+end
+
+pub fn osm_new() -> OrderedStrMap is
+    return OrderedStrMap { keys: [], vals: [] }
+end
+
+pub fn osm_insert(m: OrderedStrMap, key: string, val: string) -> OrderedStrMap is
+    let mut i: int = 0
+    while i < m.keys.len() is
+        if m.keys[i] == key is
+            let mut nv: [string] = m.vals
+            nv[i] = val
+            return OrderedStrMap { keys: m.keys, vals: nv }
+        end
+        i += 1
+    end
+    let mut nk: [string] = m.keys
+    let mut nv2: [string] = m.vals
+    nk.push(key)
+    nv2.push(val)
+    return OrderedStrMap { keys: nk, vals: nv2 }
+end
+
+pub fn osm_get(m: OrderedStrMap, key: string) -> string is
+    let mut i: int = 0
+    while i < m.keys.len() is
+        if m.keys[i] == key is return m.vals[i] end
+        i += 1
+    end
+    return ""
+end
+
+pub fn osm_contains(m: OrderedStrMap, key: string) -> bool is
+    let mut i: int = 0
+    while i < m.keys.len() is
+        if m.keys[i] == key is return true end
+        i += 1
+    end
+    return false
+end
+
+pub struct Manifest is
+    pub name:             string
+    pub version:          string
+    pub authors:          string
+    pub license:          string
+    pub summary:          string
+    pub long:             string
+    pub system_specs:     OrderedStrMap
+    pub deps:             OrderedStrMap
+    ;; Tagi grupowe: @development, @cli, @tools itp.
+    pub tags:             [string]
+    pub bins:              [string]
+    pub bin_paths:        OrderedStrMap
+    pub sandbox:          Sandbox
+    pub sandbox_disabled: bool
+    pub install_commands: [string]
+    pub build:            BuildInfo
+    pub runtime:          RuntimeInfo
+    pub desktop:          DesktopInfo
+    pub is_gui:           bool
+    pub conflicts:        [string]
+    ;; Zadeklarowana architektura (x86_64 | aarch64 | armhf | i386 | any).
+    pub arch:             string
+    ;; Automatycznie wykrywane przez load_from_path — true jeśli istnieje hooks/.
+    pub has_hooks:        bool
+end
+
+;; ── Walidacja architektury ────────────────────────────────────────────
+
+fn arch_matches(declared: string, current: string) -> bool is
+    if declared == "x86_64"  is return current == "x86_64" end
+    if declared == "aarch64" is return current == "aarch64" end
+    if declared == "armhf"   is return current == "arm" end
+    if declared == "i386"    is return current == "x86" end
+    return false
+end
+
+;; Odpowiednik `check_arch_compatibility`. Zwraca `HpmResult<bool>`
+;; (Ok(true) = zgodny, Err = niezgodny, z gotowym komunikatem 1:1 z Rust).
+pub fn check_arch_compatibility(declared: string) -> error::HpmResult<bool> is
+    if declared == "" || declared == "any" is
+        return error::HpmResult::Ok(true)
+    end
+    let current: string = os::arch()
+    if !arch_matches(declared, current) is
+        ;; fmt.h# nie ma odpowiednika `colored::bright_black()` — `dim` daje
+        ;; wizualnie najbliższy, przygaszony szary tekst w terminalu.
+        let hint: string = fmt::dim("hpm install --force-arch")
+        let msg: string = "Architecture mismatch: package requires '" + declared +
+            "' but running on '" + current + "'.\n" +
+            "  If this is a cross-arch install, use " + hint + " to override."
+        return error::HpmResult::Err(error::HpmError::InvalidArg(msg))
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Ładowanie info.hk ─────────────────────────────────────────────────
+
+pub fn default_manifest(name: string) -> Manifest is
+    return Manifest {
+        name: name, version: "", authors: "", license: "", summary: "", long: "",
+        system_specs: osm_new(), deps: osm_new(), tags: [], bins: [], bin_paths: osm_new(),
+        sandbox: sandbox_default(), sandbox_disabled: false, install_commands: [],
+        build: build_info_default(), runtime: runtime_info_default(), desktop: desktop_info_default(),
+        is_gui: false, conflicts: [], arch: "", has_hooks: false,
+    }
+end
+
+impl Manifest is
+    pub fn load_from_path(dir_path: string) -> error::HpmResult<Manifest> is
+        let info_path: string = path::join(dir_path, "info.hk")
+
+        if !fs::exists(info_path) is
+            return error::HpmResult::Err(error::HpmError::Manifest("Failed to read " + info_path + ": file not found"))
+        end
+        let contents: string = fs::read(info_path)
+        let mut config: hk_parser::HkNode = hk_parser::parse_hk(contents)
+        config = hk_parser::resolve_interpolations(config)
+
+        if !hk_parser::node_has(config, "metadata") is
+            return error::HpmResult::Err(error::HpmError::Manifest("Missing [metadata] section"))
+        end
+        let metadata: hk_parser::HkNode = hk_parser::node_get(config, "metadata")
+        if !metadata.is_map is
+            return error::HpmResult::Err(error::HpmError::Manifest("Invalid [metadata] section"))
+        end
+
+        let name: string = hk_parser::node_get_str(metadata, "name")
+        if name == "" is
+            return error::HpmResult::Err(error::HpmError::Manifest("Missing name"))
+        end
+        let version: string = hk_parser::node_get_str(metadata, "version")
+        if version == "" is
+            return error::HpmResult::Err(error::HpmError::Manifest("Missing version"))
+        end
+        let authors: string = hk_parser::node_get_str(metadata, "authors")
+        let license: string = hk_parser::node_get_str(metadata, "license")
+        let is_gui:  bool   = hk_parser::node_get_bool(metadata, "gui")
+        let mut arch: string = hk_parser::node_get_str(metadata, "arch")
+        let tags: [string] = hk_parser::node_get_string_list(metadata, "tags")
+
+        ;; bins.<name> => "<path>" — kolekcja binariów i (opcjonalnie)
+        ;; ich lokalizacji wewnątrz paczki.
+        let mut bins: [string] = []
+        let mut bin_paths: OrderedStrMap = osm_new()
+        if hk_parser::node_has(metadata, "bins") is
+            let bins_map: hk_parser::HkNode = hk_parser::node_get(metadata, "bins")
+            if bins_map.is_map is
+                let mut i: int = 0
+                while i < bins_map.keys.len() is
+                    let bin_name: string = bins_map.keys[i]
+                    bins.push(bin_name)
+                    let pv: hk_parser::HkNode = bins_map.vals[i]
+                    if !pv.is_map && pv.str_val != "" is
+                        bin_paths = osm_insert(bin_paths, bin_name, pv.str_val)
+                    end
+                    i += 1
+                end
+            end
+        end
+
+        let description: hk_parser::HkNode = hk_parser::node_get(config, "description")
+        let summary: string = hk_parser::node_get_str(description, "summary")
+        let long:    string = hk_parser::node_get_str(description, "long")
+
+        let specs: hk_parser::HkNode = hk_parser::node_get(config, "specs")
+        let mut system_specs: OrderedStrMap = osm_new()
+        if specs.is_map is
+            let mut i: int = 0
+            while i < specs.keys.len() is
+                let k: string = specs.keys[i]
+                if k != "dependencies" is
+                    let v: hk_parser::HkNode = specs.vals[i]
+                    if !v.is_map is
+                        system_specs = osm_insert(system_specs, k, v.str_val)
+                    end
+                end
+                i += 1
+            end
+        end
+
+        let mut deps: OrderedStrMap = osm_new()
+        if hk_parser::node_has(specs, "dependencies") is
+            let dnode: hk_parser::HkNode = hk_parser::node_get(specs, "dependencies")
+            if dnode.is_map is
+                let mut i: int = 0
+                while i < dnode.keys.len() is
+                    let v: hk_parser::HkNode = dnode.vals[i]
+                    if !v.is_map is
+                        deps = osm_insert(deps, dnode.keys[i], v.str_val)
+                    end
+                    i += 1
+                end
+            end
+        end
+
+        if arch == "" is
+            arch = osm_get(system_specs, "arch")
+        end
+
+        let mut conflicts: [string] = []
+        let conflicts_sec: hk_parser::HkNode = hk_parser::node_get(config, "conflicts")
+        if conflicts_sec.is_map is
+            let mut i: int = 0
+            while i < conflicts_sec.keys.len() is
+                if hk_parser::node_is_empty_value(conflicts_sec.vals[i]) is
+                    conflicts.push(conflicts_sec.keys[i])
+                end
+                i += 1
+            end
+        end
+
+        let sandbox_sec: hk_parser::HkNode = hk_parser::node_get(config, "sandbox")
+        let mut network: bool = false
+        let mut gui: bool = is_gui
+        let mut dev: bool = false
+        let mut full_gui: bool = false
+        let mut filesystem: [string] = []
+        let mut sandbox_disabled: bool = false
+        let mut hooks_network: bool = false
+        if sandbox_sec.is_map is
+            network          = hk_parser::node_get_bool(sandbox_sec, "network")
+            gui              = hk_parser::node_get_bool(sandbox_sec, "gui") || is_gui
+            dev              = hk_parser::node_get_bool(sandbox_sec, "dev")
+            full_gui         = hk_parser::node_get_bool(sandbox_sec, "full_gui")
+            filesystem       = hk_parser::node_get_string_list(sandbox_sec, "filesystem")
+            sandbox_disabled = hk_parser::node_get_bool(sandbox_sec, "disabled")
+            hooks_network    = hk_parser::node_get_bool(sandbox_sec, "hooks_network")
+        end
+
+        let install_sec: hk_parser::HkNode = hk_parser::node_get(config, "install")
+        let mut install_commands: [string] = []
+        if install_sec.is_map is
+            install_commands = hk_parser::node_get_string_list(install_sec, "commands")
+        end
+
+        let build_sec: hk_parser::HkNode = hk_parser::node_get(config, "build")
+        let mut build_commands: [string] = []
+        let mut build_deb_deps: [string] = []
+        if build_sec.is_map is
+            build_commands = hk_parser::node_get_string_list(build_sec, "commands")
+            build_deb_deps = hk_parser::node_get_string_list(build_sec, "deb_deps")
+        end
+
+        let runtime_sec: hk_parser::HkNode = hk_parser::node_get(config, "runtime")
+        let mut runtime_deb_deps: [string] = []
+        if runtime_sec.is_map is
+            runtime_deb_deps = hk_parser::node_get_string_list(runtime_sec, "deb_deps")
+        end
+
+        let desktop_sec: hk_parser::HkNode = hk_parser::node_get(config, "desktop")
+        let mut desktop: DesktopInfo = desktop_info_default()
+        if desktop_sec.is_map is
+            desktop = DesktopInfo {
+                display_name: hk_parser::node_get_str(desktop_sec, "display_name"),
+                icon:         hk_parser::node_get_str(desktop_sec, "icon"),
+                categories:   hk_parser::node_get_str(desktop_sec, "categories"),
+                comment:      hk_parser::node_get_str(desktop_sec, "comment"),
+                nodisplay:    hk_parser::node_get_bool(desktop_sec, "nodisplay"),
+                desktop_file: hk_parser::node_get_str(desktop_sec, "desktop_file"),
+                mime_types:   hk_parser::node_get_str(desktop_sec, "mime_types"),
+                keywords:     hk_parser::node_get_str(desktop_sec, "keywords"),
+            }
+        end
+
+        let has_hooks: bool = fs::exists(path::join(dir_path, "hooks"))
+
+        return error::HpmResult::Ok(Manifest {
+            name: name, version: version, authors: authors, license: license,
+            summary: summary, long: long,
+            system_specs: system_specs, deps: deps, tags: tags,
+            bins: bins, bin_paths: bin_paths, is_gui: is_gui,
+            conflicts: conflicts, arch: arch, has_hooks: has_hooks,
+            sandbox: Sandbox { network: network, filesystem: filesystem, gui: gui, dev: dev, full_gui: full_gui, hooks_network: hooks_network },
+            sandbox_disabled: sandbox_disabled, install_commands: install_commands,
+            build: BuildInfo { commands: build_commands, deb_deps: build_deb_deps },
+            runtime: RuntimeInfo { deb_deps: runtime_deb_deps },
+            desktop: desktop,
+        })
+    end
+end
