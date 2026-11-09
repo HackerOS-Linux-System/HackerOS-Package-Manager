@@ -1,0 +1,176 @@
+mod error
+mod utils
+
+use "std -> fs" from "fs"
+
+fn squashfs_sidecar(pkg_version_dir: string) -> string is
+    let parts: [string] = string_split(pkg_version_dir, "/")
+    if array_len(parts) == 0 is return "" end
+    let version: string = parts[array_len(parts) - 1]
+    let parent_parts: [string] = utils::array_slice(parts, 0, array_len(parts) - 1)
+    let parent: string = parent_parts.join("/")
+    return parent + "/." + version + ".squashfs"
+end
+
+fn have_tool(name: string) -> bool is
+    let r: error::HpmResult<int> = utils::run_command("which", [name])
+    match r is
+        HpmResult::Ok(code) => return code == 0
+        HpmResult::Err(_)   => return false
+    end
+end
+
+;; Czy `dir` jest AKTUALNIE zamontowanym punktem montowania — sprawdza
+;; `/proc/mounts`, nie tylko czy katalog istnieje/jest pusty.
+fn is_mount_point(dir: string) -> bool is
+    if !fs::exists("/proc/mounts") is return false end
+    let canon: string = normalize_path(dir)
+    let mounts: string = fs::read("/proc/mounts")
+    let lines: [string] = string_split(mounts, "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let fields: [string] = string_split(lines[i], " ")
+        if array_len(fields) >= 2 && fields[1] == canon is return true end
+        i += 1
+    end
+    return false
+end
+
+;; `std -> fs` nie ma `canonicalize()` — usuwamy tylko końcowy `/`, co
+;; wystarcza, bo wszystkie ścieżki w tym module są już budowane jako
+;; absolutne przez `paths.h#`/`main.h#`.
+fn normalize_path(p: string) -> string is
+    if string_len(p) > 1 && string_ends_with(p, "/") is
+        return string_slice(p, 0, string_len(p) - 1)
+    end
+    return p
+end
+
+;; Kompresuje `pkg_version_dir` do siostrzanego pliku squashfs, po czym
+;; opróżnia oryginalny katalog (zostaje jako czysty punkt montowania).
+;; Best-effort: brak `mksquashfs` nigdy nie blokuje instalacji.
+pub fn compress_after_install(pkg_version_dir: string) -> error::HpmResult<bool> is
+    if !have_tool("mksquashfs") is return error::HpmResult::Ok(false) end
+    let sidecar: string = squashfs_sidecar(pkg_version_dir)
+    if sidecar == "" is return error::HpmResult::Ok(false) end
+
+    let tmp_sidecar: string = sidecar + ".building"
+    if fs::exists(tmp_sidecar) is fs::remove(tmp_sidecar) end
+
+    let r: error::HpmResult<int> = utils::run_command("mksquashfs",
+        [pkg_version_dir, tmp_sidecar, "-comp", "lz4", "-Xhc", "-noappend", "-no-progress"])
+
+    let mut ok: bool = false
+    match r is
+        HpmResult::Ok(code) => ok = code == 0
+        HpmResult::Err(_)   => ok = false
+    end
+    if !ok is
+        if fs::exists(tmp_sidecar) is fs::remove(tmp_sidecar) end
+        return error::HpmResult::Ok(false) ;; best-effort — pakiet zostaje nieskompresowany
+    end
+
+    fs::rename(tmp_sidecar, sidecar)
+
+    ;; Opróżnij oryginalny katalog przez rename-out + świeży pusty katalog,
+    ;; żeby nie było momentu gdzie katalog fizycznie nie istnieje.
+    let tmp_old: string = pkg_version_dir + ".old-uncompressed"
+    if fs::exists(tmp_old) is fs::rmdir_all(tmp_old) end
+    fs::rename(pkg_version_dir, tmp_old)
+    utils::mkdir_all(pkg_version_dir)
+    fs::rmdir_all(tmp_old)
+
+    return error::HpmResult::Ok(true)
+end
+
+;; Upewnia się, że `pkg_version_dir` jest zamontowany, jeśli ma
+;; odpowiadający plik `.squashfs`. Idempotentne i tanie do wołania za
+;; każdym razem przed dostępem do store'owanego pakietu.
+pub fn ensure_mounted(pkg_version_dir: string) -> error::HpmResult<bool> is
+    let sidecar: string = squashfs_sidecar(pkg_version_dir)
+    if sidecar == "" || !fs::exists(sidecar) is return error::HpmResult::Ok(true) end
+    if is_mount_point(pkg_version_dir) is return error::HpmResult::Ok(true) end
+
+    if !have_tool("squashfuse") is
+        return error::HpmResult::Err(error::HpmError::Io(
+            "Package data is compressed (squashfs) but 'squashfuse' is not installed.\n" +
+            "  Install it: apt install squashfuse (or equivalent for your distro)."))
+    end
+
+    utils::mkdir_all(pkg_version_dir)
+    let r: error::HpmResult<int> = utils::run_command("squashfuse", [sidecar, pkg_version_dir])
+    match r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(code) => is
+            if code != 0 is
+                return error::HpmResult::Err(error::HpmError::Io("Failed to mount " + sidecar))
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+;; Odmontowuje (jeśli zamontowany) — wołane przed usunięciem wersji ze
+;; store, żeby nie zostawić osieroconego uchwytu FUSE.
+pub fn unmount(pkg_version_dir: string) -> error::HpmResult<bool> is
+    if !is_mount_point(pkg_version_dir) is return error::HpmResult::Ok(true) end
+
+    let fr: error::HpmResult<int> = utils::run_command("fusermount", ["-u", pkg_version_dir])
+    let mut ok: bool = false
+    match fr is
+        HpmResult::Ok(code) => ok = code == 0
+        HpmResult::Err(_)   => ok = false
+    end
+    if !ok is
+        utils::run_command("umount", [pkg_version_dir])
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; Kasuje sam plik `.squashfs` (jeśli istnieje) — wołane RAZEM z usunięciem
+;; katalogu wersji, inaczej zostałby osierocony.
+pub fn remove_sidecar(pkg_version_dir: string) -> error::HpmResult<bool> is
+    let sidecar: string = squashfs_sidecar(pkg_version_dir)
+    if sidecar != "" && fs::exists(sidecar) is
+        fs::remove(sidecar)
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; Czy ten katalog pakietu jest skompresowany (ma plik `.squashfs`
+;; siostrzany) — używane do raportowania w `hpm info`/`hpm doctor`.
+pub fn is_compressed(pkg_version_dir: string) -> bool is
+    let sidecar: string = squashfs_sidecar(pkg_version_dir)
+    return sidecar != "" && fs::exists(sidecar)
+end
+
+;; Rozmiar na dysku — dla pakietu skompresowanego to rozmiar pliku
+;; `.squashfs`, nie (zwykle pusty/niezamontowany) katalog.
+pub fn on_disk_size(pkg_version_dir: string) -> int is
+    let sidecar: string = squashfs_sidecar(pkg_version_dir)
+    if sidecar != "" && fs::exists(sidecar) is
+        return fs::size(sidecar)
+    end
+    return dir_size(pkg_version_dir)
+end
+
+;; Odpowiednik `commands::clean::dir_size` (rekurencyjna suma rozmiarów) —
+;; wołany stąd, więc definiujemy go tutaj i re-eksportujemy dla
+;; `commands/clean.h#`, zamiast tworzyć zależność w drugą stronę
+;; (`squash.h#` NIE powinien zależeć od `commands/`, dokładnie jak w Rust,
+;; gdzie zależność szła `commands::clean -> squash`, nie odwrotnie —
+;; funkcja i tak fizycznie żyje tu, bo `squash.rs::on_disk_size` jej używa).
+pub fn dir_size(dir: string) -> int is
+    if !fs::exists(dir) is return 0 end
+    if fs::is_file(dir) is return fs::size(dir) end
+    let mut total: int = 0
+    let entries: [string] = fs::walk(dir)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        if fs::is_file(entries[i]) is
+            total = total + fs::size(entries[i])
+        end
+        i += 1
+    end
+    return total
+end
