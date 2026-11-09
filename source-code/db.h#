@@ -1,0 +1,291 @@
+mod error
+mod state
+mod paths
+
+use "std -> db" from "db"
+use "std -> fs" from "fs"
+
+;; ── Separatory (ASCII, nie występują w normalnych danych tekstowych) ───
+fn us() -> string is return "\x1f" end ;; Unit Separator   — pola w rekordzie
+fn rs() -> string is return "\x1e" end ;; Record Separator — rekordy w liście
+fn gs() -> string is return "\x1d" end ;; Group Separator  — elementy list w polu
+
+fn sql_escape(s: string) -> string is
+    return string_replace(s, "'", "''")
+end
+
+fn join_us(parts: [string]) -> string is
+    return parts.join(us())
+end
+
+fn join_list(items: [string]) -> string is
+    return items.join(gs())
+end
+
+fn split_list(s: string) -> [string] is
+    if s == "" is return [] end
+    return string_split(s, gs())
+end
+
+pub fn db_path() -> string is
+    return paths::db_dir() + "/hpm.sqlite3"
+end
+
+;; ── Schemat ──────────────────────────────────────────────────────────
+
+pub fn open_conn() -> string is
+    let conn: string = db::open(db_path())
+    db::exec(conn, "CREATE TABLE IF NOT EXISTS packages (
+        name TEXT NOT NULL, version TEXT NOT NULL, checksum TEXT NOT NULL,
+        pinned INTEGER NOT NULL DEFAULT 0, manually_installed INTEGER NOT NULL DEFAULT 0,
+        installed_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (name, version))")
+    db::exec(conn, "CREATE TABLE IF NOT EXISTS package_required_by (
+        name TEXT NOT NULL, version TEXT NOT NULL, dependent TEXT NOT NULL,
+        UNIQUE(name, version, dependent))")
+    db::exec(conn, "CREATE TABLE IF NOT EXISTS package_depends_on (
+        name TEXT NOT NULL, version TEXT NOT NULL, dependency TEXT NOT NULL,
+        UNIQUE(name, version, dependency))")
+    db::exec(conn, "CREATE TABLE IF NOT EXISTS package_conflicts_with (
+        name TEXT NOT NULL, version TEXT NOT NULL, conflict TEXT NOT NULL,
+        UNIQUE(name, version, conflict))")
+    db::exec(conn, "CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+        description TEXT NOT NULL, packages_json TEXT NOT NULL)")
+    db::exec(conn, "CREATE TABLE IF NOT EXISTS wrapper_names (
+        key TEXT NOT NULL PRIMARY KEY, wrapper_name TEXT NOT NULL)")
+    return conn
+end
+
+;; ── Odczyt relacji (required_by / depends_on / conflicts_with) ─────────
+;; Zwraca listę (name, version, value) jako spłaszczone rekordy — wołający
+;; sam dopasowuje do właściwego `VersionInfo` po (name, version).
+struct RelationRow is
+    pub name:    string
+    pub version: string
+    pub value:   string
+end
+
+fn load_relation(conn: string, table: string, value_col: string) -> [RelationRow] is
+    let sql: string = "SELECT name || char(31) || version || char(31) || " + value_col + " FROM " + table
+    let rows: [any] = db::query(conn, sql)
+    let mut out: [RelationRow] = []
+    let mut i: int = 0
+    while i < array_len(rows) is
+        let row: [any] = rows[i]
+        if array_len(row) > 0 is
+            let line: string = to_string(row[0])
+            let fields: [string] = string_split(line, us())
+            if array_len(fields) >= 3 is
+                out = array_push(out, RelationRow { name: fields[0], version: fields[1], value: fields[2] })
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── load_state / save_state ─────────────────────────────────────────
+
+pub fn load_state() -> error::HpmResult<state::State> is
+    let conn: string = open_conn()
+
+    let sql: string = "SELECT name || char(31) || version || char(31) || checksum || char(31) || " +
+        "pinned || char(31) || manually_installed || char(31) || installed_at FROM packages"
+    let rows: [any] = db::query(conn, sql)
+
+    let mut packages: [state::VersionInfo] = []
+    let mut i: int = 0
+    while i < array_len(rows) is
+        let row: [any] = rows[i]
+        if array_len(row) > 0 is
+            let line: string = to_string(row[0])
+            let f: [string] = string_split(line, us())
+            if array_len(f) >= 6 is
+                let mut info: state::VersionInfo = state::version_info_new(f[0], f[1], f[2], f[4] == "1")
+                info.pinned = f[3] == "1"
+                info.installed_at = parse_int_or0(f[5])
+                packages = array_push(packages, info)
+            end
+        end
+        i += 1
+    end
+
+    ;; Dołącz relacje required_by/depends_on/conflicts_with do już wczytanych rekordów.
+    let req_rows: [RelationRow] = load_relation(conn, "package_required_by", "dependent")
+    let dep_rows: [RelationRow] = load_relation(conn, "package_depends_on", "dependency")
+    let conf_rows: [RelationRow] = load_relation(conn, "package_conflicts_with", "conflict")
+
+    let mut p: int = 0
+    while p < array_len(packages) is
+        let mut info: state::VersionInfo = packages[p]
+        info.required_by    = collect_values(req_rows, info.name, info.version)
+        info.depends_on     = collect_values(dep_rows, info.name, info.version)
+        info.conflicts_with = collect_values(conf_rows, info.name, info.version)
+        packages[p] = info
+        p += 1
+    end
+
+    ;; Snapshoty
+    let snap_sql: string = "SELECT timestamp || char(31) || description || char(31) || packages_json FROM snapshots ORDER BY id"
+    let snap_rows: [any] = db::query(conn, snap_sql)
+    let mut history: [state::RollbackEntry] = []
+    let mut s: int = 0
+    while s < array_len(snap_rows) is
+        let row: [any] = snap_rows[s]
+        if array_len(row) > 0 is
+            let line: string = to_string(row[0])
+            let f: [string] = string_split(line, us())
+            if array_len(f) >= 3 is
+                history = array_push(history, state::RollbackEntry {
+                    timestamp: parse_int_or0(f[0]), description: f[1], snapshot: deserialize_snapshot(f[2]),
+                })
+            end
+        end
+        s += 1
+    end
+
+    return error::HpmResult::Ok(state::State { packages: packages, history: history })
+end
+
+fn collect_values(rows: [RelationRow], name: string, version: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(rows) is
+        if rows[i].name == name && rows[i].version == version is
+            out = array_push(out, rows[i].value)
+        end
+        i += 1
+    end
+    return out
+end
+
+fn parse_int_or0(s: string) -> int is
+    let v: int? = parse_int(string_trim(s))
+    if v == nil is return 0 end
+    return v?
+end
+
+pub fn save_state(s: state::State) -> error::HpmResult<bool> is
+    let conn: string = open_conn()
+
+    db::exec(conn, "DELETE FROM packages")
+    db::exec(conn, "DELETE FROM package_required_by")
+    db::exec(conn, "DELETE FROM package_depends_on")
+    db::exec(conn, "DELETE FROM package_conflicts_with")
+    db::exec(conn, "DELETE FROM snapshots")
+
+    let mut i: int = 0
+    while i < array_len(s.packages) is
+        let info: state::VersionInfo = s.packages[i]
+        let pinned_i: string = if info.pinned then "1" else "0"
+        let manual_i: string = if info.manually_installed then "1" else "0"
+        db::exec(conn, "INSERT INTO packages (name, version, checksum, pinned, manually_installed, installed_at) VALUES ('" +
+            sql_escape(info.name) + "', '" + sql_escape(info.version) + "', '" + sql_escape(info.checksum) + "', " +
+            pinned_i + ", " + manual_i + ", " + to_string(info.installed_at) + ")")
+
+        let mut r: int = 0
+        while r < array_len(info.required_by) is
+            db::exec(conn, "INSERT OR IGNORE INTO package_required_by (name, version, dependent) VALUES ('" +
+                sql_escape(info.name) + "', '" + sql_escape(info.version) + "', '" + sql_escape(info.required_by[r]) + "')")
+            r += 1
+        end
+        let mut d: int = 0
+        while d < array_len(info.depends_on) is
+            db::exec(conn, "INSERT OR IGNORE INTO package_depends_on (name, version, dependency) VALUES ('" +
+                sql_escape(info.name) + "', '" + sql_escape(info.version) + "', '" + sql_escape(info.depends_on[d]) + "')")
+            d += 1
+        end
+        let mut c: int = 0
+        while c < array_len(info.conflicts_with) is
+            db::exec(conn, "INSERT OR IGNORE INTO package_conflicts_with (name, version, conflict) VALUES ('" +
+                sql_escape(info.name) + "', '" + sql_escape(info.version) + "', '" + sql_escape(info.conflicts_with[c]) + "')")
+            c += 1
+        end
+        i += 1
+    end
+
+    let mut h: int = 0
+    while h < array_len(s.history) is
+        let entry: state::RollbackEntry = s.history[h]
+        let blob: string = serialize_snapshot(entry.snapshot)
+        db::exec(conn, "INSERT INTO snapshots (timestamp, description, packages_json) VALUES (" +
+            to_string(entry.timestamp) + ", '" + sql_escape(entry.description) + "', '" + sql_escape(blob) + "')")
+        h += 1
+    end
+
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Serializacja snapshotu (patrz nagłówek pliku — nie jest to już JSON) ─
+
+fn serialize_snapshot(packages: [state::VersionInfo]) -> string is
+    let mut records: [string] = []
+    let mut i: int = 0
+    while i < array_len(packages) is
+        let p: state::VersionInfo = packages[i]
+        let pinned_i: string = if p.pinned then "1" else "0"
+        let manual_i: string = if p.manually_installed then "1" else "0"
+        let record: string = join_us([
+            p.name, p.version, p.checksum, pinned_i, manual_i, to_string(p.installed_at),
+            join_list(p.required_by), join_list(p.depends_on), join_list(p.conflicts_with),
+        ])
+        records = array_push(records, record)
+        i += 1
+    end
+    return records.join(rs())
+end
+
+fn deserialize_snapshot(blob: string) -> [state::VersionInfo] is
+    if blob == "" is return [] end
+    let records: [string] = string_split(blob, rs())
+    let mut out: [state::VersionInfo] = []
+    let mut i: int = 0
+    while i < array_len(records) is
+        let f: [string] = string_split(records[i], us())
+        if array_len(f) >= 9 is
+            let mut info: state::VersionInfo = state::version_info_new(f[0], f[1], f[2], f[4] == "1")
+            info.pinned = f[3] == "1"
+            info.installed_at = parse_int_or0(f[5])
+            info.required_by = split_list(f[6])
+            info.depends_on = split_list(f[7])
+            info.conflicts_with = split_list(f[8])
+            out = array_push(out, info)
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── WrapperNames ─────────────────────────────────────────────────────
+
+pub fn load_wrapper_names() -> error::HpmResult<state::WrapperNames> is
+    let conn: string = open_conn()
+    let rows: [any] = db::query(conn, "SELECT key || char(31) || wrapper_name FROM wrapper_names")
+    let mut wn: state::WrapperNames = state::wrapper_names_new()
+    let mut i: int = 0
+    while i < array_len(rows) is
+        let row: [any] = rows[i]
+        if array_len(row) > 0 is
+            let line: string = to_string(row[0])
+            let f: [string] = string_split(line, us())
+            if array_len(f) >= 2 is
+                wn.keys = array_push(wn.keys, f[0])
+                wn.vals = array_push(wn.vals, f[1])
+            end
+        end
+        i += 1
+    end
+    return error::HpmResult::Ok(wn)
+end
+
+pub fn save_wrapper_names(wn: state::WrapperNames) -> error::HpmResult<bool> is
+    let conn: string = open_conn()
+    db::exec(conn, "DELETE FROM wrapper_names")
+    let mut i: int = 0
+    while i < array_len(wn.keys) is
+        db::exec(conn, "INSERT OR REPLACE INTO wrapper_names (key, wrapper_name) VALUES ('" +
+            sql_escape(wn.keys[i]) + "', '" + sql_escape(wn.vals[i]) + "')")
+        i += 1
+    end
+    return error::HpmResult::Ok(true)
+end
