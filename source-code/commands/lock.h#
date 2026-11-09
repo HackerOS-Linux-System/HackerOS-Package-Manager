@@ -1,0 +1,465 @@
+mod error
+mod state
+mod repo
+mod paths
+mod colors
+mod utils
+
+use "std -> fs"   from "fs"
+use "std -> fmt"  from "fmt"
+use "std -> env"  from "env"
+use "std -> time" from "time"
+
+fn hpm_version() -> string is return "1.0.0" end
+fn us() -> string is return "\x1f" end
+fn gs() -> string is return "\x1d" end
+
+fn system_lock_path() -> string is return paths::db_dir() + "/system.lock" end
+
+pub struct LockEntry is
+    pub name:                string
+    pub version:             string
+    pub git_commit:          string
+    pub repo_url:            string
+    pub checksum:            string
+    pub dep_names:           [string]
+    pub dep_versions:        [string]
+    pub manually_installed:  bool
+    pub installed_at:        int
+end
+
+pub struct LockFile is
+    pub lock_version: int
+    pub generated_at: int
+    pub hpm_version:  string
+    pub entries:      [LockEntry]
+end
+
+pub fn lock_file_new() -> LockFile is
+    return LockFile { lock_version: 1, generated_at: time::now_unix(), hpm_version: hpm_version(), entries: [] }
+end
+
+pub fn lock_entry_find(lf: LockFile, name: string) -> LockEntry is
+    let mut i: int = 0
+    while i < array_len(lf.entries) is
+        if lf.entries[i].name == name is return lf.entries[i] end
+        i += 1
+    end
+    return LockEntry { name: "", version: "", git_commit: "", repo_url: "", checksum: "", dep_names: [], dep_versions: [], manually_installed: false, installed_at: 0 }
+end
+
+pub fn lock_has_entry(lf: LockFile, name: string) -> bool is
+    return lock_entry_find(lf, name).name != ""
+end
+
+pub fn lock_file_load(path: string) -> error::HpmResult<LockFile> is
+    if !fs::exists(path) is
+        return error::HpmResult::Err(error::HpmError::Io(
+            "Lock file not found at " + path + ".\nRun " + fmt::dim("hpm lock generate") + " to generate one."))
+    end
+    let content: string = fs::read(path)
+    let lines: [string] = string_split(content, "\n")
+    if array_len(lines) < 2 || lines[0] != "HPM_LOCK_V1" is
+        return error::HpmResult::Err(error::HpmError::Manifest("Invalid lock file: bad header"))
+    end
+    let header: [string] = string_split(lines[1], us())
+    let mut lf: LockFile = LockFile {
+        lock_version: parse_int_or0(if array_len(header) > 0 then header[0] else "1"),
+        generated_at: parse_int_or0(if array_len(header) > 1 then header[1] else "0"),
+        hpm_version: if array_len(header) > 2 then header[2] else "",
+        entries: [],
+    }
+    let mut i: int = 2
+    while i < array_len(lines) is
+        let line: string = lines[i]
+        if string_starts_with(line, "PKG" + us()) is
+            let fields: [string] = string_split(line, us())
+            ;; fields[0]="PKG", 1=name, 2=version, 3=git_commit, 4=repo_url,
+            ;; 5=checksum, 6=manually_installed, 7=installed_at, 8=deps(gs-joined "name:ver")
+            if array_len(fields) >= 9 is
+                let dep_pairs: [string] = if fields[8] == "" then [] else string_split(fields[8], gs())
+                let mut dep_names: [string] = []
+                let mut dep_versions: [string] = []
+                let mut d: int = 0
+                while d < array_len(dep_pairs) is
+                    let colon: int = string_find(dep_pairs[d], ":")
+                    if colon >= 0 is
+                        dep_names = array_push(dep_names, string_slice(dep_pairs[d], 0, colon))
+                        dep_versions = array_push(dep_versions, string_slice(dep_pairs[d], colon + 1, string_len(dep_pairs[d])))
+                    end
+                    d += 1
+                end
+                lf.entries = array_push(lf.entries, LockEntry {
+                    name: fields[1], version: fields[2], git_commit: fields[3], repo_url: fields[4],
+                    checksum: fields[5], manually_installed: fields[6] == "1", installed_at: parse_int_or0(fields[7]),
+                    dep_names: dep_names, dep_versions: dep_versions,
+                })
+            end
+        end
+        i += 1
+    end
+    return error::HpmResult::Ok(lf)
+end
+
+fn parse_int_or0(s: string) -> int is
+    let v: int? = parse_int(string_trim(s))
+    if v == nil is return 0 end
+    return v?
+end
+
+pub fn lock_file_save(lf: LockFile, path: string) -> error::HpmResult<bool> is
+    let mut out: string = "HPM_LOCK_V1\n"
+    out = out + to_string(lf.lock_version) + us() + to_string(lf.generated_at) + us() + lf.hpm_version + "\n"
+    let mut i: int = 0
+    while i < array_len(lf.entries) is
+        let e: LockEntry = lf.entries[i]
+        let mut deps: [string] = []
+        let mut d: int = 0
+        while d < array_len(e.dep_names) is
+            deps = array_push(deps, e.dep_names[d] + ":" + e.dep_versions[d])
+            d += 1
+        end
+        out = out + "PKG" + us() + e.name + us() + e.version + us() + e.git_commit + us() + e.repo_url + us() +
+            e.checksum + us() + (if e.manually_installed then "1" else "0") + us() + to_string(e.installed_at) + us() +
+            deps.join(gs()) + "\n"
+        i += 1
+    end
+    let parent: string = dirname_of(path)
+    if parent != "" && !fs::exists(parent) is
+        utils_mkdir_all(parent)
+    end
+    let tmp: string = path + ".tmp"
+    fs::write(tmp, out)
+    fs::rename(tmp, path)
+    return error::HpmResult::Ok(true)
+end
+
+fn dirname_of(p: string) -> string is
+    let slash: int = string_len(p) - 1
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < string_len(p) is
+        if string_at(p, i) == "/" is idx = i end
+        i += 1
+    end
+    if idx < 0 is return "" end
+    return string_slice(p, 0, idx)
+end
+
+fn utils_mkdir_all(dir: string) is
+    if dir == "" || dir == "/" || fs::exists(dir) is return end
+    utils_mkdir_all(dirname_of(dir))
+    if !fs::exists(dir) is fs::mkdir(dir) end
+end
+
+;; Zwraca listę rozbieżności między lockiem a bieżącym stanem instalacji.
+pub fn check_against_state(lf: LockFile, s: state::State) -> [string] is
+    let mut diffs: [string] = []
+
+    let mut i: int = 0
+    while i < array_len(lf.entries) is
+        let e: LockEntry = lf.entries[i]
+        let installed_ver: string = state::get_current_version(e.name, paths::store_path())
+        if installed_ver == "" is
+            diffs = array_push(diffs, "missing: " + e.name + "@" + e.version + " not installed")
+        else is
+            if installed_ver != e.version is
+                diffs = array_push(diffs, "version mismatch: " + e.name + " — lock has " + e.version + ", installed has " + installed_ver)
+            end
+            let idx: int = state::find_index(s.packages, e.name, installed_ver)
+            if idx >= 0 && s.packages[idx].checksum != e.checksum is
+                diffs = array_push(diffs, "checksum mismatch: " + e.name + "@" + installed_ver + " — contents may have changed")
+            end
+        end
+        i += 1
+    end
+
+    let mut names: [string] = []
+    let mut j: int = 0
+    while j < array_len(s.packages) is
+        if !contains_str(names, s.packages[j].name) is names = array_push(names, s.packages[j].name) end
+        j += 1
+    end
+    let mut k: int = 0
+    while k < array_len(names) is
+        if !lock_has_entry(lf, names[k]) is
+            let ver: string = state::get_current_version(names[k], paths::store_path())
+            if ver != "" is
+                diffs = array_push(diffs, "unlocked: " + names[k] + "@" + ver + " installed but not in lock file")
+            end
+        end
+        k += 1
+    end
+
+    return diffs
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── Rozwiązanie ścieżki lock file ─────────────────────────────────────
+
+fn resolve_lock_path(project: string) -> string is
+    if project != "" is return project + "/hpm.lock" end
+    let cwd: string = fs::cwd()
+    if fs::exists(cwd + "/info.hk") is return cwd + "/hpm.lock" end
+    return system_lock_path()
+end
+
+;; ── Komendy ──────────────────────────────────────────────────────────
+
+pub fn lock(args: [string]) -> error::HpmResult<bool> is
+    let subcmd: string = if array_len(args) > 0 then args[0] else "status"
+    let project: string = if array_len(args) > 1 then args[1] else ""
+
+    if subcmd == "generate" || subcmd == "gen" || subcmd == "update" is return cmd_generate(project) end
+    if subcmd == "check" || subcmd == "verify" is return cmd_check(project) end
+    if subcmd == "status" is return cmd_status(project) end
+    if subcmd == "diff" is return cmd_diff(project) end
+    if subcmd == "--help" || subcmd == "help" is is print_help() return error::HpmResult::Ok(true) end end
+
+    write(fmt::red("✗") + " Unknown lock subcommand: " + subcmd)
+    print_help()
+    exit(1)
+    return error::HpmResult::Ok(true)
+end
+
+fn cmd_generate(project: string) -> error::HpmResult<bool> is
+    let lock_path: string = resolve_lock_path(project)
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            if array_len(s.packages) == 0 is
+                write("→ No packages installed — lock file will be empty.")
+            end
+
+            let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+            match rm_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(rm) => is
+                    let mut lf: LockFile = lock_file_new()
+                    write("→ Generating lock file...")
+
+                    let mut names: [string] = []
+                    let mut i: int = 0
+                    while i < array_len(s.packages) is
+                        if !contains_str(names, s.packages[i].name) is names = array_push(names, s.packages[i].name) end
+                        i += 1
+                    end
+
+                    let mut n: int = 0
+                    while n < array_len(names) is
+                        let pkg_name: string = names[n]
+                        let current_ver: string = state::get_current_version(pkg_name, paths::store_path())
+                        if current_ver != "" is
+                            let idx: int = state::find_index(s.packages, pkg_name, current_ver)
+                            if idx >= 0 is
+                                let info: state::VersionInfo = s.packages[idx]
+                                let git_commit: string = get_git_commit(pkg_name, current_ver)
+                                let mut repo_url: string = repo::get_package_url(rm, pkg_name)
+                                if repo_url == "" is repo_url = "unknown" end
+
+                                let mut dep_names: [string] = []
+                                let mut dep_versions: [string] = []
+                                let mut di: int = 0
+                                while di < array_len(info.depends_on) is
+                                    let parts: [string] = state::split_pkg_ver(info.depends_on[di])
+                                    let dep_name: string = parts[0]
+                                    let mut dep_ver: string = parts[1]
+                                    if dep_ver == "" is dep_ver = state::get_current_version(dep_name, paths::store_path()) end
+                                    if dep_ver != "" is
+                                        dep_names = array_push(dep_names, dep_name)
+                                        dep_versions = array_push(dep_versions, dep_ver)
+                                    end
+                                    di += 1
+                                end
+
+                                lf.entries = array_push(lf.entries, LockEntry {
+                                    name: pkg_name, version: current_ver, git_commit: git_commit, repo_url: repo_url,
+                                    checksum: info.checksum, dep_names: dep_names, dep_versions: dep_versions,
+                                    manually_installed: info.manually_installed, installed_at: info.installed_at,
+                                })
+                                write("  ✔ " + colors::white(pkg_name) + "@" + fmt::red(current_ver))
+                            end
+                        end
+                        n += 1
+                    end
+
+                    let save_r: error::HpmResult<bool> = lock_file_save(lf, lock_path)
+                    if error::is_err(save_r) is return save_r end
+
+                    write("")
+                    write(fmt::red("✔") + " Lock file written: " + colors::white(lock_path))
+                    write("  " + to_string(array_len(lf.entries)) + " packages locked")
+                    write("  Commit to version control to ensure reproducible installs.")
+                    return error::HpmResult::Ok(true)
+                end
+            end
+        end
+    end
+end
+
+fn cmd_check(project: string) -> error::HpmResult<bool> is
+    let lock_path: string = resolve_lock_path(project)
+    let lf_r: error::HpmResult<LockFile> = lock_file_load(lock_path)
+    match lf_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lf) => is
+            let s_r: error::HpmResult<state::State> = state::state_load()
+            match s_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(s) => is
+                    write("→ Checking lock file consistency...")
+                    write("  Lock: " + fmt::dim(lock_path))
+                    write("  Generated: " + time::format(lf.generated_at, "%Y-%m-%d %H:%M") + " UTC by hpm " + fmt::dim(lf.hpm_version))
+                    write("")
+
+                    let diffs: [string] = check_against_state(lf, s)
+                    if array_len(diffs) == 0 is
+                        write(fmt::red("✔") + " Lock file matches installed packages. Reproducible install verified.")
+                        return error::HpmResult::Ok(true)
+                    end
+                    write(fmt::red("✗") + " " + to_string(array_len(diffs)) + " discrepancy(ies) found:\n")
+                    let mut i: int = 0
+                    while i < array_len(diffs) is
+                        write("  " + fmt::red("✗") + " " + diffs[i])
+                        i += 1
+                    end
+                    write("")
+                    write("  Run " + fmt::dim("hpm lock generate") + " to update lock, or " + fmt::dim("hpm lock restore") + " to restore.")
+                    return error::HpmResult::Err(error::HpmError::Manifest("Lock file check failed"))
+                end
+            end
+        end
+    end
+end
+
+fn cmd_status(project: string) -> error::HpmResult<bool> is
+    let lock_path: string = resolve_lock_path(project)
+    if !fs::exists(lock_path) is
+        write("→ No lock file at " + lock_path)
+        write("  Run " + fmt::dim("hpm lock generate") + " to create one.")
+        return error::HpmResult::Ok(true)
+    end
+    let lf_r: error::HpmResult<LockFile> = lock_file_load(lock_path)
+    match lf_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lf) => is
+            let s_r: error::HpmResult<state::State> = state::state_load()
+            match s_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(s) => is
+                    let diffs: [string] = check_against_state(lf, s)
+                    write("→ Lock file: " + colors::white(lock_path))
+                    write("  Lock version : " + to_string(lf.lock_version))
+                    write("  hpm version  : " + fmt::dim(lf.hpm_version))
+                    write("  Generated    : " + time::format(lf.generated_at, "%Y-%m-%d %H:%M") + " UTC")
+                    write("  Packages     : " + to_string(array_len(lf.entries)))
+                    write("")
+                    if array_len(diffs) == 0 is
+                        write(fmt::red("✔") + " In sync with installed packages.")
+                    else is
+                        write("⚠ " + to_string(array_len(diffs)) + " discrepancy(ies):")
+                        let mut i: int = 0
+                        while i < array_len(diffs) is
+                            write("  ⚠ " + diffs[i])
+                            i += 1
+                        end
+                    end
+                    return error::HpmResult::Ok(true)
+                end
+            end
+        end
+    end
+end
+
+fn cmd_diff(project: string) -> error::HpmResult<bool> is
+    let lock_path: string = resolve_lock_path(project)
+    let lf_r: error::HpmResult<LockFile> = lock_file_load(lock_path)
+    match lf_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lf) => is
+            let s_r: error::HpmResult<state::State> = state::state_load()
+            match s_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(s) => is
+                    let diffs: [string] = check_against_state(lf, s)
+                    if array_len(diffs) == 0 is
+                        write(fmt::red("✔") + " No differences — lock matches state.")
+                    else is
+                        write("→ Differences (lock ↔ state):\n")
+                        let mut i: int = 0
+                        while i < array_len(diffs) is
+                            let d: string = diffs[i]
+                            let mut prefix: string = "~"
+                            if string_starts_with(d, "missing") || string_starts_with(d, "checksum") is prefix = "−"
+                            elsif string_starts_with(d, "unlocked") is prefix = "+" end
+                            write("  " + prefix + " " + d)
+                            i += 1
+                        end
+                    end
+                    return error::HpmResult::Ok(true)
+                end
+            end
+        end
+    end
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────
+
+fn get_git_commit(pkg_name: string, version: string) -> string is
+    let repos_dir: string = env::temp_dir() + "/hpm/repos/" + pkg_name
+    if !fs::exists(repos_dir) is return "unknown" end
+
+    let out_file: string = env::temp_dir() + "/hpm-lock-commit-" + to_string(time::now_unix())
+    run_git(repos_dir, "rev-parse \"v" + version + "\" 2>/dev/null || git -C " + shell_q(repos_dir) + " rev-parse \"" + version + "\" 2>/dev/null || git -C " + shell_q(repos_dir) + " rev-parse HEAD", out_file)
+    let mut out: string = "unknown"
+    if fs::exists(out_file) is
+        let content: string = string_trim(fs::read(out_file))
+        if content != "" is out = content end
+        fs::remove(out_file)
+    end
+    return out
+end
+
+fn shell_q(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+fn run_git(repo_path: string, git_args_str: string, out_file: string) is
+    let cmd: string = "git -C " + shell_q(repo_path) + " " + git_args_str + " > " + shell_q(out_file) + " 2>/dev/null"
+    utils::run_command("sh", ["-c", cmd])
+end
+
+fn print_help() is
+    write("\n" + fmt::bold(fmt::red("hpm lock")) + " — Reproducible install lock file\n")
+    write(fmt::bold("Usage:") + "  hpm lock " + fmt::dim("<subcommand>") + " [project_dir]\n")
+    write(colors::bold_underline("Subcommands:"))
+    write("  " + pad(fmt::red("generate"), 20) + " Generate/update hpm.lock from current installs")
+    write("  " + pad(fmt::red("check"), 20) + " Verify state matches lock file (exits 1 if not)")
+    write("  " + pad(fmt::red("status"), 20) + " Show lock file info and sync status")
+    write("  " + pad(fmt::red("diff"), 20) + " Show differences between lock and installed state")
+    write("")
+    write(colors::bold_underline("Files:"))
+    write("  ./hpm.lock                Local lock (when info.hk present in CWD)")
+    write("  /var/lib/hpm/system.lock  Global system lock")
+    write("")
+    write(colors::bold_underline("CI usage:"))
+    write("  " + fmt::dim("hpm lock check  # exits 1 if state diverged from lock"))
+    write("")
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is
+        out = out + " "
+    end
+    return out
+end
