@@ -1,0 +1,636 @@
+mod error
+mod manifest
+mod hooks
+mod utils
+mod sandbox
+mod repo
+mod state
+mod installer
+mod colors
+
+use "std -> fs"   from "fs"
+use "std -> fmt"  from "fmt"
+use "std -> env"  from "env"
+use "std -> time" from "time"
+
+fn hpm_version() -> string is return "1.0.0" end
+
+pub fn dev(args: [string]) -> error::HpmResult<bool> is
+    let subcmd: string = if array_len(args) > 0 then args[0] else "test"
+    if subcmd == "test" is return run_tests(false) end
+    if subcmd == "test-full" is return run_tests(true) end
+    if subcmd == "check-env" is return check_environment() end
+
+    if fs::is_dir(subcmd) is
+        let rest: [string] = utils::array_slice(args, 1, array_len(args))
+        return dev_local(subcmd, rest)
+    end
+
+    write(fmt::red("✗") + " Unknown dev subcommand or path: '" + subcmd + "'")
+    write("  Expected one of: test | test-full | check-env")
+    write("  ...or a path to a local package directory (containing info.hk), e.g.:")
+    write("    hpm dev ./my-package")
+    write("    hpm dev /home/user/packages/firefox run firefox")
+    exit(1)
+    return error::HpmResult::Ok(true)
+end
+
+;; ── hpm dev <path> [run <bin> [args...]] ────────────────────────────
+
+fn dev_local(path_arg: string, rest: [string]) -> error::HpmResult<bool> is
+    if !fs::exists(path_arg) is
+        return error::HpmResult::Err(error::HpmError::Io("Path '" + path_arg + "' does not exist"))
+    end
+    if !fs::is_dir(path_arg) is
+        return error::HpmResult::Err(error::HpmError::InvalidArg("'" + path_arg + "' is not a directory (expected a package directory containing info.hk)"))
+    end
+    let dir: string = path_arg
+
+    if !fs::exists(dir + "/info.hk") is
+        return error::HpmResult::Err(error::HpmError::Manifest(
+            "'" + dir + "' has no info.hk — not a valid hpm package directory.\n" +
+            "  Expected layout: <dir>/info.hk (+ optionally contents/, hooks/, build.toml)"))
+    end
+
+    write("\n" + fmt::bold(fmt::red("hpm dev")) + " " + fmt::dim("— local package test: " + dir) + "\n")
+
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(dir)
+    let mut m: manifest::Manifest = manifest::default_manifest("")
+    match mr is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(loaded) => m = loaded
+    end
+
+    print_manifest_summary(m)
+
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Ok(rm) => is
+            if repo::get_package_url(rm, m.name) != "" is
+                write("  ℹ Note: '" + m.name + "' is ALSO present in the configured repo index — this local directory is used instead for this test run only.")
+            else is
+                write("  ℹ '" + m.name + "' is not in repo-list.json / repo.json — that's expected for local dev testing.")
+            end
+        end
+        HpmResult::Err(_) => is end
+    end
+
+    let arch_r: error::HpmResult<bool> = manifest::check_arch_compatibility(m.arch)
+    if error::is_err(arch_r) is
+        match arch_r is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(_)  => is end
+        end
+    end
+
+    let warnings: [string] = hooks::validate_hooks(dir)
+    if array_len(warnings) == 0 is
+        write("  " + fmt::red("✔") + " No hook validation warnings")
+    else is
+        write("  ⚠ Hook validation warnings:")
+        let mut wi: int = 0
+        while wi < array_len(warnings) is write("      - " + warnings[wi]) wi += 1 end
+    end
+
+    let contents_dir: string = dir + "/contents"
+    if !fs::exists(contents_dir) is
+        let cfg: repo::BuildConfig = repo::fetch_raw_build_config("") ;; nieużywane bezpośrednio z sieci lokalnie — patrz installer::run_build_config_local
+        let build_toml_path: string = dir + "/build.toml"
+        if fs::exists(build_toml_path) is
+            write("  → Found build.toml — running BuildConfig pipeline...")
+            let local_cfg: repo::BuildConfig = repo::parse_build_config(fs::read(build_toml_path))
+            let br: error::HpmResult<bool> = installer::run_build_config(local_cfg, dir, m.version, m, m.name)
+            if error::is_err(br) is
+                match br is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end
+            end
+        elsif array_len(m.build.commands) > 0 || fs::exists(dir + "/build.info") is
+            write("  → No contents/ yet — running [build] commands in sandbox...")
+            let br2: error::HpmResult<bool> = installer::run_classic_build(dir, m)
+            if error::is_err(br2) is
+                match br2 is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end
+            end
+        else is
+            return error::HpmResult::Err(error::HpmError::Manifest(
+                "No 'contents/' directory, no build.toml, and no [build] commands in info.hk — nothing to test.\n" +
+                "  Either provide a pre-built contents/, or add a build step (same as a real package needs for 'hpm install')."))
+        end
+        if !fs::exists(contents_dir) is
+            return error::HpmResult::Err(error::HpmError::Manifest("Build finished but 'contents/' is still missing — check build.toml / [build] in info.hk"))
+        end
+        write("  " + fmt::red("✔") + " Build finished")
+    else is
+        write("  " + fmt::red("✔") + " contents/ already present — skipping build step")
+    end
+
+    installer::make_all_binaries_executable(dir, m)
+
+    let fake_store_path: string = "(dev) " + dir
+    let ctx: hooks::HookContext = hooks::HookContext { pkg_name: m.name, pkg_version: m.version, store_path: fake_store_path, old_version: "" }
+    if hooks::hook_exists(dir, hooks::HookKind::PreInstall) is
+        let hr: error::HpmResult<bool> = hooks::run_hook(dir, hooks::HookKind::PreInstall, ctx, m)
+        if error::is_err(hr) is match hr is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+    end
+    if hooks::hook_exists(dir, hooks::HookKind::PostInstall) is
+        let hr2: error::HpmResult<bool> = hooks::run_hook(dir, hooks::HookKind::PostInstall, ctx, m)
+        if error::is_err(hr2) is match hr2 is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+    end
+
+    if array_len(m.bins) == 0 is
+        write("\n  ℹ Package declares no [metadata] bins — nothing to run.")
+    else is
+        write("\n  → Binaries declared:")
+        let mut bi: int = 0
+        while bi < array_len(m.bins) is
+            let b: string = m.bins[bi]
+            let rel: string = installer::find_binary_in_dir(dir, b)
+            if rel != "" is write("    " + fmt::red("✔") + " " + b + " → " + fmt::dim(rel))
+            else is write("    " + fmt::red("✗") + " " + b + " — NOT FOUND in contents/") end
+            bi += 1
+        end
+        write("\n  Try it: hpm dev " + path_arg + " run <bin> [args...]")
+    end
+
+    if array_len(rest) > 0 is
+        let sub: string = rest[0]
+        if sub == "run" is
+            if array_len(rest) < 2 is
+                return error::HpmResult::Err(error::HpmError::InvalidArg("Usage: hpm dev " + path_arg + " run <bin> [args...]"))
+            end
+            let bin: string = rest[1]
+            let extra_args: [string] = utils::array_slice(rest, 2, array_len(rest))
+            let bin_rel: string = installer::find_binary_in_dir(dir, bin)
+            if bin_rel == "" is
+                return error::HpmResult::Err(error::HpmError::Manifest("Binary '" + bin + "' not found in '" + dir + "'"))
+            end
+            write("\n  → Running '" + bin + "' via sandbox...\n")
+            sandbox::setup_sandbox(dir, m, false, bin_rel, extra_args)
+        else is
+            write("  ⚠ Unknown 'hpm dev " + path_arg + " " + sub + "' — did you mean: run <bin> [args...]?")
+        end
+    end
+
+    write("\n" + fmt::bold(fmt::red("✔")) + " Local dev test finished for '" + m.name + "@" + m.version + "'.")
+    return error::HpmResult::Ok(true)
+end
+
+fn print_manifest_summary(m: manifest::Manifest) is
+    write("  " + pad("Name:", 12) + " " + colors::white(m.name))
+    write("  " + pad("Version:", 12) + " " + m.version)
+    write("  " + pad("Authors:", 12) + " " + (if m.authors == "" then "-" else m.authors))
+    write("  " + pad("License:", 12) + " " + (if m.license == "" then "-" else m.license))
+    write("  " + pad("Arch:", 12) + " " + (if m.arch == "" then "any" else m.arch))
+    if array_len(m.tags) > 0 is write("  " + pad("Tags:", 12) + " " + fmt::dim(m.tags.join(", "))) end
+    write("  " + pad("Sandbox:", 12) + " network=" + to_string(m.sandbox.network) + " gui=" + to_string(m.sandbox.gui) +
+        " full_gui=" + to_string(m.sandbox.full_gui) + " disabled=" + to_string(m.sandbox_disabled) +
+        " filesystem=" + m.sandbox.filesystem.join(","))
+    write("  " + pad("Hooks:", 12) + " " + (if m.has_hooks then fmt::red("yes") else fmt::dim("no")))
+    write("")
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is out = out + " " end
+    return out
+end
+
+;; ── check-env ────────────────────────────────────────────────────────
+
+fn check_environment() -> error::HpmResult<bool> is
+    write("→ Checking hpm development environment...\n")
+
+    let cmds: [string] = ["git", "tar", "hl", "zstd", "gpg", "bpftrace", "valac", "meson", "cargo"]
+    let descs: [string] = ["Git", "tar", "Hacker Lang (hl)", "zstd", "GPG", "bpftrace (eBPF tracing)", "Vala compiler", "Meson build system", "Rust/Cargo"]
+    let required: [bool] = [true, true, false, false, false, false, false, false, false]
+
+    let mut all_ok: bool = true
+    let mut i: int = 0
+    while i < array_len(cmds) is
+        let found: bool = utils::command_exists(cmds[i])
+        if found is
+            write("  " + fmt::red("✔") + " " + pad(descs[i], 35) + " " + fmt::dim("(found)"))
+        elsif required[i] is
+            write("  " + fmt::red("✗") + " " + pad(descs[i], 35) + " MISSING (required)")
+            all_ok = false
+        else is
+            write("  ○ " + pad(descs[i], 35) + " not found (optional)")
+        end
+        i += 1
+    end
+
+    write("")
+    write(fmt::bold("Kernel features:"))
+    check_kf("User namespaces", "/proc/sys/user/max_user_namespaces", "0")
+    check_kf("Landlock LSM", "/proc/sys/kernel/landlock/abi", "")
+    check_kf("eBPF JIT", "/proc/sys/net/core/bpf_jit_enable", "0")
+    write("")
+    if all_ok is write(fmt::red("✔") + " Environment ready.")
+    else is write(fmt::red("✗") + " Some required tools missing.") end
+    return error::HpmResult::Ok(true)
+end
+
+fn check_kf(name: string, path: string, bad_value: string) is
+    if fs::exists(path) is
+        let val: string = string_trim(fs::read(path))
+        if val == bad_value is write("  ⚠ " + pad(name, 30) + " " + fmt::red(val) + " (disabled)")
+        else is write("  " + fmt::red("✔") + " " + pad(name, 30) + " " + fmt::dim(val)) end
+    else is
+        write("  ○ " + pad(name, 30) + " not available")
+    end
+end
+
+;; ── Test suite ───────────────────────────────────────────────────────
+
+struct TestSuite is
+    pub passed:  [string]
+    pub failed_names: [string]
+    pub failed_reasons: [string]
+    pub skipped: [string]
+end
+
+fn suite_new() -> TestSuite is
+    return TestSuite { passed: [], failed_names: [], failed_reasons: [], skipped: [] }
+end
+
+fn print_summary(s: TestSuite) is
+    let total: int = array_len(s.passed) + array_len(s.failed_names) + array_len(s.skipped)
+    write("")
+    write(fmt::dim(string_repeat("─", 60)))
+    write(fmt::bold("Test Results:"))
+    write("  " + fmt::red("✔") + " Passed:  " + to_string(array_len(s.passed)))
+    write("  " + fmt::red("✗") + " Failed:  " + to_string(array_len(s.failed_names)))
+    write("  ○ Skipped: " + to_string(array_len(s.skipped)))
+    write("  Total:    " + to_string(total))
+    if array_len(s.failed_names) > 0 is
+        write("")
+        write(fmt::bold(fmt::red("Failed tests:")))
+        let mut i: int = 0
+        while i < array_len(s.failed_names) is
+            write("  " + fmt::red("✗") + " " + s.failed_names[i] + " — " + s.failed_reasons[i])
+            i += 1
+        end
+    end
+    write("")
+    if array_len(s.failed_names) == 0 is write(fmt::bold(fmt::red("✔")) + " All tests passed!")
+    else is write(fmt::bold(fmt::red("✗")) + " " + to_string(array_len(s.failed_names)) + " test(s) failed.") end
+end
+
+fn string_repeat(c: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is out = out + c i += 1 end
+    return out
+end
+
+;; Każdy test zwraca "" przy sukcesie, albo komunikat błędu.
+fn run_one(s: TestSuite, id: string, result: string) -> TestSuite is
+    if result == "" is
+        write("  … " + pad(id, 48) + " " + fmt::bold(fmt::red("OK")))
+        return TestSuite { passed: array_push(s.passed, id), failed_names: s.failed_names, failed_reasons: s.failed_reasons, skipped: s.skipped }
+    end
+    write("  … " + pad(id, 48) + " " + fmt::bold(fmt::red("FAIL")))
+    write("    " + fmt::red(result))
+    return TestSuite { passed: s.passed, failed_names: array_push(s.failed_names, id), failed_reasons: array_push(s.failed_reasons, result), skipped: s.skipped }
+end
+
+fn run_tests(full: bool) -> error::HpmResult<bool> is
+    write("\n" + fmt::bold(fmt::red("hpm dev test")) + " — Integration Test Suite\n")
+    write("  hpm version : " + colors::white(hpm_version()))
+    write("  full mode   : " + (if full then fmt::red("yes") else fmt::dim("no (quick)")))
+    write("")
+
+    let root: string = env::temp_dir() + "/hpm-dev-test-" + to_string(time::now_unix())
+    utils::mkdir_all(root)
+    write("→ Test environment: " + fmt::dim(root) + "\n")
+
+    let mut s: TestSuite = suite_new()
+
+    s = run_one(s, "manifest-parse", test_manifest_parse(root))
+    s = run_one(s, "manifest-invalid", test_manifest_invalid(root))
+    s = run_one(s, "version-compare", test_version_compare())
+    s = run_one(s, "version-satisfies", test_version_satisfies())
+    s = run_one(s, "compute-hash", test_compute_hash(root))
+    s = run_one(s, "state-conflict", test_state_conflict())
+    s = run_one(s, "wrapper-names-persist", test_wrapper_names())
+    s = run_one(s, "hooks-validate-hl", test_hooks_validate_hl(root))
+    s = run_one(s, "hooks-hl-syntax", test_hooks_hl_syntax(root))
+    s = run_one(s, "hooks-pre-install", test_hooks_pre_install(root))
+    s = run_one(s, "hooks-post-install", test_hooks_post_install(root))
+    s = run_one(s, "hooks-fail-blocks-install", test_hooks_fail_blocks(root))
+    s = run_one(s, "diff-manifests", test_diff_manifests(root))
+    s = run_one(s, "arch-check", test_arch_check())
+    s = run_one(s, "tag-grouping", test_tag_grouping())
+    s = run_one(s, "url-validation", test_url_validation())
+    s = run_one(s, "wrapper-atomic-write", test_wrapper_atomic(root))
+    s = run_one(s, "search-offline-fallback", test_search_offline())
+
+    if full is
+        s = run_one(s, "solver-picks-older-version-to-avoid-conflict", test_solver_conflict_resolution())
+        s = run_one(s, "solver-fails-clearly-when-unsatisfiable", test_solver_unsatisfiable())
+    else is
+        s = TestSuite { passed: s.passed, failed_names: s.failed_names, failed_reasons: s.failed_reasons,
+            skipped: array_push(array_push(s.skipped, "solver-picks-older-version-to-avoid-conflict"), "solver-fails-clearly-when-unsatisfiable") }
+    end
+
+    write("")
+    write("→ Cleaning up test environment... " + fmt::red("done"))
+    fs::rmdir_all(root)
+    print_summary(s)
+    if array_len(s.failed_names) > 0 is exit(1) end
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Testy indywidualne (zwracają "" = sukces, string = powód błędu) ────
+
+fn make_pkg_dir(root: string, name: string, version: string, extra: string) -> string is
+    let dir: string = root + "/pkg-" + name + "-" + version
+    utils::mkdir_all(dir + "/contents/bin")
+    let info: string = "[metadata]\n-> name => " + name + "\n-> version => " + version + "\n-> authors => Test\n-> license => MIT\n" + extra +
+        "\n[description]\n-> summary => Test package " + name + "\n" +
+        "[sandbox]\n-> network => false\n-> gui => false\n-> full_gui => false\n-> dev => false\n-> disabled => false\n-> filesystem => []\n"
+    fs::write(dir + "/info.hk", info)
+    let bin: string = dir + "/contents/bin/" + name
+    fs::write(bin, "#!/usr/bin/env hl\n~> hello from " + name + " " + version + "\n")
+    utils::make_executable(bin)
+    return dir
+end
+
+fn test_manifest_parse(root: string) -> string is
+    let dir: string = make_pkg_dir(root, "test-parse", "1.0.0", "-> bins.test-parse => \"bin/test-parse\"\n")
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(dir)
+    match mr is
+        HpmResult::Err(e) => return "load failed: " + error::message(e)
+        HpmResult::Ok(m) => is
+            if m.name != "test-parse" is return "expected name test-parse, got " + m.name end
+            if m.version != "1.0.0" is return "expected version 1.0.0, got " + m.version end
+            if !array_has(m.bins, "test-parse") is return "expected bins to contain test-parse" end
+            return ""
+        end
+    end
+end
+
+fn array_has(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is if arr[i] == target is return true end i += 1 end
+    return false
+end
+
+fn test_manifest_invalid(root: string) -> string is
+    let dir: string = root + "/pkg-invalid"
+    utils::mkdir_all(dir)
+    fs::write(dir + "/info.hk", "[metadata]\n-> name => \n-> version => \n")
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(dir)
+    match mr is
+        HpmResult::Err(_) => return ""
+        HpmResult::Ok(m)  => is if m.name == "" is return "" end return "expected failure for empty name" end
+    end
+end
+
+fn test_version_compare() -> string is
+    if utils::compare_versions("1.2.0", "1.1.9") <= 0 is return "1.2.0 should be > 1.1.9" end
+    if utils::compare_versions("1.0.0", "1.0.0") != 0 is return "1.0.0 should equal 1.0.0" end
+    if utils::compare_versions("0.9.9", "1.0.0") >= 0 is return "0.9.9 should be < 1.0.0" end
+    if utils::compare_versions("2.0.0", "1.99.99") <= 0 is return "2.0.0 should be > 1.99.99" end
+    return ""
+end
+
+fn test_version_satisfies() -> string is
+    if !utils::satisfies("1.2.0", ">=1.0") is return "1.2.0 should satisfy >=1.0" end
+    if !utils::satisfies("1.0.0", ">=1.0.0") is return "1.0.0 should satisfy >=1.0.0" end
+    if utils::satisfies("0.9.0", ">=1.0") is return "0.9.0 should not satisfy >=1.0" end
+    if !utils::satisfies("1.5.0", ">1.4") is return "1.5.0 should satisfy >1.4" end
+    if !utils::satisfies("2.0.0", "=2.0.0") is return "2.0.0 should satisfy =2.0.0" end
+    if utils::satisfies("2.0.1", "=2.0.0") is return "2.0.1 should not satisfy =2.0.0" end
+    if !utils::satisfies("1.0.0", "") is return "empty req should always satisfy" end
+    return ""
+end
+
+fn test_compute_hash(root: string) -> string is
+    let dir: string = root + "/hash-test"
+    utils::mkdir_all(dir)
+    fs::write(dir + "/a.txt", "hello")
+    fs::write(dir + "/b.txt", "world")
+    let h1r: error::HpmResult<string> = utils::compute_dir_hash(dir)
+    let h2r: error::HpmResult<string> = utils::compute_dir_hash(dir)
+    let h1: string = unwrap_or_empty(h1r)
+    let h2: string = unwrap_or_empty(h2r)
+    if h1 != h2 is return "hash must be deterministic" end
+    fs::write(dir + "/a.txt", "changed")
+    let h3: string = unwrap_or_empty(utils::compute_dir_hash(dir))
+    if h1 == h3 is return "hash must change after modification" end
+    return ""
+end
+
+fn unwrap_or_empty(r: error::HpmResult<string>) -> string is
+    match r is
+        HpmResult::Ok(v)  => return v
+        HpmResult::Err(_) => return ""
+    end
+end
+
+fn test_state_conflict() -> string is
+    let mut info: state::VersionInfo = state::version_info_new("installed-pkg", "1.0.0", "hash1", true)
+    info.conflicts_with = ["new-pkg"]
+    let s: state::State = state::State { packages: [info], history: [] }
+    let conflicts: [string] = state::check_conflicts(s, "new-pkg", [])
+    if array_len(conflicts) == 0 is return "expected conflicts, got none" end
+    if !string_contains(conflicts[0], "new-pkg") is return "expected conflict message to mention new-pkg" end
+    return ""
+end
+
+fn test_wrapper_names() -> string is
+    let mut wn: state::WrapperNames = state::wrapper_names_new()
+    ;; nie wołamy `wn_set` (persystuje do bazy) — tylko czysta logika w pamięci
+    if state::wn_has(wn, "mypkg", "mybin") is return "should not have entry yet" end
+    wn.keys = array_push(wn.keys, state::wn_key("mypkg", "mybin"))
+    wn.vals = array_push(wn.vals, "mypkg-mybin")
+    if state::wn_get(wn, "mypkg", "mybin") != "mypkg-mybin" is return "expected mypkg-mybin" end
+    if state::wn_get(wn, "mypkg", "other") != "" is return "expected empty for unknown bin" end
+    wn = state::wn_remove_pkg(wn, "mypkg")
+    if state::wn_has(wn, "mypkg", "mybin") is return "expected entry removed" end
+    return ""
+end
+
+fn test_hooks_validate_hl(root: string) -> string is
+    let dir: string = root + "/hooks-validate-test"
+    utils::mkdir_all(dir + "/hooks")
+    fs::write(dir + "/hooks/post-install.hl", "~> done")
+    let warnings: [string] = hooks::validate_hooks(dir)
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(warnings) is if string_contains(warnings[i], "shebang") is found = true end i += 1 end
+    if !found is return "should warn about missing shebang" end
+    return ""
+end
+
+fn test_hooks_hl_syntax(root: string) -> string is
+    let dir: string = root + "/hooks-hl-syntax-test"
+    utils::mkdir_all(dir + "/hooks")
+    let content: string = "#!/usr/bin/env hl\nusing <gen 2>\n\n~> Installing\n"
+    fs::write(dir + "/hooks/pre-install.hl", content)
+    utils::make_executable(dir + "/hooks/pre-install.hl")
+    if !string_starts_with(content, "#!/usr/bin/env hl") is return "hook should have hl shebang" end
+    if !string_contains(content, "using <gen 2>") is return "hook should declare gen 2" end
+    let warnings: [string] = hooks::validate_hooks(dir)
+    let mut i: int = 0
+    while i < array_len(warnings) is
+        if string_contains(warnings[i], "shebang") is return "valid .hl hook should not warn about shebang" end
+        i += 1
+    end
+    return ""
+end
+
+fn test_hooks_pre_install(root: string) -> string is
+    let dir: string = root + "/hooks-pre-test"
+    let sentinel: string = root + "/hook-ran"
+    utils::mkdir_all(dir + "/hooks")
+    fs::write(dir + "/hooks/pre-install.hl", "#!/bin/sh\ntouch " + sentinel + "\n")
+    utils::make_executable(dir + "/hooks/pre-install.hl")
+    let ctx: hooks::HookContext = hooks::HookContext { pkg_name: "test-hook", pkg_version: "1.0.0", store_path: root + "/store", old_version: "" }
+    let r: error::HpmResult<bool> = hooks::run_hook(dir, hooks::HookKind::PreInstall, ctx, manifest::default_manifest("test-hook"))
+    match r is
+        HpmResult::Ok(ran) => is if !ran is return "hook should have run" end return "" end
+        HpmResult::Err(e)  => return "hook failed: " + error::message(e)
+    end
+end
+
+fn test_hooks_post_install(root: string) -> string is
+    let dir: string = root + "/hooks-post-test"
+    utils::mkdir_all(dir + "/hooks")
+    fs::write(dir + "/hooks/post-install.hl", "#!/bin/sh\necho post-install hook ran\n")
+    utils::make_executable(dir + "/hooks/post-install.hl")
+    let ctx: hooks::HookContext = hooks::HookContext { pkg_name: "post-hook-pkg", pkg_version: "2.0.0", store_path: root + "/store", old_version: "" }
+    let r: error::HpmResult<bool> = hooks::run_hook(dir, hooks::HookKind::PostInstall, ctx, manifest::default_manifest("post-hook-pkg"))
+    match r is
+        HpmResult::Ok(_)  => return ""
+        HpmResult::Err(e) => return "hook failed: " + error::message(e)
+    end
+end
+
+fn test_hooks_fail_blocks(root: string) -> string is
+    let dir: string = root + "/hooks-fail-test"
+    utils::mkdir_all(dir + "/hooks")
+    fs::write(dir + "/hooks/pre-install.hl", "#!/bin/sh\necho 'Refusing'\nexit 1\n")
+    utils::make_executable(dir + "/hooks/pre-install.hl")
+    let ctx: hooks::HookContext = hooks::HookContext { pkg_name: "bad-hook-pkg", pkg_version: "1.0.0", store_path: root + "/store", old_version: "" }
+    let r: error::HpmResult<bool> = hooks::run_hook(dir, hooks::HookKind::PreInstall, ctx, manifest::default_manifest("bad-hook-pkg"))
+    match r is
+        HpmResult::Err(_) => return ""
+        HpmResult::Ok(_)  => return "pre-install hook failure should have blocked install"
+    end
+end
+
+fn test_diff_manifests(root: string) -> string is
+    let dir1: string = make_pkg_dir(root, "diff-pkg", "1.0.0", "")
+    let dir2: string = root + "/diff-pkg-2.0.0"
+    utils::mkdir_all(dir2)
+    fs::write(dir2 + "/info.hk", "[metadata]\n-> name => diff-pkg\n-> version => 2.0.0\n-> authors => New\n-> license => MIT\n" +
+        "\n[description]\n-> summary => Changed\n" +
+        "[sandbox]\n-> network => true\n-> gui => false\n-> full_gui => false\n-> dev => false\n-> disabled => false\n-> filesystem => []\n")
+    let m1r: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(dir1)
+    let m2r: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(dir2)
+    match m1r is
+        HpmResult::Err(e) => return "m1 failed: " + error::message(e)
+        HpmResult::Ok(m1) => is
+            match m2r is
+                HpmResult::Err(e) => return "m2 failed: " + error::message(e)
+                HpmResult::Ok(m2) => is
+                    if m1.version == m2.version is return "versions should differ" end
+                    if m1.sandbox.network == m2.sandbox.network is return "sandbox.network should differ" end
+                    return ""
+                end
+            end
+        end
+    end
+end
+
+fn test_arch_check() -> string is
+    let r1: error::HpmResult<bool> = manifest::check_arch_compatibility("any")
+    if error::is_err(r1) is return "arch 'any' should always pass" end
+    let r2: error::HpmResult<bool> = manifest::check_arch_compatibility("")
+    if error::is_err(r2) is return "empty arch should always pass" end
+    return ""
+end
+
+fn test_tag_grouping() -> string is
+    let idx: repo::RepoIndex = repo::RepoIndex { names: ["gcc", "make", "firefox"], urls: ["https://github.com/test/gcc", "https://github.com/test/make", "https://github.com/test/firefox"] }
+    if repo::index_len(idx) != 3 is return "expected 3 packages" end
+    if repo::index_url_of(idx, "gcc") == "" is return "expected gcc to have a url" end
+    if repo::index_url_of(idx, "nonexistent") != "" is return "expected empty url for nonexistent" end
+    return ""
+end
+
+fn test_url_validation() -> string is
+    if error::is_err(repo::validate_repo_url("https://github.com/user/repo")) is return "https github url should be valid" end
+    if error::is_err(repo::validate_repo_url("http://github.com/user/repo")) is return "http github url should be valid" end
+    if error::is_err(repo::validate_repo_url("ssh://git@github.com/user/repo")) is return "ssh url should be valid" end
+    if error::is_err(repo::validate_repo_url("git@github.com:user/repo.git")) is return "git@ url should be valid" end
+    if !error::is_err(repo::validate_repo_url("file:///etc/passwd")) is return "file:// should be rejected" end
+    if !error::is_err(repo::validate_repo_url("https://localhost/repo")) is return "localhost should be rejected" end
+    if !error::is_err(repo::validate_repo_url("")) is return "empty should be rejected" end
+    if !error::is_err(repo::validate_repo_url("https://github.com/../etc/passwd")) is return "path traversal should be rejected" end
+    if !error::is_err(repo::validate_repo_url("ftp://example.com/repo")) is return "ftp should be rejected" end
+    return ""
+end
+
+fn test_wrapper_atomic(root: string) -> string is
+    let wrapper_dir: string = root + "/usr_bin"
+    utils::mkdir_all(wrapper_dir)
+    let wrapper_path: string = wrapper_dir + "/test-wrapper"
+    let tmp_path: string = wrapper_dir + "/test-wrapper.hpm.tmp"
+    let content: string = "#!/bin/sh\nexec hpm run test-pkg bin/test\n"
+    fs::write(tmp_path, content)
+    fs::rename(tmp_path, wrapper_path)
+    if !fs::exists(wrapper_path) is return "wrapper should exist" end
+    if fs::exists(tmp_path) is return "tmp should not exist after rename" end
+    if fs::read(wrapper_path) != content is return "content mismatch after rename" end
+    return ""
+end
+
+fn test_search_offline() -> string is
+    let meta: repo::PackageMeta = repo::PackageMeta { name: "offline-test-pkg", version: "1.0.0", summary: "Test offline search",
+        authors: "Test", license: "MIT", tags: ["test"], available_versions: ["1.0.0"], fetched_at: 0 }
+    if meta.name != "offline-test-pkg" is return "name mismatch" end
+    if array_len(meta.tags) == 0 is return "expected non-empty tags" end
+    return ""
+end
+
+fn test_solver_conflict_resolution() -> string is
+    let pkg_a_v2: manifest::Manifest = with_conflicts(manifest::default_manifest("pkg-a"), ["pkg-b"])
+    let pkg_a_v1: manifest::Manifest = manifest::default_manifest("pkg-a")
+    let pkg_b_v1: manifest::Manifest = manifest::default_manifest("pkg-b")
+
+    let candidates: [installer::PkgCandidates] = [
+        installer::PkgCandidates { name: "pkg-a", versions: ["2.0.0", "1.0.0"], manifests: [pkg_a_v2, pkg_a_v1] },
+        installer::PkgCandidates { name: "pkg-b", versions: ["1.0.0"], manifests: [pkg_b_v1] },
+    ]
+    let order: [string] = ["pkg-a", "pkg-b"]
+    let s: state::State = state::state_new()
+    let result: installer::SolveResult = installer::backtrack_solve(order, 0, candidates, s, [], 2000)
+
+    if !result.solved is return "solver should find a conflict-free combination" end
+    let a_ver: string = installer::assignment_version_of(result.assignment, "pkg-a")
+    if a_ver != "1.0.0" is return "solver should have backed off pkg-a to 1.0.0 to avoid the conflict, got " + a_ver end
+    let b_ver: string = installer::assignment_version_of(result.assignment, "pkg-b")
+    if b_ver != "1.0.0" is return "expected pkg-b@1.0.0, got " + b_ver end
+    return ""
+end
+
+fn test_solver_unsatisfiable() -> string is
+    let pkg_a: manifest::Manifest = with_conflicts(manifest::default_manifest("pkg-a"), ["pkg-b"])
+    let pkg_b: manifest::Manifest = manifest::default_manifest("pkg-b")
+    let candidates: [installer::PkgCandidates] = [
+        installer::PkgCandidates { name: "pkg-a", versions: ["1.0.0"], manifests: [pkg_a] },
+        installer::PkgCandidates { name: "pkg-b", versions: ["1.0.0"], manifests: [pkg_b] },
+    ]
+    let order: [string] = ["pkg-a", "pkg-b"]
+    let s: state::State = state::state_new()
+    let result: installer::SolveResult = installer::backtrack_solve(order, 0, candidates, s, [], 2000)
+    if result.solved is return "solver must report failure, not silently pick a conflicting combination" end
+    return ""
+end
+
+fn with_conflicts(m: manifest::Manifest, conflicts: [string]) -> manifest::Manifest is
+    let mut m2: manifest::Manifest = m
+    m2.conflicts = conflicts
+    return m2
+end
