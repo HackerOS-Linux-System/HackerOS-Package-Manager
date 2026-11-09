@@ -1,0 +1,44 @@
+mod error
+mod repo
+mod colors
+
+use "std -> fmt" from "fmt"
+
+fn hpm_version() -> string is return "1.0.0" end
+fn hpm_owner() -> string is return "HackerOS-Linux-System" end
+fn hpm_repo() -> string is return "HackerOS-Package-Manager" end
+
+pub fn upgrade() -> error::HpmResult<bool> is
+    write("→ Checking for hpm updates...")
+    write("  Current version: " + colors::white(hpm_version()))
+
+    let rel_r: error::HpmResult<repo::GithubRelease> = repo::fetch_github_release(hpm_owner(), hpm_repo(), "")
+    match rel_r is
+        HpmResult::Err(e) => is
+            write("  ⚠ Could not check GitHub Releases: " + error::message(e))
+            write("  → You can still update manually:")
+            write("      git -C <hpm source dir> pull && hpm build && hpm install hpm --release")
+            return error::HpmResult::Ok(true)
+        end
+        HpmResult::Ok(release) => is
+            let latest: string = if string_starts_with(release.tag_name, "v")
+                then string_slice(release.tag_name, 1, string_len(release.tag_name))
+                else release.tag_name
+
+            if latest == hpm_version() is
+                write(fmt::red("✔") + " hpm is already up to date (" + colors::white(hpm_version()) + ").")
+                return error::HpmResult::Ok(true)
+            end
+
+            write("  " + fmt::bold("New version available:") + " " + fmt::red(latest))
+            write("")
+            write("  To upgrade:")
+            write("    " + colors::white("hpm install hpm@" + latest))
+            write("  or, if hpm publishes signed .hpm release assets:")
+            write("    " + colors::white("hpm install hpm@" + latest + " --release --require-signed"))
+            write("")
+            write("  Release notes: https://github.com/" + hpm_owner() + "/" + hpm_repo() + "/releases/tag/" + release.tag_name)
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
