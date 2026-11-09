@@ -1,0 +1,238 @@
+mod colors
+mod error
+mod state
+mod utils
+mod paths
+mod squash
+mod manifest
+
+use "std -> fs"   from "fs"
+use "std -> fmt"  from "fmt"
+use "std -> env"  from "env"
+use "std -> time" from "time"
+
+pub fn verify(package: string) -> error::HpmResult<bool> is
+    if package == "" is
+        write(fmt::red("✗") + " Usage: hpm verify <package>")
+        exit(1)
+    end
+
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            let current_ver: string = state::get_current_version(package, paths::store_path())
+            if current_ver == "" is
+                return error::HpmResult::Err(error::HpmError::Manifest("Package '" + package + "' not installed"))
+            end
+            let idx: int = state::find_index(s.packages, package, current_ver)
+            if idx < 0 is
+                return error::HpmResult::Err(error::HpmError::Manifest("No checksum in state for " + package + "@" + current_ver))
+            end
+            let expected: string = s.packages[idx].checksum
+
+            let pkg_path: string = paths::store_path() + package + "/" + current_ver
+            let mount_r: error::HpmResult<bool> = squash::ensure_mounted(pkg_path)
+            if error::is_err(mount_r) is return mount_r end
+
+            write("→ Verifying " + colors::white(package) + "@" + fmt::red(current_ver) + "...\n")
+
+            ;; 1. SHA-256
+            write("  " + pad(fmt::bold("Content hash (SHA-256):"), 40))
+            let hash_r: error::HpmResult<string> = utils::compute_dir_hash(pkg_path)
+            match hash_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(computed) => is
+                    if computed == expected is
+                        write(fmt::red("OK"))
+                        let short_len: int = if string_len(computed) < 32 then string_len(computed) else 32
+                        write("    " + fmt::dim(string_slice(computed, 0, short_len)))
+                    else is
+                        write(fmt::bold(fmt::red("MISMATCH")))
+                        let el: int = if string_len(expected) < 16 then string_len(expected) else 16
+                        let cl: int = if string_len(computed) < 16 then string_len(computed) else 16
+                        write("    stored:   " + fmt::red(string_slice(expected, 0, el)))
+                        write("    computed: " + fmt::red(string_slice(computed, 0, cl)))
+                        return error::HpmResult::Err(error::HpmError::Manifest(
+                            "Content checksum verification failed for " + package + "@" + current_ver))
+                    end
+                end
+            end
+
+            ;; 2. Podpis GPG
+            let info_hk: string = pkg_path + "/info.hk"
+            let info_hk_sig: string = pkg_path + "/info.hk.sig"
+
+            write("  " + pad(fmt::bold("GPG signature (info.hk.sig):"), 40))
+            if !fs::exists(info_hk_sig) is
+                write(fmt::dim("NOT PRESENT"))
+                write("    " + fmt::dim("⚠") + " Package is not GPG-signed.")
+                write("    " + fmt::dim("→ For security, prefer signed packages."))
+            elsif !fs::exists(info_hk) is
+                write(fmt::red("ERROR"))
+                return error::HpmResult::Err(error::HpmError::Manifest("info.hk missing from store — cannot verify signature"))
+            else is
+                let sig_r: error::HpmResult<string> = verify_gpg_signature(info_hk, info_hk_sig)
+                match sig_r is
+                    HpmResult::Ok(signer) => is
+                        write(fmt::red("OK"))
+                        write("    Signed by: " + colors::white(signer))
+                    end
+                    HpmResult::Err(e) => is
+                        write(fmt::bold(fmt::red("FAILED")))
+                        write("    " + error::message(e))
+                        return error::HpmResult::Err(error::HpmError::Sandbox("GPG signature verification failed"))
+                    end
+                end
+            end
+
+            ;; 3. Manifest czytelny
+            write("  " + pad(fmt::bold("Manifest (info.hk) readable:"), 40))
+            let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(pkg_path)
+            match mr is
+                HpmResult::Ok(m) => is
+                    write(fmt::red("OK"))
+                    write("    name=" + colors::white(m.name) + " version=" + fmt::red(m.version))
+                end
+                HpmResult::Err(e) => is
+                    write(fmt::red("ERROR"))
+                    write("    " + error::message(e))
+                end
+            end
+
+            write("")
+            write(fmt::red("✔") + " Verification passed for " + colors::white(package) + "@" + fmt::red(current_ver))
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is
+        out = out + " "
+    end
+    return out
+end
+
+;; ── GPG przez CLI (status protocol) ────────────────────────────────────
+
+fn run_capture(cmd: string) -> string is
+    let out_file: string = env::temp_dir() + "/hpm-gpg-out-" + to_string(time::now_unix())
+    utils::run_command("sh", ["-c", cmd + " > " + shell_quote(out_file) + " 2>&1"])
+    let mut out: string = ""
+    if fs::exists(out_file) is
+        out = fs::read(out_file)
+        fs::remove(out_file)
+    end
+    return out
+end
+
+fn shell_quote(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+pub fn verify_gpg_signature(data_file: string, sig_file: string) -> error::HpmResult<string> is
+    if !utils::command_exists("/usr/bin/gpg") && !command_exists_path("gpg") is
+        return error::HpmResult::Err(error::HpmError::Sandbox("gpg is not installed — cannot verify signatures"))
+    end
+
+    let cmd: string = "gpg --status-fd 1 --verify " + shell_quote(sig_file) + " " + shell_quote(data_file)
+    let output: string = run_capture(cmd)
+    let lines: [string] = string_split(output, "\n")
+
+    let mut fingerprint: string = "unknown fingerprint"
+    let mut has_good: bool = false
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = lines[i]
+
+        if string_contains(l, "[GNUPG:] REVKEYSIG") is
+            let fp: string = extract_last_field(l)
+            return error::HpmResult::Err(error::HpmError::Sandbox(
+                "Signing key " + fp + " has been REVOKED by its owner.\n" +
+                "    This usually means the key was compromised or retired — do not trust this package."))
+        end
+        if string_contains(l, "[GNUPG:] EXPKEYSIG") is
+            let fp: string = extract_last_field(l)
+            return error::HpmResult::Err(error::HpmError::Sandbox(
+                "Signing key " + fp + " has EXPIRED.\n" +
+                "    The signature can't be trusted until the packager publishes a new key/signature."))
+        end
+        if string_contains(l, "[GNUPG:] EXPSIG") is
+            let fp: string = extract_last_field(l)
+            return error::HpmResult::Err(error::HpmError::Sandbox(
+                "Signature itself has EXPIRED (key " + fp + " is fine, but this specific signature had a validity period).\n" +
+                "    Ask the packager to re-sign."))
+        end
+        if string_contains(l, "[GNUPG:] NO_PUBKEY") is
+            let fp: string = extract_last_field(l)
+            return error::HpmResult::Err(error::HpmError::Sandbox(
+                "Signing key " + fp + " not in trusted keyring.\n    Add: hpm verify --import-key " + fp))
+        end
+        if string_contains(l, "[GNUPG:] BADSIG") is
+            return error::HpmResult::Err(error::HpmError::Sandbox("BAD signature — package may be tampered with!"))
+        end
+        if string_contains(l, "[GNUPG:] ERRSIG") is
+            return error::HpmResult::Err(error::HpmError::Sandbox("GPG reported a system error while checking this signature — treating as untrusted."))
+        end
+        if string_contains(l, "[GNUPG:] GOODSIG") is
+            fingerprint = extract_last_field(l)
+            has_good = true
+        end
+        if string_contains(l, "[GNUPG:] VALIDSIG") is
+            let parts: [string] = string_split(l, " ")
+            if array_len(parts) > 2 is fingerprint = parts[2] end
+        end
+        i += 1
+    end
+
+    if !has_good is
+        return error::HpmResult::Err(error::HpmError::Sandbox("No valid signatures found"))
+    end
+    return error::HpmResult::Ok(fingerprint)
+end
+
+fn extract_last_field(status_line: string) -> string is
+    let parts: [string] = string_split(string_trim(status_line), " ")
+    if array_len(parts) == 0 is return "unknown fingerprint" end
+    return parts[array_len(parts) - 1]
+end
+
+fn command_exists_path(name: string) -> bool is
+    return utils::command_exists(name)
+end
+
+;; ── hpm verify --import-key ──────────────────────────────────────────
+
+pub fn import_key(key_source: string) -> error::HpmResult<bool> is
+    write("→ Importing GPG key: " + colors::white(key_source))
+
+    let mut key_path: string = key_source
+    let mut is_temp: bool = false
+
+    if !fs::exists(key_source) is
+        let url: string = if string_starts_with(key_source, "http") then key_source
+            else "https://keyserver.ubuntu.com/pks/lookup?op=get&search=" + key_source
+        let resp: utils::HttpResponse = utils::http_get(url)
+        if resp.status < 200 || resp.status >= 300 is
+            let why: string = if resp.status == 0 then resp.body else "HTTP " + to_string(resp.status)
+            return error::HpmResult::Err(error::HpmError::Network("Failed to fetch key: " + why))
+        end
+        key_path = env::temp_dir() + "/hpm-import-key-" + to_string(time::now_unix()) + ".asc"
+        fs::write(key_path, resp.body)
+        is_temp = true
+    end
+
+    let result: string = run_capture("gpg --import " + shell_quote(key_path))
+    if is_temp is fs::remove(key_path) end
+
+    if string_contains(result, "imported: 1") || string_contains(result, "IMPORT_OK") || string_contains(result, "imported") is
+        write(fmt::red("✔") + " Imported key to your GPG keyring (~/.gnupg)")
+    elsif string_contains(result, "unchanged") is
+        write("→ Key already in keyring")
+    else is
+        write(fmt::dim(result))
+    end
+    return error::HpmResult::Ok(true)
+end
