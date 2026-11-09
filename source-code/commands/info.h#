@@ -1,0 +1,210 @@
+mod colors
+mod error
+mod repo
+mod state
+mod paths
+mod squash
+mod manifest
+
+use "std -> fmt" from "fmt"
+
+pub fn info(package: string) -> error::HpmResult<bool> is
+    if package == "" is
+        write(fmt::red("✗") + " Usage: hpm info <package>")
+        exit(1)
+    end
+
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            let s_r: error::HpmResult<state::State> = state::state_load()
+            match s_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(s) => is
+                    let repo_url: string = repo::get_package_url(rm, package)
+                    if repo_url == "" is
+                        return error::HpmResult::Err(error::HpmError::PackageNotFound(
+                            package + "' not found in repository index. Run `hpm refresh` to refresh."))
+                    end
+
+                    let meta_r: error::HpmResult<repo::PackageMeta> = repo::fetch_package_meta(rm, package)
+                    match meta_r is
+                        HpmResult::Err(e) => return error::HpmResult::Err(e)
+                        HpmResult::Ok(meta) => is
+                            let build_cfg: repo::BuildConfig = repo::fetch_raw_build_config(repo_url)
+                            let installed_ver: string = state::get_current_version(package, paths::store_path())
+                            let idx: int = if installed_ver != "" then state::find_index(s.packages, package, installed_ver) else -1
+                            let pinned: bool = idx >= 0 && s.packages[idx].pinned
+                            let local_versions: [string] = meta.available_versions
+
+                            write("")
+                            write("  ◆ " + fmt::bold(colors::white(package)))
+                            write("  " + repeat("─", 60))
+                            write("  " + pad("Version:", 16) + fmt::red(meta.version))
+                            write("  " + pad("Author:", 16) + meta.authors)
+                            write("  " + pad("License:", 16) + meta.license)
+                            write("  " + pad("Repository:", 16) + fmt::dim(repo_url))
+
+                            if array_len(meta.tags) > 0 is
+                                let mut labels: [string] = []
+                                let mut i: int = 0
+                                while i < array_len(meta.tags) is
+                                    labels = array_push(labels, colors::white("@" + meta.tags[i]))
+                                    i += 1
+                                end
+                                write("  " + pad("Tags:", 16) + labels.join("  "))
+                            end
+
+                            if repo::has_build_config(build_cfg) is
+                                let mut build_type: string = "prebuilt (contents/)"
+                                if build_cfg.source_type == "download" is
+                                    let url: string = build_cfg.download_url
+                                    let trimmed: string = if string_len(url) > 50 then string_slice(url, 0, 49) + "…" else url
+                                    build_type = "download (" + fmt::dim(trimmed) + ")"
+                                elsif build_cfg.source_type == "build" is
+                                    build_type = "build from source"
+                                end
+                                write("  " + pad("Build type:", 16) + build_type)
+                            end
+
+                            write("")
+                            write("  " + fmt::bold("Description:"))
+                            let wrapped: [string] = wrap_text(meta.summary, 65)
+                            let mut wi: int = 0
+                            while wi < array_len(wrapped) is
+                                write("    " + wrapped[wi])
+                                wi += 1
+                            end
+
+                            write("")
+                            if installed_ver != "" is
+                                let pin_tag: string = if pinned then " " + fmt::dim("(pinned)") else ""
+                                write("  " + pad("Installed:", 16) + colors::white(installed_ver) + pin_tag)
+
+                                let wn: state::WrapperNames = state::wrapper_names_load()
+                                let ver_dir: string = paths::store_path() + package + "/" + installed_ver
+                                squash::ensure_mounted(ver_dir)
+                                let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(ver_dir)
+                                match mr is
+                                    HpmResult::Ok(m) => is
+                                        let mut custom: [string] = []
+                                        let mut b: int = 0
+                                        while b < array_len(m.bins) is
+                                            let bin: string = m.bins[b]
+                                            if state::wn_has(wn, package, bin) is
+                                                let w: string = state::wn_get(wn, package, bin)
+                                                if w != bin is
+                                                    custom = array_push(custom, bin + " → " + paths::bin_dir() + "/" + w)
+                                                end
+                                            end
+                                            b += 1
+                                        end
+                                        if array_len(custom) > 0 is
+                                            write("  " + pad("Wrappers:", 16) + fmt::dim(custom.join(", ")))
+                                        end
+                                    end
+                                    HpmResult::Err(_) => is end
+                                end
+                            else is
+                                write("  " + pad("Installed:", 16) + fmt::red("No"))
+                            end
+
+                            if array_len(local_versions) > 0 is
+                                write("")
+                                write("  " + fmt::bold("Available versions (from git tags):"))
+                                let mut vi: int = 0
+                                while vi < array_len(local_versions) is
+                                    let v: string = local_versions[vi]
+                                    let cur: string = if v == installed_ver then " " + fmt::red("← current") else ""
+                                    write("    • " + colors::white(v) + cur)
+                                    vi += 1
+                                end
+                            else is
+                                write("")
+                                write("  ℹ Run " + fmt::dim("hpm refresh") + " or " + fmt::dim("hpm install " + package + "@<ver>") + " to see all versions.")
+                            end
+
+                            if array_len(meta.tags) > 0 is
+                                let mut any_related: bool = false
+                                let mut ti: int = 0
+                                while ti < array_len(meta.tags) is
+                                    let tag: string = meta.tags[ti]
+                                    let all_related: [string] = repo::packages_for_tag(rm, tag)
+                                    let mut related: [string] = []
+                                    let mut ri: int = 0
+                                    while ri < array_len(all_related) && array_len(related) < 4 is
+                                        if all_related[ri] != package is related = array_push(related, all_related[ri]) end
+                                        ri += 1
+                                    end
+                                    if array_len(related) > 0 is
+                                        if !any_related is
+                                            write("")
+                                            write("  ℹ Related packages (same tags):")
+                                            any_related = true
+                                        end
+                                        let mut labeled: [string] = []
+                                        let mut li: int = 0
+                                        while li < array_len(related) is
+                                            labeled = array_push(labeled, colors::magenta(related[li]))
+                                            li += 1
+                                        end
+                                        write("    @" + colors::white(tag) + ": " + labeled.join(", "))
+                                    end
+                                    ti += 1
+                                end
+                            end
+
+                            write("")
+                            if installed_ver == "" is
+                                write("  → Install: " + fmt::bold(fmt::dim("hpm install " + package)))
+                            end
+                            write("")
+                            return error::HpmResult::Ok(true)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is
+        out = out + " "
+    end
+    return out
+end
+
+fn repeat(c: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out = out + c
+        i += 1
+    end
+    return out
+end
+
+fn wrap_text(text: string, width: int) -> [string] is
+    let words: [string] = string_split(text, " ")
+    let mut lines: [string] = []
+    let mut current: string = ""
+    let mut i: int = 0
+    while i < array_len(words) is
+        let word: string = words[i]
+        if current == "" is
+            current = word
+        elsif string_len(current) + 1 + string_len(word) <= width is
+            current = current + " " + word
+        else is
+            lines = array_push(lines, current)
+            current = word
+        end
+        i += 1
+    end
+    if current != "" is lines = array_push(lines, current) end
+    if array_len(lines) == 0 is lines = [""] end
+    return lines
+end
