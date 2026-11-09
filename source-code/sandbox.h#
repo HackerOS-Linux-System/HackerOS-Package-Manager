@@ -1,0 +1,246 @@
+mod error
+mod manifest
+mod utils
+mod sandbox_ffi
+
+use "bit -> landlock" from "landlock"
+use "bit -> libseccomp" from "libseccomp"
+
+use "std -> fs" from "fs"
+
+;; ── Tryb piaskownicy ─────────────────────────────────────────────────
+
+pub enum SandboxMode is
+    Full
+    Compat
+    None
+end
+
+pub struct ResourceLimits is
+    pub cpu_secs:  int
+    pub mem_bytes: int
+    pub nproc:     int
+end
+
+pub fn limits_for_run() -> ResourceLimits is
+    return ResourceLimits { cpu_secs: 0, mem_bytes: 4 * 1024 * 1024 * 1024, nproc: 2048 }
+end
+
+pub fn limits_for_build() -> ResourceLimits is
+    return ResourceLimits { cpu_secs: 0, mem_bytes: 8 * 1024 * 1024 * 1024, nproc: 8192 }
+end
+
+;; Hooki — mocno ograniczone: krótkie skrypty pomocnicze, nie powinny
+;; kompilować kodu ani ściągać dużych plików.
+pub fn limits_for_hook() -> ResourceLimits is
+    return ResourceLimits { cpu_secs: 120, mem_bytes: 512 * 1024 * 1024, nproc: 256 }
+end
+
+fn clone_newnet() -> i64 is return 1073741824 end ;; 0x40000000
+
+pub struct SandboxOutput is
+    pub stdout:    string
+    pub stderr:    string
+    pub exit_code: int
+end
+
+;; ── Wybór trybu ──────────────────────────────────────────────────────
+
+pub fn pick_mode(m: manifest::Manifest) -> SandboxMode is
+    if m.sandbox_disabled is return SandboxMode::None end
+    if landlock::is_supported() is return SandboxMode::Full end
+    return SandboxMode::Compat
+end
+
+;; ── Nałożenie restrykcji w procesie potomnym (PRZED execlp) ────────────
+;; Wołane wewnątrz dziecka (patrz `sandbox_ffi::fork_child`/`exec_child`) — to, co
+;; tu nałożymy, PRZEŻYWA `execlp()` i obejmuje cały proces hooka/komendy,
+;; a rodzic (hpm) nigdy tego nie dostaje na siebie.
+
+fn apply_rlimits(limits: ResourceLimits) is
+    if limits.cpu_secs > 0 is
+        sandbox_ffi::set_rlimit(sandbox_ffi::rlimit_cpu(), limits.cpu_secs, limits.cpu_secs)
+    end
+    sandbox_ffi::set_rlimit(sandbox_ffi::rlimit_as(), limits.mem_bytes, limits.mem_bytes)
+    sandbox_ffi::set_rlimit(sandbox_ffi::rlimit_nproc(), limits.nproc, limits.nproc)
+end
+
+fn apply_landlock(path: string, extra_paths: [string], full_gui: bool) is
+    if !landlock::is_supported() is return end
+    let abi: int = landlock::abi_version()
+    let fs_access: int = landlock_consts::access_fs_all_for_abi(abi)
+    let rs_result: landlock::LandlockResult<landlock::Ruleset> = landlock::new_ruleset(fs_access, 0)
+    match rs_result is
+        LandlockResult::Err(_) => return
+        LandlockResult::Ok(rs) => is
+            ;; Pełny dostęp (r/w/exec) do katalogu pakietu.
+            landlock::allow_path(rs, path, fs_access)
+            ;; Odczyt-only dla standardowych ścieżek systemowych potrzebnych
+            ;; każdemu interpreterowi (biblioteki współdzielone, /usr, /etc).
+            let ro_access: int = landlock_consts::access_fs_read_only()
+            landlock::allow_path(rs, "/usr", ro_access)
+            landlock::allow_path(rs, "/lib", ro_access)
+            landlock::allow_path(rs, "/lib64", ro_access)
+            landlock::allow_path(rs, "/etc", ro_access)
+            landlock::allow_path(rs, "/tmp", fs_access)
+            ;; Dodatkowe ścieżki zadeklarowane w `sandbox.filesystem` manifestu.
+            let mut i: int = 0
+            while i < array_len(extra_paths) is
+                if fs::exists(extra_paths[i]) is
+                    landlock::allow_path(rs, extra_paths[i], fs_access)
+                end
+                i += 1
+            end
+            if full_gui is
+                ;; GUI potrzebuje dostępu do X11/Wayland socketów i configu.
+                landlock::allow_path(rs, "/tmp/.X11-unix", fs_access)
+                landlock::allow_path(rs, "/run/user", fs_access)
+            end
+            landlock::set_no_new_privs()
+            landlock::restrict_self(rs)
+        end
+    end
+end
+
+fn apply_seccomp() is
+    let mut rules: [rules::Rule] = rules::new_rules()
+    rules = rules::allow_baseline(rules)
+    ;; Syscalle dodatkowe potrzebne typowym interpreterom/skryptom (fork,
+    ;; exec, wait, sygnały, gniazda dla ewentualnego dozwolonego ruchu
+    ;; sieciowego — samo `network: true` w manifeście nie zdejmuje seccomp,
+    ;; tylko landlock/namespace sieciowy, więc te syscalle i tak muszą
+    ;; przechodzić niezależnie od trybu sieci).
+    let extra: [string] = [
+        "execve", "execveat", "clone", "clone3", "fork", "vfork",
+        "wait4", "waitid", "socket", "connect", "bind", "listen", "accept4",
+        "getsockopt", "setsockopt", "sendto", "recvfrom", "poll", "select",
+        "epoll_wait", "epoll_ctl", "epoll_create1",
+    ]
+    let mut i: int = 0
+    while i < array_len(extra) is
+        rules = rules::allow(rules, extra[i])
+        i += 1
+    end
+    install::install(rules, consts::action_errno(1)) ;; default: EPERM zamiast zabicia procesu
+end
+
+fn apply_network_isolation(allow_network: bool) is
+    if allow_network is return end
+    ;; unshare(CLONE_NEWNET) — pojedynczy syscall, bez marshallingu.
+    unsafe is
+        sandbox_ffi::syscall(272, clone_newnet(), 0, 0, 0, 0, 0) ;; 272 = __NR_unshare (x86_64/aarch64)
+    end
+end
+
+;; ── Hook sandboxing ──────────────────────────────────────────────────
+;;
+;; Hooki NIGDY nie dostają sieci, nawet jeśli pakiet deklaruje
+;; `sandbox.network = true` dla samej aplikacji — chyba że manifest jawnie
+;; ustawia `sandbox.hooks_network` (pole dodane względem oryginalnego Rust
+;; TODO, bo `manifest.h#` już je obsługuje — patrz jego nagłówek).
+pub fn run_hook_sandboxed(dir: string, m: manifest::Manifest, interpreter: string, hook_path: string,
+                          env_vars: [[string]], timeout_secs: int) -> error::HpmResult<SandboxOutput> is
+    let stdout_path: string = fs::temp_file("hpm-hook-out")
+    let stderr_path: string = fs::temp_file("hpm-hook-err")
+    let limits: ResourceLimits = limits_for_hook()
+    let allow_net: bool = m.sandbox.hooks_network
+
+    let pid: int = sandbox_ffi::fork_child(stdout_path, stderr_path, env_vars, timeout_secs)
+    if pid == 0 is
+        ;; ── DZIECKO: restrykcje, potem exec (nie wraca) ──
+        apply_network_isolation(allow_net)
+        apply_rlimits(limits)
+        apply_landlock(dir, m.sandbox.filesystem, false)
+        apply_seccomp()
+        sandbox_ffi::exec_child(interpreter, hook_path)
+    end
+    let code: int = if pid < 0 then -1 else sandbox_ffi::wait_child(pid)
+
+    let out: string = if fs::exists(stdout_path) then fs::read(stdout_path) else ""
+    let err: string = if fs::exists(stderr_path) then fs::read(stderr_path) else ""
+    if fs::exists(stdout_path) is fs::remove(stdout_path) end
+    if fs::exists(stderr_path) is fs::remove(stderr_path) end
+
+    if code < 0 is
+        return error::HpmResult::Err(error::HpmError::Sandbox("fork() failed while sandboxing hook"))
+    end
+    return error::HpmResult::Ok(SandboxOutput { stdout: out, stderr: err, exit_code: code })
+end
+
+;; ── `hpm run` / `hpm dev ... run` — wykonanie binarki/komend paczki ────
+
+fn env_pairs_none() -> [[string]] is return [] end
+
+;; Odpowiednik `exec_direct` (SandboxMode::None) — bez żadnej izolacji.
+fn exec_direct(m: manifest::Manifest, path: string, bin: string, extra_args: [string]) -> error::HpmResult<int> is
+    let full_bin: string = path + "/" + bin
+    return utils::run_command(full_bin, extra_args)
+end
+
+;; Odpowiednik `run_compat`/`run_full` (Compat i Full — dla interaktywnego
+;; `hpm run` różnica praktyczna to już tylko izolacja sieciowa, zob.
+;; nagłówek pliku). Uruchamia binarkę pakietu z pełną izolacją, ale bez
+;; przechwytywania stdout/stderr do plików (użytkownik ma to widzieć na
+;; żywo) — stąd osobna, prostsza ścieżka niż `run_hook_sandboxed`, oparta
+;; wprost na `utils::run_command` (dziedziczy fd 0/1/2 od hpm) OPAKOWANA w
+;; `apply_*` nałożone na TEN SAM proces powłoki, którą `system()` i tak
+;; tworzy jako świeże dziecko.
+fn run_isolated(m: manifest::Manifest, path: string, bin: string, extra_args: [string], allow_network: bool) -> error::HpmResult<int> is
+    let full_bin: string = path + "/" + bin
+    let stdout_path: string = fs::temp_file("hpm-run-out")
+    let stderr_path: string = fs::temp_file("hpm-run-err")
+    let limits: ResourceLimits = limits_for_run()
+
+    let arg_str: string = extra_args.join(" ")
+    let pid: int = sandbox_ffi::fork_child(stdout_path, stderr_path, env_pairs_none(), 0)
+    if pid == 0 is
+        ;; ── DZIECKO: restrykcje, potem exec (nie wraca) ──
+        apply_network_isolation(allow_network)
+        apply_rlimits(limits)
+        apply_landlock(path, m.sandbox.filesystem, m.sandbox.full_gui)
+        apply_seccomp()
+        sandbox_ffi::exec_child(full_bin, arg_str)
+    end
+    let code: int = if pid < 0 then -1 else sandbox_ffi::wait_child(pid)
+
+    ;; Interaktywne — przelej zawartość na własne stdout/stderr hpm.
+    if fs::exists(stdout_path) is
+        write(fs::read(stdout_path))
+        fs::remove(stdout_path)
+    end
+    if fs::exists(stderr_path) is
+        write(fs::read(stderr_path))
+        fs::remove(stderr_path)
+    end
+    return error::HpmResult::Ok(code)
+end
+
+pub fn setup_sandbox(path: string, m: manifest::Manifest, is_install: bool, bin: string, extra_args: [string]) -> error::HpmResult<int> is
+    match pick_mode(m) is
+        SandboxMode::None   => return exec_direct(m, path, bin, extra_args)
+        SandboxMode::Compat => return run_isolated(m, path, bin, extra_args, m.sandbox.network)
+        SandboxMode::Full   => return run_isolated(m, path, bin, extra_args, m.sandbox.network)
+    end
+end
+
+;; Odpowiednik `run_commands` — wykonuje listę poleceń budowania jako
+;; jeden skrypt powłoki (`sh -e`), w piaskownicy.
+pub fn run_commands(path: string, m: manifest::Manifest, commands: [string]) -> error::HpmResult<bool> is
+    let script: string = path + "/run_commands.sh"
+    fs::write(script, "#!/bin/sh\nset -e\n" + commands.join("\n") + "\n")
+    let exec_r: error::HpmResult<bool> = utils::make_executable(script)
+    if error::is_err(exec_r) is return exec_r end
+
+    let result: error::HpmResult<int> = run_isolated(m, path, "run_commands.sh", [], m.sandbox.network)
+    if fs::exists(script) is fs::remove(script) end
+
+    match result is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(code) => is
+            if code != 0 is
+                return error::HpmResult::Err(error::HpmError::Sandbox("build command failed with exit code " + to_string(code)))
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
