@@ -1,0 +1,313 @@
+mod colors
+mod error
+mod manifest
+mod sandbox
+mod state
+mod db
+mod squash
+mod repo
+mod utils
+mod hooks
+mod verbose
+mod paths
+mod commands
+
+use "std -> env" from "env"
+use "std -> fmt" from "fmt"
+
+fn hpm_version() -> string is return "1.0.0" end
+
+pub fn main() is
+    let raw_args: [string] = env::args()
+    let mut command: string = ""
+    let mut sub_args: [string] = []
+    let mut have_command: bool = false
+
+    ;; `env::args()` zwraca też argv[0] (ścieżkę programu) jako pierwszy element —
+    ;; w skompilowanym binarium to np. "cache/build/release/hpm". Bez pominięcia go
+    ;; hpm brał własną ścieżkę za komendę ("Unknown command: .../hpm").
+    let mut i: int = 1
+    while i < array_len(raw_args) is
+        let arg: string = raw_args[i]
+        if !have_command is
+            if arg == "-h" || arg == "--help" is
+                print_help()
+                return
+            end
+            if arg == "-V" || arg == "--version" is
+                write("hpm " + hpm_version())
+                return
+            end
+            if arg == "-v" || arg == "--verbose" is
+                verbose::set_verbose(true)
+            else is
+                command = arg
+                have_command = true
+            end
+        else is
+            sub_args = array_push(sub_args, arg)
+        end
+        i += 1
+    end
+
+    if !have_command is
+        print_help()
+        return
+    end
+
+    let result: error::HpmResult<bool> = dispatch(command, sub_args)
+    match result is
+        HpmResult::Ok(_) => is end
+        HpmResult::Err(e) => is
+            let mut msg: string = error::message(e)
+            if msg == "" is
+                ;; Zabezpieczenie: nigdy nie wypisuj samego "✗" bez treści.
+                msg = "Unexpected error (" + error::code(e) + ")"
+            end
+            if is_permission_error(msg) is
+                print_sudo_hint()
+            else is
+                write(fmt::red("✗") + " " + msg)
+            end
+            exit(1)
+        end
+    end
+end
+
+fn arg_or(args: [string], idx: int, default_val: string) -> string is
+    if idx < array_len(args) is return args[idx] end
+    return default_val
+end
+
+fn usage_exit(msg: string) -> error::HpmResult<bool> is
+    write(fmt::red("✗") + " " + msg)
+    exit(1)
+    return error::HpmResult::Ok(true)
+end
+
+fn dispatch(command: string, sub_args: [string]) -> error::HpmResult<bool> is
+    if command == "refresh"    is return refresh::refresh() end
+    if command == "install"    is return installer::install(sub_args) end
+    if command == "remove"     is return remove::remove(arg_or(sub_args, 0, "")) end
+    if command == "update"     is return update::update() end
+    if command == "switch"     is
+        if array_len(sub_args) < 2 is return usage_exit("Usage: hpm switch <package> <version>") end
+        return switch::switch_version(sub_args[0], sub_args[1])
+    end
+    if command == "upgrade"    is return upgrade::upgrade() end
+    if command == "run"        is
+        if array_len(sub_args) < 2 is return usage_exit("Usage: hpm run <package> <bin> [args...]") end
+        let pkg: string = sub_args[0]
+        let bin: string = sub_args[1]
+        let extra: [string] = utils::array_slice(sub_args, 2, array_len(sub_args))
+        return run::run(pkg, bin, extra)
+    end
+    if command == "rollback"   is return rollback::rollback(arg_or(sub_args, 0, "")) end
+    if command == "autoremove" is return autoremove::autoremove() end
+    if command == "search"     is return search::search(arg_or(sub_args, 0, "")) end
+    if command == "info"       is return info::info(arg_or(sub_args, 0, "")) end
+    if command == "list"       is return list::list_installed() end
+    if command == "outdated"   is return outdated::outdated() end
+    if command == "deps"       is return deps::deps(arg_or(sub_args, 0, "")) end
+    if command == "tags"       is return cmd_tags() end
+    if command == "diff"       is return diff::diff(sub_args) end
+    if command == "build"      is return build::build(sub_args) end
+    if command == "clean"      is
+        let all: bool = array_contains(sub_args, "--all")
+        if all is return clean::clean_all() end
+        return clean::clean_cache()
+    end
+    if command == "verify"     is
+        if arg_or(sub_args, 0, "") == "--import-key" is
+            let keyid: string = arg_or(sub_args, 1, "")
+            if keyid == "" is return usage_exit("Usage: hpm verify --import-key <keyid|keyfile|url>") end
+            return verify::import_key(keyid)
+        end
+        return verify::verify(arg_or(sub_args, 0, ""))
+    end
+    if command == "pin"        is
+        if array_len(sub_args) < 2 is return usage_exit("Usage: hpm pin <package> <version>") end
+        return pin::pin(sub_args[0], sub_args[1])
+    end
+    if command == "unpin"      is return unpin::unpin(arg_or(sub_args, 0, "")) end
+    if command == "__debug_hash" is
+        let dir: string = arg_or(sub_args, 0, "")
+        let hr: error::HpmResult<string> = utils::compute_dir_hash(dir)
+        match hr is
+            HpmResult::Ok(h)  => is write(h) return error::HpmResult::Ok(true) end
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+        end
+    end
+    if command == "__debug_gpg" is
+        let data: string = arg_or(sub_args, 0, "")
+        let sig: string = arg_or(sub_args, 1, "")
+        let vr: error::HpmResult<string> = verify::verify_gpg_signature(data, sig)
+        match vr is
+            HpmResult::Ok(signer) => write("OK: " + signer)
+            HpmResult::Err(e)     => write("FAIL: " + error::message(e))
+        end
+        return error::HpmResult::Ok(true)
+    end
+    if command == "doctor"     is return doctor::doctor() end
+    if command == "repair"     is return repair::repair() end
+    if command == "lock"       is return lock::lock(sub_args) end
+    if command == "create"     is return create::create(arg_or(sub_args, 0, "")) end
+    if command == "dev"        is return dev::dev(sub_args) end ;; ukryta komenda — nie w --help
+
+    ;; Krótki błąd + podpowiedź zamiast zalewania terminala całym helpem
+    ;; (pełny help: `hpm --help` albo samo `hpm`).
+    write(fmt::red("✗") + " Unknown command: " + command)
+    write("  Run `hpm --help` to see the available commands.")
+    exit(1)
+    return error::HpmResult::Ok(true)
+end
+
+fn array_contains(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── Wykrywanie "Permission denied" + podpowiedź sudo ───────────────────
+
+fn is_permission_error(err: string) -> bool is
+    return string_contains(err, "Permission denied") || string_contains(err, "os error 13") ||
+        string_contains(err, "EACCES") || string_contains(err, "permission denied")
+end
+
+;; Od 0.9 hpm działa WYŁĄCZNIE w przestrzeni użytkownika — żadna komenda
+;; nie wymaga roota. `sudo hpm ...` jest ZŁYM pomysłem (inny $HOME).
+fn print_sudo_hint() is
+    write("")
+    write(fmt::bold(fmt::red("✗")) + " " + fmt::bold(fmt::red("Permission denied")))
+    write("")
+    write("  ℹ hpm no longer needs root — packages live under your own home directory:")
+    write("      " + fmt::dim(paths::store_path()))
+    write("      " + fmt::dim(paths::bin_dir()))
+    write("")
+    write("  → This usually means those directories (or their parent ~/.hackeros / ~/.local)")
+    write("    are owned by someone else — often because they were created by root")
+    write("    (e.g. a stray `sudo hpm ...` before 0.9, or a previous install as another user).")
+    write("")
+    write("  Fix ownership, then retry without sudo:")
+    write("")
+    write("    " + fmt::bold(colors::white("sudo chown -R $USER: ~/.hackeros ~/.local/bin ~/.local/share")))
+    write("")
+end
+
+;; ── hpm tags ─────────────────────────────────────────────────────────
+
+fn cmd_tags() -> error::HpmResult<bool> is
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            let tags: [string] = repo::all_tags(rm)
+            if array_len(tags) == 0 is
+                write("→ No group tags found.")
+                write("  Tags are defined in each package's " + fmt::dim("info.hk") + " file.")
+                write("  Run " + fmt::dim("hpm refresh") + " to fetch metadata from all packages.")
+                return error::HpmResult::Ok(true)
+            end
+            write("Available group tags:\n")
+            let mut i: int = 0
+            while i < array_len(tags) is
+                let tag: string = tags[i]
+                let pkgs: [string] = repo::packages_for_tag(rm, tag)
+                let count: int = array_len(pkgs)
+                let preview_n: int = if count < 5 then count else 5
+                let preview: [string] = utils::array_slice(pkgs, 0, preview_n)
+                let suffix: string = if count > 5 then " +" + to_string(count - 5) + " more" else ""
+                write("  ◆ @" + tag + "   " + to_string(count) + " package(s): " + fmt::dim(preview.join(", ") + suffix))
+                i += 1
+            end
+            write("")
+            write("  Install a tag group : " + fmt::dim("hpm install @<tag>"))
+            write("  Search by tag       : " + fmt::dim("hpm search @<tag>"))
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+;; ── Help ─────────────────────────────────────────────────────────────
+
+fn print_help() is
+    write("")
+    write(fmt::bold(fmt::red("Hacker Package Manager (hpm)")) + " " + fmt::red(hpm_version()))
+    write("")
+    write(fmt::bold("Usage:") + "  hpm " + fmt::dim("<command>") + " [options]")
+    write("")
+    write(fmt::bold("Package Commands:"))
+    write("  refresh                                Update index and pre-fetch metadata")
+    write("  install <pkg>[@<ver>]...                Install packages (no root needed)")
+    write("  install <pkg> --release                 Install from a GitHub Release .hpm instead of git clone")
+    write("  install <pkg> --release --require-signed  ...and refuse if it isn't GPG-signed")
+    write("  install @<tag>                          Install all packages with group tag")
+    write("  remove <pkg>[@<ver>]                    Remove package")
+    write("  autoremove                              Remove orphaned packages")
+    write("  update                                  Update all packages")
+    write("  upgrade                                 Upgrade hpm itself")
+    write("  switch <pkg> <ver>                      Switch active version")
+    write("  rollback [<pkg>]                        Restore previous state")
+    write("")
+    write(fmt::bold("Query Commands:"))
+    write("  search <query|@tag>                     Search packages")
+    write("  info <package>                          Show package details")
+    write("  list                                    List installed packages")
+    write("  outdated                                Show packages with updates")
+    write("  deps <pkg>[@<ver>]                       Show dependency tree")
+    write("  tags                                    List available group tags")
+    write("  diff <pkg> <v1> [<v2>]                  Compare two package versions")
+    write("")
+    write(fmt::bold("Maintenance Commands:"))
+    write("  run <pkg> <bin> [args]                  Run binary (sandboxed)")
+    write("  build [name]                            Package current directory into a .hpm archive")
+    write("  build --output <path>                   Custom output path for the .hpm archive")
+    write("  build --sign <key-id>                   Also produce a detached GPG .sig (like pacman)")
+    write("  clean                                   Remove cached repos + temp files")
+    write("  clean --all                             Also remove old store versions")
+    write("  verify <package>                        Verify SHA-256 + GPG signature")
+    write("  verify --import-key <key>                Import GPG key to trusted keyring")
+    write("  pin <pkg> <ver>                          Pin a package version")
+    write("  unpin <pkg>                              Unpin current version")
+    write("  doctor                                  Diagnose consistency issues")
+    write("  repair                                  Auto-fix issues found by doctor")
+    write("  lock <subcmd>                            Manage hpm.lock (reproducible installs)")
+    write("")
+    write(fmt::bold("Development Commands:"))
+    write("  create [<name>]                          Interactive package creation wizard")
+    write("  dev <path>                                Test a local package dir (not in repo-list.json)")
+    write("  dev <path> run <bin> [args]                ...and run one of its binaries, sandboxed")
+    write("")
+    write(fmt::bold("Options:"))
+    write("  -h, --help                    Show this help")
+    write("  -V, --version                 Show version")
+    write("  -v, --verbose                 Print diagnostic detail (spawned commands, paths, ...); before or after the subcommand")
+    write("")
+    write(fmt::bold("Group tags:"))
+    write("  hpm install @development  →  install all @development packages")
+    write("  hpm tags                  →  list all available tags")
+    write("")
+    write(fmt::bold("Hooks (Hacker Lang):"))
+    write("  Package hooks are placed in hooks/ subdirectory:")
+    write("  pre-install.hl                 runs before install (blocks on failure)")
+    write("  post-install.hl                runs after install")
+    write("  pre-remove.hl                  runs before removal (blocks on failure)")
+    write("  post-remove.hl                 runs after removal")
+    write("  post-update.hl                 runs after update")
+    write("  Also supported: .py .rb .sh")
+    write("")
+    write(fmt::bold("Package format:"))
+    write("  info.hk          Manifest (name, version, bins, deps, sandbox, tags)")
+    write("  build.toml       Build/download instructions (optional)")
+    write("  contents/        Pre-built files")
+    write("  hooks/           Hacker Lang hooks (.hl) — pre/post install/remove")
+    write("  info.hk.sig      GPG signature (optional)")
+    write("")
+    write("  ℹ hpm runs entirely as your user — no sudo is only needed")
+    write("    if " + paths::store_path() + " or " + paths::bin_dir() + " are owned by root from before 0.9.")
+    write("")
+end
