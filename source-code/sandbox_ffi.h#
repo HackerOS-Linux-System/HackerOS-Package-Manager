@@ -1,0 +1,112 @@
+extern static [c] is
+    fn fork() -> i32
+    fn setenv(name: string, value: string, overwrite: i32) -> i32
+    fn alarm(seconds: i32) -> i32
+    fn dup2(oldfd: i32, newfd: i32) -> i32
+    fn close(fd: i32) -> i32
+    fn open(path: string, flags: i32, mode: i32) -> i32
+    fn _exit(code: i32)
+    ;; execlp(file, arg0, arg1, NULL) — 2 argumenty + terminator NULL,
+    ;; wystarczające dla `execlp(interpreter, interpreter, hook_path, NULL)`.
+    fn execlp(file: string, arg0: string, arg1: string, null_term: i64) -> i32
+    fn malloc(size: i64) -> i64
+    fn free(ptr: i64)
+    fn waitpid(pid: i32, status_ptr: i64, options: i32) -> i32
+    fn setrlimit(resource: i32, limits_ptr: i64) -> i32
+    fn syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64
+end
+
+pub fn o_creat_wronly_trunc() -> i32 is return 64 | 1 | 512 end ;; O_CREAT|O_WRONLY|O_TRUNC
+pub fn mode_644() -> i32 is return 420 end
+
+;; `struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; }` — dwa `u64` z rzędu,
+;; 16 bajtów na x86_64/aarch64 Linux. Budujemy je ręcznie w malloc'owanym
+;; buforze (ten sam wzorzec co `landlock_ffi.h#`'s `errno()`).
+pub fn rlimit_cpu()    -> i32 is return 0 end ;; RLIMIT_CPU
+pub fn rlimit_as()     -> i32 is return 9 end ;; RLIMIT_AS (pamięć wirtualna)
+pub fn rlimit_nproc()  -> i32 is return 6 end ;; RLIMIT_NPROC
+
+pub fn set_rlimit(resource: i32, soft: i64, hard: i64) -> bool is
+    let buf: i64 = malloc(16)
+    unsafe is
+        ptr_write_i64(buf, 0, soft)
+        ptr_write_i64(buf, 8, hard)
+    end
+    let rc: i32 = setrlimit(resource, buf)
+    free(buf)
+    return rc == 0
+end
+
+;; Uruchamianie procesu potomnego w piaskownicy — TRZY kroki zamiast jednej
+;; funkcji z callbackiem. Wcześniej `spawn_sandboxed` brał domknięcie
+;; (`|| is ... end`) wołane w dziecku; domknięcia nie są jeszcze obsługiwane
+;; przez backend LLVM (`h#`/`bit` --release), więc kod, który MUSI się w
+;; dziecku wykonać między przekierowaniem fd a `execlp` (landlock/seccomp/
+;; setrlimit — patrz `sandbox.h#`), jest teraz wołany wprost przez
+;; wywołującego:
+;;
+;;     let pid: int = sandbox_ffi::fork_child(stdout_path, stderr_path, env_vars, timeout_secs)
+;;     if pid < 0 is ...błąd fork()... end
+;;     if pid == 0 is
+;;         ;; ── DZIECKO ── nałóż restrykcje, potem:
+;;         sandbox_ffi::exec_child(interpreter, arg1)     ;; nie wraca
+;;     end
+;;     let code: int = sandbox_ffi::wait_child(pid)
+;;
+;; Restrykcje jądra (Landlock/seccomp/rlimit) PRZEŻYWAJĄ `execve()` — to cały
+;; sens; rodzic (sam `hpm`) nigdy ich nie dostaje, bo nakładane są wyłącznie
+;; w gałęzi `pid == 0`.
+
+;; fork() + (w dziecku) przekierowanie stdout/stderr do plików, ustawienie
+;; zmiennych środowiskowych i alarmu. Zwraca: -1 (fork nie powiódł się),
+;; 0 (jesteśmy w DZIECKU, gotowym na nałożenie restrykcji i `exec_child`),
+;; albo pid dziecka (rodzic).
+pub fn fork_child(stdout_path: string, stderr_path: string, env_vars: [[string]], timeout_secs: int) -> int is
+    let pid: i32 = fork()
+    if pid < 0 is return -1 end
+    if pid > 0 is return pid end
+
+    ;; ── DZIECKO ──
+    let out_fd: i32 = open(stdout_path, o_creat_wronly_trunc(), mode_644())
+    let err_fd: i32 = open(stderr_path, o_creat_wronly_trunc(), mode_644())
+    if out_fd >= 0 is dup2(out_fd, 1) end
+    if err_fd >= 0 is dup2(err_fd, 2) end
+    if out_fd >= 0 is close(out_fd) end
+    if err_fd >= 0 is close(err_fd) end
+
+    let mut i: int = 0
+    while i < array_len(env_vars) is
+        setenv(env_vars[i][0], env_vars[i][1], 1)
+        i += 1
+    end
+
+    alarm(timeout_secs)
+    return 0
+end
+
+;; Tylko w dziecku: `execlp(interpreter, interpreter, arg1)`. Nie wraca —
+;; jeśli `execlp` zawiedzie, proces kończy się kodem 127 (konwencyjne
+;; "command not found"), więc rodzic odróżni to od niepowodzenia skryptu.
+pub fn exec_child(interpreter: string, arg1: string) is
+    execlp(interpreter, interpreter, arg1, 0)
+    _exit(127)
+end
+
+;; Tylko w rodzicu: czeka na dziecko i zwraca kod wyjścia (0-255).
+pub fn wait_child(pid: int) -> int is
+    let status_buf: i64 = malloc(8)
+    waitpid(pid, status_buf, 0)
+    let mut status: int = 0
+    unsafe is
+        status = ptr_read_i32(status_buf, 0)
+    end
+    free(status_buf)
+
+    ;; WEXITSTATUS(status) — normalny exit koduje kod w bitach 8-15.
+    ;; Jeśli proces zginął od sygnału (np. SIGALRM z timeoutu), niższe 7
+    ;; bitów są niezerowe — zwracamy 124 (konwencja `timeout(1)` z coreutils).
+    if (status & 127) != 0 is
+        return 124
+    end
+    return (status >> 8) & 255
+end
