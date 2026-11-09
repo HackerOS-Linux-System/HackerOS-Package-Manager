@@ -1,0 +1,479 @@
+mod error
+mod manifest
+mod utils
+mod colors
+
+use "std -> fs"     from "fs"
+use "std -> fmt"    from "fmt"
+use "std -> env"    from "env"
+use "std -> time"   from "time"
+use "std -> crypto" from "crypto"
+
+fn standard_lib_dirs() -> [string] is
+    return ["/lib", "/lib64", "/lib32", "/usr/lib", "/usr/lib64", "/usr/lib32"]
+end
+
+pub fn build(args: [string]) -> error::HpmResult<bool> is
+    let mut name: string = ""
+    let mut output: string = ""
+    let mut sign_key: string = ""
+
+    let mut i: int = 0
+    while i < array_len(args) is
+        let a: string = args[i]
+        if a == "--output" || a == "-o" is
+            i += 1
+            if i >= array_len(args) is
+                return error::HpmResult::Err(error::HpmError::InvalidArg("--output requires a path argument"))
+            end
+            output = args[i]
+        elsif a == "--sign" is
+            i += 1
+            if i >= array_len(args) is
+                return error::HpmResult::Err(error::HpmError::InvalidArg("--sign requires a GPG key id / fingerprint argument"))
+            end
+            sign_key = args[i]
+        elsif name == "" && !string_starts_with(a, "-") is
+            name = a
+        else is
+            write("  ⚠ Unknown build argument: " + a)
+        end
+        i += 1
+    end
+
+    write("→ Building hpm package...\n")
+
+    if !fs::exists("info.hk") is
+        return error::HpmResult::Err(error::HpmError::Manifest(
+            "info.hk not found in current directory.\n  Run " + fmt::dim("hpm create") + " to create a new package from scratch."))
+    end
+
+    write(pad(fmt::bold("Validating info.hk:"), 40) + "(checking...)")
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(".")
+    let mut m: manifest::Manifest = manifest::default_manifest("")
+    match mr is
+        HpmResult::Err(e) => return error::HpmResult::Err(error::HpmError::Manifest("info.hk validation failed: " + error::message(e)))
+        HpmResult::Ok(loaded) => m = loaded
+    end
+    write(pad(fmt::bold("Validating info.hk:"), 40) + fmt::red("OK"))
+
+    let validate_r: error::HpmResult<bool> = validate_manifest(m)
+    if error::is_err(validate_r) is return validate_r end
+
+    write(pad(fmt::bold("Package structure:"), 40) + "(checking...)")
+    let has_contents: bool = fs::exists("contents")
+    let has_build_toml: bool = fs::exists("build.toml")
+    if !has_contents && !has_build_toml is
+        return error::HpmResult::Err(error::HpmError::Manifest(
+            "Package needs either contents/ directory or build.toml\n" +
+            "  contents/ — pre-built binary files\n  build.toml — instructions to download or build from source"))
+    end
+    write(pad(fmt::bold("Package structure:"), 40) + fmt::red("OK"))
+
+    if has_contents is
+        write(pad(fmt::bold("Binary executability:"), 40) + "(checking...)")
+        let mut not_exec: [string] = []
+        let mut bi: int = 0
+        while bi < array_len(m.bins) is
+            let bin_name: string = m.bins[bi]
+            let candidates: [string] = ["contents/bin/" + bin_name, "contents/" + bin_name]
+            let mut ci: int = 0
+            while ci < array_len(candidates) is
+                let p: string = candidates[ci]
+                if fs::exists(p) is
+                    let exec_check: error::HpmResult<int> = utils::run_command("test", ["-x", p])
+                    match exec_check is
+                        HpmResult::Ok(code) => is if code != 0 is not_exec = array_push(not_exec, p) end end
+                        HpmResult::Err(_)   => is end
+                    end
+                    ci = array_len(candidates)
+                end
+                ci += 1
+            end
+            bi += 1
+        end
+        if array_len(not_exec) == 0 is
+            write(pad(fmt::bold("Binary executability:"), 40) + fmt::red("OK"))
+        else is
+            write(pad(fmt::bold("Binary executability:"), 40) + "WARNING")
+            let mut ni: int = 0
+            while ni < array_len(not_exec) is
+                write("    ⚠ " + not_exec[ni] + " is not executable")
+                write("      Fix: " + colors::white("git update-index --chmod=+x " + not_exec[ni]))
+                ni += 1
+            end
+        end
+    end
+
+    write(pad(fmt::bold("Portability (shared libs):"), 40) + "(checking...)")
+    let mut portability_warnings: [string] = []
+    let mut pbi: int = 0
+    while pbi < array_len(m.bins) is
+        let bin_name: string = m.bins[pbi]
+        let candidates: [string] = ["contents/bin/" + bin_name, "contents/" + bin_name]
+        let mut ci: int = 0
+        while ci < array_len(candidates) is
+            let p: string = candidates[ci]
+            if fs::exists(p) is
+                portability_warnings = check_binary_portability(p, bin_name, portability_warnings)
+                ci = array_len(candidates)
+            end
+            ci += 1
+        end
+        pbi += 1
+    end
+    if array_len(portability_warnings) == 0 is
+        write(pad(fmt::bold("Portability (shared libs):"), 40) + fmt::red("OK"))
+    else is
+        write(pad(fmt::bold("Portability (shared libs):"), 40) + "WARNING")
+        let mut wi: int = 0
+        while wi < array_len(portability_warnings) is
+            write("    ⚠ " + portability_warnings[wi])
+            wi += 1
+        end
+        write("    These are dynamic library dependencies OUTSIDE contents/ and outside")
+        write("    standard system library paths — they must also exist on the recipient's")
+        write("    machine, or the binary won't run. Consider static linking (e.g. musl),")
+        write("    or bundling the .so files under contents/ next to the binary.")
+    end
+
+    if array_len(m.tags) > 0 is
+        write(pad(fmt::bold("Group tags:"), 40) + "(checking...)")
+        let mut valid: bool = true
+        let mut ti: int = 0
+        while ti < array_len(m.tags) is
+            if !is_valid_tag_chars(m.tags[ti]) is valid = false end
+            ti += 1
+        end
+        if valid is
+            let mut labeled: [string] = []
+            let mut li: int = 0
+            while li < array_len(m.tags) is labeled = array_push(labeled, "@" + m.tags[li]) li += 1 end
+            write(pad(fmt::bold("Group tags:"), 40) + fmt::red("OK") + " [" + fmt::dim(labeled.join(", ")) + "]")
+        else is
+            write(pad(fmt::bold("Group tags:"), 40) + "WARNING")
+            write("    Tags should only contain letters, digits, hyphens and underscores.")
+        end
+    end
+
+    write(pad(fmt::bold("Git tag consistency:"), 40) + "(checking...)")
+    let git_tag: string = get_latest_git_tag()
+    if git_tag != "" is
+        let tag_ver: string = if string_starts_with(git_tag, "v") then string_slice(git_tag, 1, string_len(git_tag)) else git_tag
+        if tag_ver == m.version is
+            write(pad(fmt::bold("Git tag consistency:"), 40) + fmt::red("OK") + " [" + fmt::dim(git_tag) + "]")
+        else is
+            write(pad(fmt::bold("Git tag consistency:"), 40) + "WARNING")
+            write("    Latest git tag: " + fmt::dim(git_tag) + " but info.hk version: " + colors::white(m.version))
+            write("    Create tag: " + colors::white("git tag v" + m.version))
+        end
+    else is
+        write(pad(fmt::bold("Git tag consistency:"), 40) + "NO TAGS")
+        write("    Create a release tag: " + colors::white("git tag v" + m.version))
+    end
+
+    let mut pkg_name: string = name
+    if pkg_name == "" is pkg_name = m.name + "-" + m.version end
+    let mut out_path: string = output
+    if out_path == "" is out_path = pkg_name + ".hpm" end
+
+    write(pad(fmt::bold("Architecture check:"), 40) + "(checking...)")
+    let current_arch: string = os_arch()
+    let mut declared_arch: string = manifest::osm_get(m.system_specs, "arch")
+    if declared_arch == "" is declared_arch = "any" end
+    if declared_arch == "any" || declared_arch == current_arch is
+        write(pad(fmt::bold("Architecture check:"), 40) + fmt::red("OK") + " [" + fmt::dim(declared_arch) + "]")
+    else is
+        write(pad(fmt::bold("Architecture check:"), 40) + "MISMATCH")
+        write("    Package declares arch=" + declared_arch + " but building on " + current_arch)
+    end
+
+    write("")
+
+    let have_zstd: bool = utils::command_exists("zstd")
+    let compress_flag: string = if have_zstd then "-I zstd" else "-z"
+    let compress_label: string = if have_zstd then "zstd" else "gzip — zstd not found in PATH"
+    write(pad(fmt::bold("Packaging → " + out_path + " (" + compress_label + "):"), 40) + "(packing...)")
+    if !have_zstd is
+        write("    ℹ Install zstd for smaller archives (optional): " + fmt::dim("apt install zstd"))
+    end
+
+    let tar_cmd: string = "tar " + compress_flag +
+        " --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner" +
+        " --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime" +
+        " --exclude=.git --exclude=.github --exclude=target --exclude=_build" +
+        " --exclude=*.o --exclude=*.d --exclude=*.tmp --exclude=.staging-*" +
+        " -cf " + shq(out_path) + " ."
+    let tar_r: error::HpmResult<int> = utils::run_command("sh", ["-c", tar_cmd])
+    let mut tar_ok: bool = false
+    match tar_r is
+        HpmResult::Ok(code) => tar_ok = code == 0
+        HpmResult::Err(_)   => tar_ok = false
+    end
+    if tar_ok is
+        write(pad(fmt::bold("Packaging:"), 40) + fmt::red("OK"))
+    else is
+        return error::HpmResult::Err(error::HpmError::Io("tar packaging failed (tried " + (if have_zstd then "zstd" else "gzip") + ")"))
+    end
+
+    if fs::exists(out_path) is
+        let size: int = fs::size(out_path)
+        let human: string = human_size(size)
+        write(pad(fmt::bold("Archive size:"), 40) + fmt::red(human))
+    end
+
+    write(pad(fmt::bold("SHA-256 checksum:"), 40) + "(hashing...)")
+    let checksum_r: error::HpmResult<string> = utils::compute_file_hash(out_path)
+    let mut checksum: string = ""
+    match checksum_r is
+        HpmResult::Ok(c) => checksum = c
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+    end
+    let checksum_path: string = out_path + ".sha256"
+    fs::write(checksum_path, checksum + "  " + out_path + "\n")
+    write(pad(fmt::bold("SHA-256 checksum:"), 40) + fmt::red("OK"))
+    write(pad("", 40) + fmt::dim(checksum_path))
+
+    let mut sig_path: string = ""
+    if sign_key != "" is
+        write(pad(fmt::bold("GPG signature (" + sign_key + "):"), 40) + "(signing...)")
+        let sig_r: error::HpmResult<string> = sign_gpg_detached(out_path, sign_key)
+        match sig_r is
+            HpmResult::Ok(path) => is
+                write(pad(fmt::bold("GPG signature:"), 40) + fmt::red("OK"))
+                write(pad("", 40) + fmt::dim(path))
+                sig_path = path
+            end
+            HpmResult::Err(e) => is
+                write(pad(fmt::bold("GPG signature:"), 40) + "FAILED")
+                write("    ⚠ " + error::message(e))
+                write("    Package built successfully, but unsigned — continuing.")
+            end
+        end
+    end
+
+    write("")
+    write(fmt::red("✔") + " Package built: " + colors::white(out_path))
+    write("")
+    write(fmt::bold("Package summary:"))
+    write("  name    = " + colors::white(m.name))
+    write("  version = " + fmt::red(m.version))
+    write("  author  = " + fmt::dim(m.authors))
+    write("  license = " + fmt::dim(m.license))
+    if array_len(m.bins) > 0 is write("  bins    = " + fmt::dim(m.bins.join(", "))) end
+    if array_len(m.tags) > 0 is
+        let mut labeled2: [string] = []
+        let mut li2: int = 0
+        while li2 < array_len(m.tags) is labeled2 = array_push(labeled2, "@" + m.tags[li2]) li2 += 1 end
+        write("  tags    = " + fmt::dim(labeled2.join(", ")))
+    end
+    write("")
+    write(fmt::bold("Next steps:"))
+    write("  1. " + colors::white("git tag v" + m.version + " && git push origin main --tags"))
+    write("  2. Create a GitHub Release for tag " + colors::white("v" + m.version) + " and attach:")
+    write("       " + fmt::dim(out_path))
+    write("       " + fmt::dim(checksum_path))
+    if sig_path != "" is write("       " + fmt::dim(sig_path)) end
+    write("     Then anyone can run:")
+    write("       " + colors::white("hpm install " + m.name + " --release"))
+    write("     to fetch this exact .hpm from your Releases instead of cloning the repo.")
+    write("  3. Submit a PR to the HPM package index to register your package.")
+    write("     The maintainer will add your repo URL to repo.json (unchanged format —")
+    write("     just the git repo URL; hpm figures out whether to use git or a release .hpm).")
+    write("")
+
+    return error::HpmResult::Ok(true)
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is out = out + " " end
+    return out
+end
+
+fn shq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+fn human_size(size: int) -> string is
+    if size > 1048576 is
+        let mb: f64 = size / 1048576.0
+        return to_string((mb * 10.0).round() / 10.0) + " MB"
+    end
+    let kb: f64 = size / 1024.0
+    return to_string((kb * 10.0).round() / 10.0) + " KB"
+end
+
+fn os_arch() -> string is
+    let out_file: string = env::temp_dir() + "/hpm-arch-" + to_string(time::now_unix())
+    utils::run_command("sh", ["-c", "uname -m > " + shq(out_file)])
+    let mut arch: string = "x86_64"
+    if fs::exists(out_file) is
+        let raw: string = string_trim(fs::read(out_file))
+        fs::remove(out_file)
+        if raw == "x86_64" || raw == "amd64" is arch = "x86_64"
+        elsif raw == "aarch64" || raw == "arm64" is arch = "aarch64"
+        elsif raw != "" is arch = raw
+        end
+    end
+    return arch
+end
+
+fn is_valid_tag_chars(t: string) -> bool is
+    let mut i: int = 0
+    while i < string_len(t) is
+        let c: string = string_at(t, i)
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; ── Walidacja manifestu ─────────────────────────────────────────────
+
+fn validate_manifest(m: manifest::Manifest) -> error::HpmResult<bool> is
+    let mut errors: [string] = []
+    let mut warnings: [string] = []
+
+    if m.name == "" is errors = array_push(errors, "name is empty") end
+    if m.version == "" is errors = array_push(errors, "version is empty") end
+    if m.authors == "" is warnings = array_push(warnings, "authors is empty") end
+    if m.license == "" is warnings = array_push(warnings, "license is empty") end
+    if m.summary == "" is warnings = array_push(warnings, "summary is empty (shown in hpm search)") end
+
+    if m.name != "" is
+        if !is_valid_tag_chars(m.name) is errors = array_push(errors, "name contains invalid characters (only a-z, 0-9, -, _ allowed)") end
+        if string_starts_with(m.name, "-") || string_starts_with(m.name, "_") is
+            errors = array_push(errors, "name must start with a letter or digit")
+        end
+    end
+
+    if m.version != "" is
+        let parts: [string] = string_split(m.version, ".")
+        if array_len(parts) < 2 is
+            warnings = array_push(warnings, "version should follow semver (e.g. 1.0.0)")
+        end
+    end
+
+    if m.is_gui && m.desktop.display_name == "" is
+        warnings = array_push(warnings, "GUI package has no [desktop] display_name")
+    end
+    if array_len(m.bins) > 0 && m.summary == "" is
+        warnings = array_push(warnings, "package has bins but no summary — users won't see description in hpm search")
+    end
+
+    let arch: string = manifest::osm_get(m.system_specs, "arch")
+    if arch != "" is
+        let valid_archs: [string] = ["x86_64", "aarch64", "armhf", "i386", "any"]
+        if !contains_str(valid_archs, arch) is
+            warnings = array_push(warnings, "unknown arch value in [specs] — supported: x86_64, aarch64, armhf, i386, any")
+        end
+    end
+
+    let mut wi: int = 0
+    while wi < array_len(warnings) is write("  ⚠ " + warnings[wi]) wi += 1 end
+
+    if array_len(errors) > 0 is
+        write("")
+        let mut ei: int = 0
+        while ei < array_len(errors) is write("  " + fmt::red("✗") + " " + errors[ei]) ei += 1 end
+        return error::HpmResult::Err(error::HpmError::Manifest("info.hk validation failed with " + to_string(array_len(errors)) + " error(s)"))
+    end
+    return error::HpmResult::Ok(true)
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── Przenośność (ldd) ────────────────────────────────────────────────
+
+fn check_binary_portability(path: string, bin_name: string, warnings: [string]) -> [string] is
+    if !fs::exists(path) is return warnings end
+    let data: bytes = fs::read_bytes(path)
+    ;; Sprawdź magic ELF (pierwsze 4 bajty 0x7f 'E' 'L' 'F') — via odczyt
+    ;; pierwszych znaków w formie tekstowej ("\x7fELF") wystarczy tu jako
+    ;; heurystyka (skrypty tekstowe zaczynają się od "#!" albo zwykłego tekstu).
+    let head: string = fs::read(path)
+    if string_len(head) < 4 || string_slice(head, 1, 4) != "ELF" is
+        return warnings ;; skrypt/nie-ELF — nic do sprawdzenia
+    end
+
+    let out_file: string = env::temp_dir() + "/hpm-ldd-" + to_string(time::now_unix())
+    utils::run_command("sh", ["-c", "ldd " + shq(path) + " > " + shq(out_file) + " 2>/dev/null"])
+    if !fs::exists(out_file) is return warnings end
+    let text: string = fs::read(out_file)
+    fs::remove(out_file)
+
+    if string_contains(text, "not a dynamic executable") is return warnings end
+
+    let mut out: [string] = warnings
+    let lines: [string] = string_split(text, "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = string_trim(lines[i])
+        if string_contains(line, "=> not found") is
+            let parts: [string] = string_split(line, " ")
+            let libname: string = if array_len(parts) > 0 then parts[0] else line
+            out = array_push(out, bin_name + ": missing dependency '" + libname + "' — broken even on THIS machine, will definitely fail for users")
+        else is
+            let idx: int = string_find(line, "=> ")
+            if idx >= 0 is
+                let after: string = string_slice(line, idx + 3, string_len(line))
+                let paren: int = string_find(after, " (")
+                let mut resolved_raw: string = after
+                if paren >= 0 is
+                    resolved_raw = string_slice(after, 0, paren)
+                end
+                let resolved: string = string_trim(resolved_raw)
+                if resolved != "" && resolved != "not found" is
+                    let mut is_standard: bool = false
+                    let dirs: [string] = standard_lib_dirs()
+                    let mut d: int = 0
+                    while d < array_len(dirs) is
+                        if string_starts_with(resolved, dirs[d]) is is_standard = true end
+                        d += 1
+                    end
+                    if !is_standard is
+                        out = array_push(out, bin_name + ": links against '" + resolved + "' from a non-standard path — may not exist on the target machine")
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+fn get_latest_git_tag() -> string is
+    let out_file: string = env::temp_dir() + "/hpm-tag-" + to_string(time::now_unix())
+    utils::run_command("sh", ["-c", "git describe --tags --abbrev=0 > " + shq(out_file) + " 2>/dev/null"])
+    let mut tag: string = ""
+    if fs::exists(out_file) is
+        tag = string_trim(fs::read(out_file))
+        fs::remove(out_file)
+    end
+    return tag
+end
+
+fn sign_gpg_detached(archive: string, key_id: string) -> error::HpmResult<string> is
+    let sig_path: string = archive + ".sig"
+    if fs::exists(sig_path) is fs::remove(sig_path) end
+    let cmd: string = "gpg --batch --yes --local-user " + shq(key_id) + " --detach-sign --output " + shq(sig_path) + " " + shq(archive)
+    let r: error::HpmResult<int> = utils::run_command("sh", ["-c", cmd])
+    match r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(code) => is
+            if code != 0 || !fs::exists(sig_path) is
+                return error::HpmResult::Err(error::HpmError::Sandbox("GPG signing failed (secret key '" + key_id + "' not found or gpg error)"))
+            end
+            return error::HpmResult::Ok(sig_path)
+        end
+    end
+end
