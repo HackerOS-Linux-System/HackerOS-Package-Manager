@@ -1,0 +1,435 @@
+mod error
+mod verbose
+
+use "std -> fs"     from "fs"
+use "std -> path"   from "path"
+use "std -> crypto" from "crypto"
+use "std -> sort"   from "sort"
+use "std -> env"    from "env"
+use "std -> fmt"    from "fmt"
+use "std -> io"     from "io"
+
+extern static [c] is
+    fn open(path: string, flags: i32, mode: i32) -> i32
+    fn close(fd: i32) -> i32
+    fn flock(fd: i32, operation: i32) -> i32
+    fn unlink(path: string) -> i32
+    fn chmod(path: string, mode: i32) -> i32
+    fn system(cmd: string) -> i32
+    fn getenv(name: string) -> string
+    fn symlink(target: string, linkpath: string) -> i32
+end
+
+;; ── Stałe libc (Linux x86_64/aarch64 — wartości ABI-stabilne) ──────────
+fn o_creat() -> i32 is return 64 end
+fn o_rdwr()  -> i32 is return 2 end
+fn lock_ex() -> i32 is return 2 end
+fn lock_nb() -> i32 is return 4 end
+fn mode_644() -> i32 is return 420 end   ;; 0644
+fn mode_755() -> i32 is return 493 end   ;; 0755
+
+fn lock_path() -> string is
+    return "/var/lib/hpm/hpm.lock"
+end
+
+;; ── "current version" per pakiet: symlink + marker (patrz state.h#) ────
+;;
+;; `<store>/<pkg>/current` to prawdziwy symlink na dysk (tworzony przez
+;; libc `symlink()`, żeby narzędzia SPOZA hpm — `ls`, `file`, ręczna
+;; inspekcja — widziały normalne, oczekiwane dowiązanie), a
+;; `<store>/<pkg>/current.hpm-marker` to zwykły plik tekstowy z samą
+;; nazwą wersji, którego hpm używa do odczytu (bo H# nie ma `readlink()`
+;; w bezpiecznej formie — zob. komentarz w `state.h#::get_current_version`).
+pub fn set_current_version(store_pkg_dir: string, version: string) -> error::HpmResult<bool> is
+    let link: string = path::join(store_pkg_dir, "current")
+    let marker: string = path::join(store_pkg_dir, "current.hpm-marker")
+    let target: string = path::join(store_pkg_dir, version)
+
+    if fs::exists(link) is
+        unlink(link) ;; usuń stary symlink (fs::remove też by zadziałał, ale to prawdziwy plik-specjalny, nie zwykły plik)
+    end
+    let rc: i32 = symlink(target, link)
+    if rc != 0 is
+        return error::HpmResult::Err(error::HpmError::Io("cannot create symlink " + link + " -> " + target))
+    end
+    fs::write(marker, version)
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Blokada procesu — odpowiednik `acquire_lock`/`release_lock` (fs2) ──
+
+pub fn acquire_lock() -> error::HpmResult<int> is
+    let lock_dir: string = path::parent(lock_path())
+    if !fs::exists(lock_dir) is
+        fs::mkdir(lock_dir)
+    end
+    let fd: i32 = open(lock_path(), o_creat() | o_rdwr(), mode_644())
+    if fd < 0 is
+        return error::HpmResult::Err(error::HpmError::Io("cannot open lock file " + lock_path()))
+    end
+    let rc: i32 = flock(fd, lock_ex() | lock_nb())
+    if rc != 0 is
+        close(fd)
+        return error::HpmResult::Err(error::HpmError::Permission(
+            "Another hpm process is already running (lock held on " + lock_path() + ")"))
+    end
+    verbose::vlog("acquired lock, fd=" + to_string(fd))
+    return error::HpmResult::Ok(fd)
+end
+
+pub fn release_lock(fd: int) is
+    flock(fd, 8) ;; LOCK_UN = 8
+    close(fd)
+    verbose::vlog("released lock, fd=" + to_string(fd))
+end
+
+;; ── Hashowanie ──────────────────────────────────────────────────────────
+
+pub fn compute_file_hash(path: string) -> error::HpmResult<string> is
+    if !fs::exists(path) is
+        return error::HpmResult::Err(error::HpmError::Io("file not found: " + path))
+    end
+    let data: bytes = fs::read_bytes(path)
+    return error::HpmResult::Ok(crypto::sha256_bytes(data))
+end
+
+;; Odpowiednik `compute_dir_hash`: hashuje w kolejności posortowanej
+;; ścieżek (deterministyczne niezależnie od kolejności zwróconej przez
+;; system plików), łącząc ścieżkę względną + zawartość każdego pliku.
+;; `std -> path` nie ma `relative()` — odtwarzamy najprostszy przypadek:
+;; ścieżka zwrócona przez `fs::walk(dir)` zawsze zaczyna się od `dir`.
+fn relative_to(base: string, full: string) -> string is
+    let prefix: string = base + "/"
+    if string_starts_with(full, prefix) is
+        return string_slice(full, string_len(prefix), string_len(full))
+    end
+    if full == base is return "" end
+    return full
+end
+
+pub fn compute_dir_hash(dir: string) -> error::HpmResult<string> is
+    if !fs::exists(dir) is
+        return error::HpmResult::Err(error::HpmError::Io("directory not found: " + dir))
+    end
+    let mut files: [string] = fs::walk(dir)
+;; `sort::sort_strings` sortuje tablicę W MIEJSCU i nic nie zwraca (std v0.9).
+    sort::sort_strings(files)
+
+    let mut combined: string = ""
+    let mut i: int = 0
+    while i < files.len() is
+        let f: string = files[i]
+        if fs::is_file(f) is
+            let rel: string = relative_to(dir, f)
+            let data: bytes = fs::read_bytes(f)
+            combined = combined + rel + ":" + crypto::sha256_bytes(data) + "\n"
+        end
+        i += 1
+    end
+    return error::HpmResult::Ok(crypto::sha256(combined))
+end
+
+;; ── Kopiowanie katalogów ─────────────────────────────────────────────
+
+pub fn copy_dir_all(src: string, dst: string) -> error::HpmResult<bool> is
+    if !fs::exists(src) is
+        return error::HpmResult::Err(error::HpmError::Io("source directory not found: " + src))
+    end
+    mkdir_all(dst)
+
+    let entries: [string] = fs::list_dir(src)
+    let mut i: int = 0
+    while i < entries.len() is
+        let name: string = entries[i]
+        let src_path: string = path::join(src, name)
+        let dst_path: string = path::join(dst, name)
+        if fs::is_dir(src_path) is
+            let sub: error::HpmResult<bool> = copy_dir_all(src_path, dst_path)
+            if error::is_err(sub) is return sub end
+        else is
+            fs::copy(src_path, dst_path)
+        end
+        i += 1
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; `fs::mkdir` nie tworzy katalogów pośrednich (brak `mkdir -p` w std) —
+;; odtwarzamy to ręcznie, segment po segmencie.
+pub fn mkdir_all(dir: string) is
+    if dir == "" || dir == "/" || fs::exists(dir) is return end
+    let parent: string = path::parent(dir)
+    if parent != dir is
+        mkdir_all(parent)
+    end
+    if !fs::exists(dir) is
+        fs::mkdir(dir)
+    end
+end
+
+;; ── Uprawnienia ──────────────────────────────────────────────────────
+
+pub fn make_executable(path: string) -> error::HpmResult<bool> is
+    let rc: i32 = chmod(path, mode_755())
+    if rc != 0 is
+        return error::HpmResult::Err(error::HpmError::Permission("chmod +x failed for " + path))
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Uruchamianie poleceń ──────────────────────────────────────────────
+;;
+;; `std -> process` (`process::run_args`) zwraca tylko stdout, nie kod
+;; wyjścia — a `download_file`/`run_command` z Rust jawnie sprawdzały
+;; `.success()`. `system()` z libc daje prawdziwy kod wyjścia (jak
+;; `libc::WEXITSTATUS` na wynik `waitpid`, tyle że `system()` już go
+;; dekoduje samodzielnie na większości platform — pattern identyczny do
+;; `bytes-main/src/cli.h#`'s `extern dynamic [c] fn system`, tu jako
+;; `extern static [c]` zgodnie z życzeniem).
+pub fn run_command(cmd: string, args: [string]) -> error::HpmResult<int> is
+    let full: string = build_shell_command(cmd, args)
+    verbose::vlog("spawning: " + full)
+    let rc: i32 = system(full)
+    let code: int = rc / 256 ;; system() koduje kod wyjścia w starszym bajcie na Linuksie
+    return error::HpmResult::Ok(code)
+end
+
+fn shell_quote(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+fn build_shell_command(cmd: string, args: [string]) -> string is
+    let mut full: string = shell_quote(cmd)
+    let mut i: int = 0
+    while i < array_len(args) is
+        full = full + " " + shell_quote(args[i])
+        i += 1
+    end
+    return full
+end
+
+;; ── Pobieranie plików ─────────────────────────────────────────────────
+
+pub fn download_file(url: string, dest: string) -> error::HpmResult<bool> is
+    verbose::vlog("downloading " + url + " -> " + dest)
+    let result: error::HpmResult<int> = run_command("curl", ["-fsSL", "-o", dest, url])
+    match result is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(code) => is
+            if code != 0 is
+                return error::HpmResult::Err(error::HpmError::Network("curl exited with code " + to_string(code) + " for " + url))
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+;; ── Tablice: wycinek ──────────────────────────────────────────────────
+;; `arr[a..b]` na tablicy bywało w backendzie natywnym kompilowane jak wycinek
+;; NAPISU (śmieciowy wskaźnik); kompilator ma już `hsh_array_slice`, ale te
+;; helpery nie zależą od wersji kompilatora. [from, to) — jak w Ruście, z przycięciem.
+pub fn array_slice(arr: [string], from: int, to: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = from
+    if i < 0 is i = 0 end
+    let mut end_i: int = to
+    if end_i > array_len(arr) is end_i = array_len(arr) end
+    while i < end_i is
+        out = array_push(out, arr[i])
+        i += 1
+    end
+    return out
+end
+
+;; ── HTTP(S) przez curl ───────────────────────────────────────────────
+;;
+;; `std -> http` (`http::get_full`) w backendzie natywnym to surowy klient
+;; HTTP/1.1 po gnieździe: BEZ TLS, bez przekierowań i bez dekodowania
+;; chunked. Indeks pakietów, raw.githubusercontent.com i api.github.com są
+;; pod `https://` (i często za 301/302), więc każde `http::get_full` zwracało
+;; status 0 i hpm kończył pobieranie błędem. `curl` jest i tak zależnością
+;; hpm (patrz `download_file`), więc GET-y idą przez niego: obsługuje TLS,
+;; przekierowania i proxy ze środowiska.
+
+pub struct HttpResponse is
+    pub status: int
+    pub body:   string
+end
+
+;; GET `url`. `status` = kod HTTP, albo 0 gdy curl nie dał rady połączyć się /
+;; zweryfikować TLS / rozwiązać nazwy (wtedy `body` zawiera komunikat curl-a,
+;; żeby wywołujący mógł go pokazać zamiast pustego błędu).
+pub fn http_get(url: string) -> HttpResponse is
+    let body_path: string = fs::temp_file("hpm-http-body")
+    let err_path: string = fs::temp_file("hpm-http-err")
+    let cmd: string = "curl -sSL --connect-timeout 15 --max-time 120 -o " + shell_quote(body_path) +
+        " -w '%{{http_code}}' " + shell_quote(url) + " 2> " + shell_quote(err_path)
+    let out_path: string = fs::temp_file("hpm-http-code")
+    verbose::vlog("GET " + url)
+    system(cmd + " > " + shell_quote(out_path))
+    let code_txt: string = string_trim(fs::read(out_path))
+    let mut status: int = parse_int_or(code_txt, 0)
+    let mut body: string = fs::read(body_path)
+    if status < 100 is
+        let err: string = string_trim(fs::read(err_path))
+        body = if err != "" then err else "curl failed (no HTTP response)"
+        status = 0
+    end
+    fs::remove(body_path)
+    fs::remove(err_path)
+    fs::remove(out_path)
+    return HttpResponse { status: status, body: body }
+end
+
+;; ── Porównywanie wersji (SemVer-lite, jak Rust `compare_versions`) ─────
+;;
+;; Zwraca -1 / 0 / 1 zamiast `std::cmp::Ordering` (H# nie ma tego typu w
+;; std) — dokładnie ten sam trójstanowy wynik, tylko jako `int`.
+pub fn compare_versions(a: string, b: string) -> int is
+    let pa: [string] = string_split(a, ".")
+    let pb: [string] = string_split(b, ".")
+    let n: int = max_int(array_len(pa), array_len(pb))
+    let mut i: int = 0
+    while i < n is
+        let na: int = if i < array_len(pa) then parse_version_part(pa[i]) else 0
+        let nb: int = if i < array_len(pb) then parse_version_part(pb[i]) else 0
+        if na < nb is return -1 end
+        if na > nb is return 1 end
+        i += 1
+    end
+    return 0
+end
+
+;; Wrapper zgodny z sygnaturą `fn(any, any) -> int` oczekiwaną przez
+;; `sort::sort_by`/`sort::sort_by_key` (np. w `repo.h#`/`state.h#`).
+pub fn compare_versions_cmp(a: any, b: any) -> int is
+    return compare_versions(a, b)
+end
+
+fn parse_version_part(s: string) -> int is
+    ;; Odetnij ewentualny sufiks pre-release/build ("1-beta" -> 1, "2+meta" -> 2)
+    let mut clean: string = s
+    let dash: int = string_find(clean, "-")
+    if dash >= 0 is clean = string_slice(clean, 0, dash) end
+    let plus: int = string_find(clean, "+")
+    if plus >= 0 is clean = string_slice(clean, 0, plus) end
+    return parse_int_or(clean, 0)
+end
+
+fn parse_int_or(s: string, default_val: int) -> int is
+    let parsed: int? = parse_int(s)
+    if parsed == nil is return default_val end
+    return parsed?
+end
+
+fn max_int(a: int, b: int) -> int is
+    if a > b is return a end
+    return b
+end
+
+;; Odpowiednik `satisfies` — obsługuje ">=", "<=", ">", "<", "=", "^", "~"
+;; oraz brak operatora (dokładne dopasowanie), tak jak Rust `utils::satisfies`.
+pub fn satisfies(version: string, req: string) -> bool is
+    let r: string = string_trim(req)
+    if r == "" || r == "*" is return true end
+
+    if string_starts_with(r, ">=") is
+        return compare_versions(version, string_trim(string_slice(r, 2, string_len(r)))) >= 0
+    end
+    if string_starts_with(r, "<=") is
+        return compare_versions(version, string_trim(string_slice(r, 2, string_len(r)))) <= 0
+    end
+    if string_starts_with(r, ">") is
+        return compare_versions(version, string_trim(string_slice(r, 1, string_len(r)))) > 0
+    end
+    if string_starts_with(r, "<") is
+        return compare_versions(version, string_trim(string_slice(r, 1, string_len(r)))) < 0
+    end
+    if string_starts_with(r, "^") is
+        ;; Zgodność "kompatybilna" — ta sama wersja główna (major), >= żądanej.
+        let target: string = string_trim(string_slice(r, 1, string_len(r)))
+        let vmajor: string = major_of(version)
+        let tmajor: string = major_of(target)
+        return vmajor == tmajor && compare_versions(version, target) >= 0
+    end
+    if string_starts_with(r, "~") is
+        ;; Zgodność "przybliżona" — te same major.minor, >= żądanej.
+        let target: string = string_trim(string_slice(r, 1, string_len(r)))
+        return minor_prefix_of(version) == minor_prefix_of(target) && compare_versions(version, target) >= 0
+    end
+    return compare_versions(version, r) == 0
+end
+
+fn major_of(v: string) -> string is
+    let parts: [string] = string_split(v, ".")
+    if array_len(parts) > 0 is return parts[0] end
+    return v
+end
+
+fn minor_prefix_of(v: string) -> string is
+    let parts: [string] = string_split(v, ".")
+    if array_len(parts) >= 2 is return parts[0] + "." + parts[1] end
+    return v
+end
+
+;; ── Zależności systemowe (.deb) ───────────────────────────────────────
+;;
+;; Odpowiednik `ensure_deb_packages`: sprawdza `dpkg -s <pkg>` dla każdej
+;; zależności i, jeśli brakuje, pyta o zgodę i instaluje przez `apt-get`.
+pub fn command_exists(name: string) -> bool is
+    let path_var: string = env::get_or("PATH", "")
+    let dirs: [string] = string_split(path_var, ":")
+    let mut i: int = 0
+    while i < array_len(dirs) is
+        let candidate: string = path::join(dirs[i], name)
+        if fs::exists(candidate) && fs::is_file(candidate) is return true end
+        i += 1
+    end
+    return false
+end
+
+fn deb_package_installed(pkg: string) -> bool is
+    let result: error::HpmResult<int> = run_command("dpkg", ["-s", pkg])
+    match result is
+        HpmResult::Ok(code) => return code == 0
+        HpmResult::Err(_)   => return false
+    end
+end
+
+pub fn ensure_deb_packages(packages: [string]) -> error::HpmResult<bool> is
+    if array_len(packages) == 0 is return error::HpmResult::Ok(true) end
+
+    let mut missing: [string] = []
+    let mut i: int = 0
+    while i < array_len(packages) is
+        if !deb_package_installed(packages[i]) is
+            missing = array_push(missing, packages[i])
+        end
+        i += 1
+    end
+
+    if array_len(missing) == 0 is return error::HpmResult::Ok(true) end
+
+    write(fmt::yellow("The following system (.deb) packages are required: " + missing.join(", ")))
+    let answer: string = io::read_line("Install them now with apt-get? [Y/n] ")
+    let a: string = string_lower(string_trim(answer))
+    if a == "n" || a == "no" is
+        return error::HpmResult::Err(error::HpmError::Permission("required system packages declined by user"))
+    end
+
+    let mut apt_args: [string] = ["install", "-y"]
+    let mut j: int = 0
+    while j < array_len(missing) is
+        apt_args = array_push(apt_args, missing[j])
+        j += 1
+    end
+    match run_command("sudo", array_concat(["apt-get"], apt_args)) is
+        HpmResult::Ok(code) => is
+            if code != 0 is
+                return error::HpmResult::Err(error::HpmError::Io("apt-get install failed with code " + to_string(code)))
+            end
+            return error::HpmResult::Ok(true)
+        end
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+    end
+end
