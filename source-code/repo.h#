@@ -1,0 +1,902 @@
+mod error
+mod manifest
+mod utils
+mod paths
+mod verbose
+
+use "std -> fs"    from "fs"
+use "std -> path"  from "path"
+use "std -> json"  from "json"
+use "std -> regex" from "regex"
+use "std -> sort"  from "sort"
+use "std -> toml"  from "toml"
+use "std -> time"  from "time"
+use "std -> env"   from "env"
+
+fn repo_json_url_default() -> string is
+    return "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Package-Manager/main/repo/repo.json"
+end
+
+fn cache_ttl_secs() -> int is return 3600 end
+
+fn allowed_schemes() -> [string] is
+    return ["https://", "http://", "ssh://", "git@"]
+end
+
+fn meta_cache_dir() -> string is
+    return paths::cache_dir() + "/meta"
+end
+
+fn repos_dir() -> string is
+    let p: string = env::temp_dir() + "/hpm/repos"
+    utils::mkdir_all(p)
+    return p
+end
+
+;; ── Walidacja URL — blokuje file://, path traversal, localhost ────────
+
+pub fn validate_repo_url(raw_url: string) -> error::HpmResult<bool> is
+    let url: string = string_trim(raw_url)
+    if url == "" is
+        return error::HpmResult::Err(error::HpmError::InvalidArg("Repository URL is empty"))
+    end
+
+    let schemes: [string] = allowed_schemes()
+    let mut allowed: bool = false
+    let mut i: int = 0
+    while i < array_len(schemes) is
+        if string_starts_with(url, schemes[i]) is allowed = true end
+        i += 1
+    end
+    if !allowed is
+        return error::HpmResult::Err(error::HpmError::InvalidArg(
+            "Repository URL '" + url + "' uses an unsupported scheme.\n" +
+            "  Only " + schemes.join(", ") + " are allowed.\n" +
+            "  This prevents accidental access to local paths or unsafe protocols."))
+    end
+
+    if string_starts_with(url, "https://") || string_starts_with(url, "http://") is
+        let without_scheme: string = string_replace(string_replace(url, "https://", ""), "http://", "")
+        let parts: [string] = string_split(without_scheme, "/")
+        let hostname: string = if array_len(parts) > 0 then parts[0] else ""
+        if hostname == "" is
+            return error::HpmResult::Err(error::HpmError::InvalidArg("Repository URL '" + url + "' has no hostname"))
+        end
+        if hostname == "localhost" || string_starts_with(hostname, "127.") || string_starts_with(hostname, "::1") is
+            return error::HpmResult::Err(error::HpmError::InvalidArg("Repository URL '" + url + "' points to localhost — not allowed"))
+        end
+    end
+
+    if string_contains(url, "../") || string_contains(url, "..\\") is
+        return error::HpmResult::Err(error::HpmError::InvalidArg("Repository URL '" + url + "' contains path traversal sequence"))
+    end
+
+    return error::HpmResult::Ok(true)
+end
+
+;; ── RepoIndex — płaska mapa nazwa -> url ───────────────────────────────
+
+pub struct RepoIndex is
+    pub names: [string]
+    pub urls:  [string]
+end
+
+pub fn repo_index_empty() -> RepoIndex is
+    return RepoIndex { names: [], urls: [] }
+end
+
+pub fn parse_repo_index(content: string) -> RepoIndex is
+    let pairs: [[string]] = regex::captures_all(content, "\"([^\"]+)\"\\s*:\\s*\"([^\"]+)\"")
+    let mut names: [string] = []
+    let mut urls: [string] = []
+    let mut i: int = 0
+    while i < array_len(pairs) is
+        if array_len(pairs[i]) >= 3 is
+            names = array_push(names, pairs[i][1])
+            urls = array_push(urls, pairs[i][2])
+        end
+        i += 1
+    end
+    return RepoIndex { names: names, urls: urls }
+end
+
+pub fn index_url_of(idx: RepoIndex, name: string) -> string is
+    let mut i: int = 0
+    while i < array_len(idx.names) is
+        if idx.names[i] == name is return idx.urls[i] end
+        i += 1
+    end
+    return ""
+end
+
+pub fn index_names(idx: RepoIndex) -> [string] is
+    let mut sorted: [string] = idx.names
+    sort::sort_strings(sorted)
+    return sorted
+end
+
+pub fn index_len(idx: RepoIndex) -> int is
+    return array_len(idx.names)
+end
+
+pub fn index_validate_urls(idx: RepoIndex) -> error::HpmResult<bool> is
+    let mut bad: [string] = []
+    let mut i: int = 0
+    while i < array_len(idx.names) is
+        let r: error::HpmResult<bool> = validate_repo_url(idx.urls[i])
+        if error::is_err(r) is
+            match r is
+                HpmResult::Err(e) => bad = array_push(bad, "  " + idx.names[i] + ": " + error::message(e))
+                HpmResult::Ok(_)  => is end
+            end
+        end
+        i += 1
+    end
+    if array_len(bad) > 0 is
+        return error::HpmResult::Err(error::HpmError::Network(
+            "repo.json contains invalid repository URLs:\n" + bad.join("\n") +
+            "\n  Contact the maintainer to fix repo.json."))
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; ── PackageMeta ──────────────────────────────────────────────────────
+
+pub struct PackageMeta is
+    pub name:               string
+    pub version:            string
+    pub summary:            string
+    pub authors:            string
+    pub license:            string
+    pub tags:               [string]
+    pub available_versions: [string]
+    pub fetched_at:         int
+end
+
+pub fn meta_is_stale(m: PackageMeta) -> bool is
+    let now: int = time::now_unix()
+    let age: int = now - m.fetched_at
+    return age > cache_ttl_secs()
+end
+
+fn meta_to_json(m: PackageMeta) -> string is
+    let mut obj: string = json::object()
+    obj = json::set_str(obj, "name", m.name)
+    obj = json::set_str(obj, "version", m.version)
+    obj = json::set_str(obj, "summary", m.summary)
+    obj = json::set_str(obj, "authors", m.authors)
+    obj = json::set_str(obj, "license", m.license)
+    obj = json::set_str_array(obj, "tags", m.tags)
+    obj = json::set_str_array(obj, "available_versions", m.available_versions)
+    obj = json::set_int(obj, "fetched_at", m.fetched_at)
+    return obj
+end
+
+fn meta_from_json(obj: string) -> PackageMeta is
+    return PackageMeta {
+        name: json::get_str(obj, "name"), version: json::get_str(obj, "version"),
+        summary: json::get_str(obj, "summary"), authors: json::get_str(obj, "authors"),
+        license: json::get_str(obj, "license"), tags: json::get_str_array(obj, "tags"),
+        available_versions: json::get_str_array(obj, "available_versions"),
+        fetched_at: json::get_int(obj, "fetched_at"),
+    }
+end
+
+;; ── Cache metadanych ─────────────────────────────────────────────────
+
+fn cache_path_for(name: string) -> string is
+    return meta_cache_dir() + "/" + name + ".json"
+end
+
+pub fn load_cached_meta(name: string) -> PackageMeta is
+    let p: string = cache_path_for(name)
+    if !fs::exists(p) is return PackageMeta { name: "", version: "", summary: "", authors: "", license: "", tags: [], available_versions: [], fetched_at: 0 } end
+    return meta_from_json(fs::read(p))
+end
+
+pub fn has_cached_meta(name: string) -> bool is
+    return fs::exists(cache_path_for(name))
+end
+
+fn save_cached_meta(m: PackageMeta) is
+    utils::mkdir_all(meta_cache_dir())
+    fs::write(cache_path_for(m.name), meta_to_json(m))
+end
+
+pub fn invalidate_meta_cache() is
+    let dir: string = meta_cache_dir()
+    if !fs::exists(dir) is return end
+    let entries: [string] = fs::list_dir(dir)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        fs::remove(dir + "/" + entries[i])
+        i += 1
+    end
+end
+
+;; ── Parsowanie info.hk → PackageMeta ────────────────────────────────
+
+pub fn parse_meta_from_content(name: string, content: string) -> PackageMeta is
+    let now: int = time::now_unix()
+    let tmp: string = env::temp_dir() + "/hpm-meta-" + to_string(now) + "-" + name
+    utils::mkdir_all(tmp)
+    fs::write(tmp + "/info.hk", content)
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(tmp)
+    fs::rmdir_all(tmp)
+
+    match mr is
+        HpmResult::Ok(m) => is
+            return PackageMeta {
+                name: name, version: m.version, summary: m.summary, authors: m.authors,
+                license: m.license, tags: m.tags, available_versions: [], fetched_at: now,
+            }
+        end
+        HpmResult::Err(_) => is
+            ;; Fallback — prosty skan tekstowy linia po linii.
+            let mut version: string = "unknown"
+            let mut summary: string = "No description available"
+            let mut authors: string = ""
+            let mut license: string = ""
+            let lines: [string] = string_split(content, "\n")
+            let mut i: int = 0
+            while i < array_len(lines) is
+                let l: string = string_trim(lines[i])
+                let v: string = extract_hk_value(l, "version")
+                if v != "" is version = v end
+                let s: string = extract_hk_value(l, "summary")
+                if s != "" is summary = s end
+                let a: string = extract_hk_value(l, "authors")
+                if a != "" is authors = a end
+                let lic: string = extract_hk_value(l, "license")
+                if lic != "" is license = lic end
+                i += 1
+            end
+            return PackageMeta { name: name, version: version, summary: summary, authors: authors,
+                license: license, tags: [], available_versions: [], fetched_at: now }
+        end
+    end
+end
+
+fn extract_hk_value(line: string, key: string) -> string is
+    let prefix: string = key + " ="
+    if !string_starts_with(line, prefix) is return "" end
+    let rest: string = string_trim(string_slice(line, string_len(prefix), string_len(line)))
+    if string_len(rest) >= 2 && string_starts_with(rest, "\"") && string_ends_with(rest, "\"") is
+        return string_slice(rest, 1, string_len(rest) - 1)
+    end
+    return rest
+end
+
+;; ── Wersje z lokalnego repo (git CLI) ─────────────────────────────────
+
+fn git_output(dir: string, args: [string]) -> string is
+    ;; `utils::run_command` daje tylko kod wyjścia — do przechwycenia
+    ;; stdout `git` (tagi, `show`) potrzebujemy realnej treści, więc
+    ;; przekierowujemy do pliku tymczasowego i czytamy go z powrotem
+    ;; (ten sam wzorzec co `sandbox_ffi.h#`, bez potrzeby FFI tutaj).
+    let out_file: string = env::temp_dir() + "/hpm-git-out-" + to_string(time::now_unix())
+    let full_args: [string] = array_concat(["-C", dir], args)
+    let cmd: string = "git " + shell_quote_all(full_args) + " > " + shell_quote(out_file) + " 2>/dev/null"
+    utils::run_command("sh", ["-c", cmd])
+    let mut out: string = ""
+    if fs::exists(out_file) is
+        out = fs::read(out_file)
+        fs::remove(out_file)
+    end
+    return out
+end
+
+fn shell_quote(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+fn shell_quote_all(args: [string]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(args) is
+        parts = array_push(parts, shell_quote(args[i]))
+        i += 1
+    end
+    return parts.join(" ")
+end
+
+fn get_local_versions(pkg_name: string) -> [string] is
+    let repo_path: string = repos_dir() + "/" + pkg_name
+    if !fs::exists(repo_path) is return [] end
+    let tags_raw: string = git_output(repo_path, ["tag"])
+    let lines: [string] = string_split(tags_raw, "\n")
+    let mut vers: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let t: string = string_trim(lines[i])
+        if t != "" is
+            let v: string = if string_starts_with(t, "v") then string_slice(t, 1, string_len(t)) else t
+            vers = array_push(vers, v)
+        end
+        i += 1
+    end
+    sort::sort_by(vers, utils::compare_versions_cmp) ;; sortuje w miejscu (nie polegamy na wartości zwracanej)
+    return vers
+end
+
+;; ── collect_tag_manifests ────────────────────────────────────────────
+
+pub struct TagManifest is
+    pub version:  string
+    pub commit:   string
+    pub manifest: manifest::Manifest
+end
+
+fn collect_tag_manifests(repo_path: string) -> [TagManifest] is
+    let tags_raw: string = git_output(repo_path, ["tag"])
+    let tag_lines: [string] = string_split(tags_raw, "\n")
+    let mut result: [TagManifest] = []
+    let mut i: int = 0
+    while i < array_len(tag_lines) is
+        let tag_name: string = string_trim(tag_lines[i])
+        if tag_name != "" is
+            let ver_str: string = if string_starts_with(tag_name, "v") then string_slice(tag_name, 1, string_len(tag_name)) else tag_name
+            let commit: string = string_trim(git_output(repo_path, ["rev-parse", tag_name]))
+            let content: string = git_output(repo_path, ["show", tag_name + ":info.hk"])
+            if content != "" is
+                let tmp: string = env::temp_dir() + "/hpm-tag-" + to_string(time::now_unix()) + "-" + ver_str
+                utils::mkdir_all(tmp)
+                fs::write(tmp + "/info.hk", content)
+                let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(tmp)
+                fs::rmdir_all(tmp)
+                match mr is
+                    HpmResult::Ok(m) => result = array_push(result, TagManifest { version: ver_str, commit: commit, manifest: m })
+                    HpmResult::Err(_) => is end
+                end
+            end
+        end
+        i += 1
+    end
+    return result
+end
+
+;; ── HTTP raw fetch (z fallbackiem do git clone dla nie-GitHub) ─────────
+
+fn raw_base_url(repo_url: string) -> string is
+    let mut url: string = repo_url
+    if string_ends_with(url, "/") is url = string_slice(url, 0, string_len(url) - 1) end
+    if string_ends_with(url, ".git") is url = string_slice(url, 0, string_len(url) - 4) end
+    if string_contains(url, "github.com") is
+        return string_replace(url, "https://github.com/", "https://raw.githubusercontent.com/")
+    end
+    return ""
+end
+
+fn slug_for_url(url: string) -> string is
+    let mut base: string = url
+    if string_ends_with(base, "/") is base = string_slice(base, 0, string_len(base) - 1) end
+    if string_ends_with(base, ".git") is base = string_slice(base, 0, string_len(base) - 4) end
+    let parts: [string] = string_split(base, "/")
+    let last: string = if array_len(parts) > 0 then parts[array_len(parts) - 1] else "repo"
+    let mut slug: string = ""
+    let mut i: int = 0
+    while i < string_len(last) is
+        let c: string = string_at(last, i)
+        if regex::is_match(c, "[a-zA-Z0-9_-]") is slug = slug + c else is slug = slug + "_" end
+        i += 1
+    end
+    if slug == "" is return "repo" end
+    return "_meta_" + slug
+end
+
+pub fn clone_package_repo(name: string, url: string) -> error::HpmResult<string> is
+    let v: error::HpmResult<bool> = validate_repo_url(url)
+    if error::is_err(v) is
+        match v is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(_)  => is end
+        end
+    end
+    let repo_path: string = repos_dir() + "/" + name
+    if fs::exists(repo_path) is
+        let r: error::HpmResult<int> = utils::run_command("git", ["-C", repo_path, "fetch", "--tags", "--force", "origin"])
+        match r is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(_)  => is end
+        end
+    else is
+        let r: error::HpmResult<int> = utils::run_command("git", ["clone", "--quiet", url, repo_path])
+        match r is
+            HpmResult::Ok(code) => is
+                if code != 0 is return error::HpmResult::Err(error::HpmError::Git("Failed to clone " + url)) end
+            end
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+        end
+    end
+    return error::HpmResult::Ok(repo_path)
+end
+
+fn fetch_info_hk_via_clone(repo_url: string) -> error::HpmResult<string> is
+    let slug: string = slug_for_url(repo_url)
+    let repo_r: error::HpmResult<string> = clone_package_repo(slug, repo_url)
+    match repo_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(repo_path) => is
+            let content: string = git_output(repo_path, ["show", "HEAD:info.hk"])
+            if content == "" is
+                return error::HpmResult::Err(error::HpmError::Manifest("info.hk not found in " + repo_url + " (default branch)"))
+            end
+            return error::HpmResult::Ok(content)
+        end
+    end
+end
+
+pub fn fetch_raw_file(repo_url: string, filename: string) -> error::HpmResult<string> is
+    let base: string = raw_base_url(repo_url)
+    if base != "" is
+        let branches: [string] = ["main", "master", "HEAD"]
+        let mut i: int = 0
+        while i < array_len(branches) is
+            let url: string = base + "/" + branches[i] + "/" + filename
+            let resp: utils::HttpResponse = utils::http_get(url)
+            if resp.status >= 200 && resp.status < 300 is
+                return error::HpmResult::Ok(resp.body)
+            end
+            i += 1
+        end
+        return error::HpmResult::Err(error::HpmError::Network("Could not fetch '" + filename + "' from " + repo_url))
+    end
+    ;; Nie-GitHub: sklonuj (cache'owane) i przeczytaj lokalnie.
+    if filename == "info.hk" is return fetch_info_hk_via_clone(repo_url) end
+    let slug: string = slug_for_url(repo_url)
+    let repo_r: error::HpmResult<string> = clone_package_repo(slug, repo_url)
+    match repo_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(repo_path) => is
+            let content: string = git_output(repo_path, ["show", "HEAD:" + filename])
+            if content == "" is
+                return error::HpmResult::Err(error::HpmError::Network("Could not fetch '" + filename + "' from " + repo_url))
+            end
+            return error::HpmResult::Ok(content)
+        end
+    end
+end
+
+pub fn fetch_raw_info_hk(repo_url: string) -> error::HpmResult<string> is
+    return fetch_raw_file(repo_url, "info.hk")
+end
+
+;; ── BuildConfig (build.toml) ─────────────────────────────────────────
+;; `std -> toml` jest płaskim parserem (`sekcja.klucz -> string`, bez
+;; wsparcia dla tablic wieloliniowych) — dla tablic jednoliniowych
+;; (`commands = ["a", "b"]`) doparsowujemy nawiasy ręcznie z surowej
+;; wartości string. Wieloliniowe tablice TOML nie są obsługiwane (żaden
+;; z przykładowych `build.toml` w tym repo ich nie używa).
+
+pub struct BuildConfig is
+    pub name:             string
+    pub source_type:      string ;; "download" | "build" | "prebuilt"
+    pub download_url:     string
+    pub binary_path:      string
+    pub strip_components: int
+    pub build_commands:   [string]
+    pub build_output:     string
+    pub build_deps:       [string]
+    pub runtime_deps:     [string]
+    pub install_path:     string
+end
+
+fn toml_array(raw: string) -> [string] is
+    let s: string = string_trim(raw)
+    if !string_starts_with(s, "[") || !string_ends_with(s, "]") is return [] end
+    let inner: string = string_trim(string_slice(s, 1, string_len(s) - 1))
+    if inner == "" is return [] end
+    let parts: [string] = string_split(inner, ",")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let item: string = string_trim(parts[i])
+        let unquoted: string = if string_len(item) >= 2 && string_starts_with(item, "\"") && string_ends_with(item, "\"")
+            then string_slice(item, 1, string_len(item) - 1) else item
+        if unquoted != "" is out = array_push(out, unquoted) end
+        i += 1
+    end
+    return out
+end
+
+pub fn parse_build_config(content: string) -> BuildConfig is
+    let parsed: any = toml::parse(content)
+    let source_type_raw: string = toml::get(parsed, "type")
+    let source_type: string = if source_type_raw != "" then source_type_raw else "prebuilt"
+    return BuildConfig {
+        name: toml::get(parsed, "name"),
+        source_type: source_type,
+        download_url: toml::get(parsed, "url"),
+        binary_path: toml::get(parsed, "binary_path"),
+        strip_components: toml::get_int(parsed, "strip_components"),
+        build_commands: toml_array(toml::get(parsed, "commands")),
+        build_output: toml::get(parsed, "output"),
+        build_deps: toml_array(toml::get(parsed, "build_deps")),
+        runtime_deps: toml_array(toml::get(parsed, "runtime_deps")),
+        install_path: toml::get(parsed, "install_path"),
+    }
+end
+
+fn fetch_build_toml_via_clone(repo_url: string) -> error::HpmResult<string> is
+    let slug: string = slug_for_url(repo_url)
+    let repo_r: error::HpmResult<string> = clone_package_repo(slug, repo_url)
+    match repo_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(repo_path) => is
+            let content: string = git_output(repo_path, ["show", "HEAD:build.toml"])
+            if content == "" is
+                return error::HpmResult::Err(error::HpmError::Manifest("build.toml not found"))
+            end
+            return error::HpmResult::Ok(content)
+        end
+    end
+end
+
+;; Zwraca "" gdy brak build.toml (odpowiednik `Option<BuildConfig>` w Rust) —
+;; brak build.toml jest normalnym stanem (pakiet "prebuilt"), nie błędem.
+pub fn fetch_raw_build_config(repo_url: string) -> BuildConfig is
+    let content_r: error::HpmResult<string> = fetch_raw_file(repo_url, "build.toml")
+    match content_r is
+        HpmResult::Ok(content) => return parse_build_config(content)
+        HpmResult::Err(_) => is
+            let base: string = raw_base_url(repo_url)
+            if base == "" is
+                let via_clone: error::HpmResult<string> = fetch_build_toml_via_clone(repo_url)
+                match via_clone is
+                    HpmResult::Ok(content) => return parse_build_config(content)
+                    HpmResult::Err(_)      => is end
+                end
+            end
+            return BuildConfig { name: "", source_type: "", download_url: "", binary_path: "",
+                strip_components: 0, build_commands: [], build_output: "", build_deps: [], runtime_deps: [], install_path: "" }
+        end
+    end
+end
+
+pub fn has_build_config(cfg: BuildConfig) -> bool is
+    return cfg.source_type != ""
+end
+
+;; ── RepoManager ──────────────────────────────────────────────────────
+
+pub struct RepoManager is
+    pub index: RepoIndex
+end
+
+fn repo_json_url() -> string is
+    let custom: string = env::get_or("HPM_REPO_JSON_URL", "")
+    if custom != "" is return custom end
+    return repo_json_url_default()
+end
+
+pub fn repo_manager_load() -> error::HpmResult<RepoManager> is
+    let url: string = repo_json_url()
+
+    if string_starts_with(url, "file://") is
+        let local_path: string = string_slice(url, 7, string_len(url))
+        if !fs::exists(local_path) is
+            return error::HpmResult::Err(error::HpmError::Io("Failed to read local repo index '" + local_path + "'"))
+        end
+        let idx: RepoIndex = parse_repo_index(fs::read(local_path))
+        let v: error::HpmResult<bool> = index_validate_urls(idx)
+        if error::is_err(v) is
+            match v is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(_)  => is end
+            end
+        end
+        write("Index loaded from " + local_path + " (" + to_string(index_len(idx)) + " packages)")
+        return error::HpmResult::Ok(RepoManager { index: idx })
+    end
+
+    write("Downloading package index...")
+    let resp: utils::HttpResponse = utils::http_get(url)
+    if resp.status < 200 || resp.status >= 300 is
+        let why: string = if resp.status == 0 then resp.body else "HTTP " + to_string(resp.status)
+        return error::HpmResult::Err(error::HpmError::Network("Failed to download package index from " + url + ": " + why))
+    end
+    let idx: RepoIndex = parse_repo_index(resp.body)
+    let v: error::HpmResult<bool> = index_validate_urls(idx)
+    if error::is_err(v) is
+        match v is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(_)  => is end
+        end
+    end
+    write("Index loaded (" + to_string(index_len(idx)) + " packages)")
+    return error::HpmResult::Ok(RepoManager { index: idx })
+end
+
+pub fn repo_manager_from_index(idx: RepoIndex) -> RepoManager is
+    return RepoManager { index: idx }
+end
+
+pub fn get_package_url(rm: RepoManager, name: string) -> string is
+    return index_url_of(rm.index, name)
+end
+
+pub fn packages_for_tag(rm: RepoManager, tag: string) -> [string] is
+    let tag_lower: string = string_lower(tag)
+    let mut result: [string] = []
+    let names: [string] = index_names(rm.index)
+    let mut i: int = 0
+    while i < array_len(names) is
+        if has_cached_meta(names[i]) is
+            let meta: PackageMeta = load_cached_meta(names[i])
+            if array_contains_ci(meta.tags, tag_lower) is
+                result = array_push(result, names[i])
+            end
+        end
+        i += 1
+    end
+    sort::sort_strings(result)
+    return result
+end
+
+fn array_contains_ci(arr: [string], target_lower: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if string_lower(arr[i]) == target_lower is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn all_tags(rm: RepoManager) -> [string] is
+    let names: [string] = index_names(rm.index)
+    let mut tags: [string] = []
+    let mut i: int = 0
+    while i < array_len(names) is
+        if has_cached_meta(names[i]) is
+            let meta: PackageMeta = load_cached_meta(names[i])
+            let mut t: int = 0
+            while t < array_len(meta.tags) is
+                let lower: string = string_lower(meta.tags[t])
+                if !array_contains_ci(tags, lower) is tags = array_push(tags, lower) end
+                t += 1
+            end
+        end
+        i += 1
+    end
+    sort::sort_strings(tags)
+    return tags
+end
+
+pub fn fetch_package_meta(rm: RepoManager, name: string) -> error::HpmResult<PackageMeta> is
+    if has_cached_meta(name) is
+        let cached: PackageMeta = load_cached_meta(name)
+        if !meta_is_stale(cached) is return error::HpmResult::Ok(cached) end
+    end
+    let url: string = index_url_of(rm.index, name)
+    if url == "" is
+        return error::HpmResult::Err(error::HpmError::PackageNotFound(name))
+    end
+    let content_r: error::HpmResult<string> = fetch_raw_info_hk(url)
+    match content_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(content) => is
+            let mut meta: PackageMeta = parse_meta_from_content(name, content)
+            meta.available_versions = get_local_versions(name)
+            save_cached_meta(meta)
+            return error::HpmResult::Ok(meta)
+        end
+    end
+end
+
+;; Odpowiednik `search_lightweight` — bez współbieżności (H# nie ma
+;; async/futures); tryb offline: przy błędzie sieci używa (nawet stale) cache.
+pub fn search_lightweight(rm: RepoManager, query: string) -> [PackageMeta] is
+    let is_tag: bool = string_starts_with(query, "@")
+    ;; Wyrażenie `if ... then ... else` jako argument funkcji dawało w backendzie natywnym
+    ;; pusty napis (`query=''` — szukanie `test` pokazywało WSZYSTKIE pakiety), więc rozbite na kroki.
+    let mut query_src: string = query
+    if is_tag is
+        query_src = string_slice(query, 1, string_len(query))
+    end
+    let query_lower: string = string_lower(query_src)
+
+    verbose::vlog("search_lightweight: start, query='" + query_lower + "'")
+    let mut all_names: [string] = []
+    let mut all_urls: [string] = []
+    let mut i: int = 0
+    while i < array_len(rm.index.names) is
+        let n: string = rm.index.names[i]
+        let matches_prefilter: bool = query_lower == "" ||
+            (is_tag && (!has_cached_meta(n) || array_contains_ci(load_cached_meta(n).tags, query_lower))) ||
+            (!is_tag && string_contains(string_lower(n), query_lower))
+        if matches_prefilter is
+            all_names = array_push(all_names, n)
+            all_urls = array_push(all_urls, rm.index.urls[i])
+        end
+        i += 1
+    end
+
+    verbose::vlog("search_lightweight: prefilter kept " + to_string(array_len(all_names)) + " name(s)")
+    let mut results: [PackageMeta] = []
+    let mut j: int = 0
+    while j < array_len(all_names) is
+        let name: string = all_names[j]
+        let repo_url: string = all_urls[j]
+        verbose::vlog("search_lightweight: checking " + name)
+
+        if has_cached_meta(name) is
+            let cached: PackageMeta = load_cached_meta(name)
+            if !meta_is_stale(cached) is
+                if meta_matches(cached, query_lower, is_tag) is results = array_push(results, cached) end
+                j += 1
+                continue
+            end
+        end
+
+        let fetch_r: error::HpmResult<string> = fetch_raw_file(repo_url, "info.hk")
+        match fetch_r is
+            HpmResult::Ok(content) => is
+                let mut meta: PackageMeta = parse_meta_from_content(name, content)
+                meta.available_versions = get_local_versions(name)
+                save_cached_meta(meta)
+                if meta_matches(meta, query_lower, is_tag) is results = array_push(results, meta) end
+            end
+            HpmResult::Err(_) => is
+                if has_cached_meta(name) is
+                    let stale: PackageMeta = load_cached_meta(name)
+                    if meta_matches(stale, query_lower, is_tag) is results = array_push(results, stale) end
+                else is
+                    if query_lower == "" || (!is_tag && string_contains(string_lower(name), query_lower)) is
+                        results = array_push(results, PackageMeta {
+                            name: name, version: "unknown", summary: "Could not fetch (offline?)",
+                            authors: "", license: "", tags: [], available_versions: get_local_versions(name), fetched_at: 0,
+                        })
+                    end
+                end
+            end
+        end
+        j += 1
+    end
+
+    sort::sort_by(results, meta_name_cmp) ;; sortuje w miejscu (nie polegamy na wartości zwracanej)
+    return results
+end
+
+fn meta_name_cmp(a: any, b: any) -> int is
+    ;; sort_by przekazuje elementy jako `any` — pola czytamy dopiero po przypisaniu do typowanej zmiennej
+    let ma: PackageMeta = a
+    let mb: PackageMeta = b
+    if ma.name < mb.name is return -1 end
+    if ma.name > mb.name is return 1 end
+    return 0
+end
+
+fn meta_matches(m: PackageMeta, query_lower: string, is_tag: bool) -> bool is
+    if query_lower == "" is return true end
+    if is_tag is return array_contains_ci(m.tags, query_lower) end
+    return string_contains(string_lower(m.name), query_lower) || string_contains(string_lower(m.summary), query_lower)
+end
+
+;; ── get_latest_version_manifest / build_index ─────────────────────────
+
+pub fn get_latest_version_manifest(repo_path: string) -> error::HpmResult<TagManifest> is
+    let mut tag_versions: [TagManifest] = collect_tag_manifests(repo_path)
+    if array_len(tag_versions) > 0 is
+        sort::sort_by(tag_versions, tag_manifest_cmp) ;; sortuje w miejscu (nie polegamy na wartości zwracanej)
+        return error::HpmResult::Ok(tag_versions[array_len(tag_versions) - 1])
+    end
+
+    let content: string = git_output(repo_path, ["show", "HEAD:info.hk"])
+    if content == "" is
+        return error::HpmResult::Err(error::HpmError::Manifest("No info.hk found in repository"))
+    end
+    let tmp: string = env::temp_dir() + "/hpm-head-" + to_string(time::now_unix())
+    utils::mkdir_all(tmp)
+    fs::write(tmp + "/info.hk", content)
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(tmp)
+    fs::rmdir_all(tmp)
+    match mr is
+        HpmResult::Ok(m) => return error::HpmResult::Ok(TagManifest { version: m.version, commit: "HEAD", manifest: m })
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+    end
+end
+
+fn tag_manifest_cmp(a: any, b: any) -> int is
+    let ta: TagManifest = a
+    let tb: TagManifest = b
+    return utils::compare_versions(ta.version, tb.version)
+end
+
+;; Wersje jednego pakietu na żądanie (klonuje/aktualizuje repo w razie
+;; potrzeby) — używane przez `deps.h#`/`diff.h#` zamiast budowania całego
+;; indeksu wszystkich pakietów naraz (`build_index` w Rust), bo typowe
+;; zapytanie dotyczy tylko jednego pakietu + jego zależności.
+pub fn get_package_versions(rm: RepoManager, name: string) -> error::HpmResult<[TagManifest]> is
+    let url: string = index_url_of(rm.index, name)
+    if url == "" is
+        return error::HpmResult::Err(error::HpmError::PackageNotFound(name))
+    end
+    let repo_r: error::HpmResult<string> = clone_package_repo(name, url)
+    match repo_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(repo_path) => is
+            let mut versions: [TagManifest] = collect_tag_manifests(repo_path)
+            if array_len(versions) == 0 is
+                let head_r: error::HpmResult<TagManifest> = get_latest_version_manifest(repo_path)
+                match head_r is
+                    HpmResult::Ok(tm) => versions = [tm]
+                    HpmResult::Err(_) => is end
+                end
+            end
+            sort::sort_by(versions, tag_manifest_cmp) ;; sortuje w miejscu (nie polegamy na wartości zwracanej)
+            return error::HpmResult::Ok(versions)
+        end
+    end
+end
+
+;; ── GitHub Releases (`--release`) ────────────────────────────────────
+
+pub struct GithubAsset is
+    pub name:                string
+    pub browser_download_url: string
+end
+
+pub struct GithubRelease is
+    pub tag_name: string
+    pub assets:   [GithubAsset]
+end
+
+pub fn parse_github_owner_repo(raw_url: string) -> [string] is
+    let mut cleaned: string = string_trim(raw_url)
+    if string_ends_with(cleaned, ".git") is cleaned = string_slice(cleaned, 0, string_len(cleaned) - 4) end
+    if string_ends_with(cleaned, "/") is cleaned = string_slice(cleaned, 0, string_len(cleaned) - 1) end
+
+    let mut rest: string = ""
+    if string_starts_with(cleaned, "https://github.com/") is rest = string_slice(cleaned, 19, string_len(cleaned))
+    elsif string_starts_with(cleaned, "http://github.com/") is rest = string_slice(cleaned, 18, string_len(cleaned))
+    elsif string_starts_with(cleaned, "git@github.com:") is rest = string_slice(cleaned, 15, string_len(cleaned))
+    else is return [] end
+
+    let parts: [string] = string_split(rest, "/")
+    if array_len(parts) < 2 is return [] end
+    if parts[0] == "" || parts[1] == "" is return [] end
+    return [parts[0], parts[1]]
+end
+
+pub fn fetch_github_release(owner: string, repo: string, tag: string) -> error::HpmResult<GithubRelease> is
+    let url: string = if tag != "" then
+        "https://api.github.com/repos/" + owner + "/" + repo + "/releases/tags/" + tag
+    else
+        "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest"
+
+    let resp: utils::HttpResponse = utils::http_get(url)
+    if resp.status == 404 is
+        let what: string = if tag != "" then "release tagged '" + tag + "'" else "releases"
+        return error::HpmResult::Err(error::HpmError::Network(
+            "No " + what + " found for " + owner + "/" + repo + " on GitHub.\n" +
+            "  The maintainer needs to publish one (see `hpm build`), or drop --release to use git clone instead."))
+    end
+    if resp.status < 200 || resp.status >= 300 is
+        let why: string = if resp.status == 0 then resp.body else "HTTP " + to_string(resp.status)
+        return error::HpmResult::Err(error::HpmError::Network("GitHub API request failed (" + why + ") for " + owner + "/" + repo))
+    end
+
+    let tag_name: string = first_capture(resp.body, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"")
+    ;; Natywne `regex::captures_all` to POSIX ERE (bez `*?` / lookaround), a w obiekcie assetu
+    ;; GitHub między "name" a "browser_download_url" stoi zagnieżdżony obiekt "uploader" ({...}),
+    ;; którego nie da się przeskoczyć wzorcem `[^}]*`. Dlatego zbieramy same URL-e, a nazwę
+    ;; pliku bierzemy z ostatniego segmentu URL-a (GitHub zawsze kończy go nazwą assetu).
+    let url_rows: [[string]] = regex::captures_all(resp.body, "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"([^\"]+)\"")
+    let mut assets: [GithubAsset] = []
+    let mut i: int = 0
+    while i < array_len(url_rows) is
+        if array_len(url_rows[i]) >= 2 is
+            let dl_url: string = url_rows[i][1]
+            assets = array_push(assets, GithubAsset { name: path::filename(dl_url), browser_download_url: dl_url })
+        end
+        i += 1
+    end
+
+    return error::HpmResult::Ok(GithubRelease { tag_name: tag_name, assets: assets })
+end
+
+fn first_capture(s: string, pattern: string) -> string is
+    let caps: [string] = regex::captures(s, pattern)
+    if array_len(caps) >= 2 is return caps[1] end
+    return ""
+end
