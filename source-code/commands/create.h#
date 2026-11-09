@@ -1,0 +1,276 @@
+mod error
+mod utils
+mod colors
+
+use "std -> fs"  from "fs"
+use "std -> fmt" from "fmt"
+use "std -> io"  from "io"
+use "std -> regex" from "regex"
+
+pub fn create(name: string) -> error::HpmResult<bool> is
+    write("\n◆ HPM Package Creation Wizard\n")
+
+    let mut pkg_name: string = name
+    if pkg_name == "" is pkg_name = prompt("Package name", "") end
+    let validate_r: error::HpmResult<bool> = validate_pkg_name(pkg_name)
+    if error::is_err(validate_r) is return validate_r end
+
+    let version: string = prompt("Version", "1.0.0")
+    let authors: string = prompt("Author(s)", "")
+    let license: string = prompt_choice("License", ["MIT", "GPL-2.0", "GPL-3.0", "Apache-2.0", "BSD-2-Clause", "custom"], 0)
+    let summary: string = prompt("Short description (shown in hpm search)", "")
+    let long_desc: string = prompt("Long description (shown in hpm info)", summary)
+
+    let pkg_type: string = prompt_choice("Package type", ["CLI application", "GUI application", "Library / tool (no binary)", "Custom"], 0)
+    let is_gui: bool = pkg_type == "GUI application"
+    let has_binary: bool = pkg_type != "Library / tool (no binary)"
+
+    let mut bin_name: string = ""
+    if has_binary is bin_name = prompt("Binary name", pkg_name) end
+
+    let mut build_type: string = ""
+    if has_binary is
+        build_type = prompt_choice("How is the binary obtained?", [
+            "Already in contents/ (prebuilt)",
+            "Download from URL (GitHub Releases etc.)",
+            "Build from source (cargo / make / cmake)",
+        ], 0)
+    end
+
+    let mut needs_network: bool = false
+    if is_gui is needs_network = prompt_bool("Does the app need network access?", false) end
+
+    let mut categories: string = ""
+    if is_gui is categories = prompt("XDG categories (e.g. Graphics;Viewer;)", "Utility;") end
+
+    let tags_input: string = prompt("Group tags (comma-separated, e.g. development,cli,tools)", "")
+    let mut tags: [string] = []
+    let raw_tags: [string] = string_split(tags_input, ",")
+    let mut ti: int = 0
+    while ti < array_len(raw_tags) is
+        let t: string = string_trim(raw_tags[ti])
+        if t != "" is tags = array_push(tags, t) end
+        ti += 1
+    end
+
+    if fs::exists(pkg_name) is
+        if !prompt_bool("Directory '" + pkg_name + "' already exists. Continue?", false) is
+            write("→ Aborted.")
+            return error::HpmResult::Ok(true)
+        end
+    end
+
+    utils::mkdir_all(pkg_name)
+
+    if has_binary is
+        let bin_dir: string = pkg_name + "/contents/bin"
+        utils::mkdir_all(bin_dir)
+
+        if bin_name != "" && build_type == "Already in contents/ (prebuilt)" is
+            let placeholder: string = bin_dir + "/" + bin_name
+            if !fs::exists(placeholder) is
+                let content: string = "#!/bin/sh\n# " + pkg_name + " — replace with actual binary\necho 'Hello from " + pkg_name + "!'\n"
+                fs::write(placeholder, content)
+                utils::make_executable(placeholder)
+            end
+        end
+
+        if is_gui is
+            let icon_dir: string = pkg_name + "/contents/icons"
+            utils::mkdir_all(icon_dir)
+            let icon: string = icon_dir + "/" + pkg_name + ".svg"
+            if !fs::exists(icon) is
+                let initial: string = string_upper(string_slice(pkg_name, 0, 1))
+                let svg: string = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">\n" +
+                    "  <rect width=\"64\" height=\"64\" rx=\"12\" fill=\"#ff2040\"/>\n" +
+                    "  <text x=\"32\" y=\"42\" font-size=\"28\" text-anchor=\"middle\" fill=\"white\" font-family=\"sans-serif\">" + initial + "</text>\n</svg>"
+                fs::write(icon, svg)
+            end
+        end
+    end
+
+    let info_hk: string = generate_info_hk(pkg_name, version, authors, license, summary, long_desc,
+        bin_name, is_gui, needs_network, categories, build_type, tags)
+    fs::write(pkg_name + "/info.hk", info_hk)
+
+    if has_binary && build_type != "Already in contents/ (prebuilt)" is
+        let build_toml: string = generate_build_toml(pkg_name, bin_name, build_type)
+        fs::write(pkg_name + "/build.toml", build_toml)
+    end
+
+    fs::write(pkg_name + "/README.md", generate_readme(pkg_name, summary, authors, license, is_gui))
+    fs::write(pkg_name + "/.gitignore", "target/\n*.o\n*.so\n*.tmp\n.staging-*\n")
+
+    if has_binary && bin_name != "" is
+        fs::write(pkg_name + "/.gitattributes", "contents/bin/* text eol=lf\n")
+    end
+
+    let gh_dir: string = pkg_name + "/.github/workflows"
+    utils::mkdir_all(gh_dir)
+    fs::write(gh_dir + "/hpm-validate.yml", generate_ci_workflow())
+
+    write("\n" + fmt::red("✔") + " Package '" + pkg_name + "' created!\n")
+    if array_len(tags) > 0 is
+        let mut labeled: [string] = []
+        let mut li: int = 0
+        while li < array_len(tags) is
+            labeled = array_push(labeled, "@" + tags[li])
+            li += 1
+        end
+        write("  ◆ Tags: " + colors::white(labeled.join(", ")))
+    end
+    write(fmt::bold("Next steps:"))
+    write("  1. cd " + colors::white(pkg_name))
+    if has_binary && build_type == "Already in contents/ (prebuilt)" is
+        write("  2. Replace " + colors::white("contents/bin/" + bin_name) + " with your actual binary")
+        write("  3. Make it executable in git:")
+        write("     " + colors::white("git update-index --chmod=+x contents/bin/" + bin_name))
+    end
+    write("  n. git tag v1.0.0 && git push origin main --tags")
+    write("  n. Submit PR to add package to HPM index\n")
+
+    return error::HpmResult::Ok(true)
+end
+
+fn generate_info_hk(name: string, version: string, authors: string, license: string, summary: string,
+                    long_desc: string, bin_name: string, is_gui: bool, needs_network: bool, categories: string,
+                    build_type: string, tags: [string]) -> string is
+    let mut out: string = "! " + name + "\n! Generated by hpm create\n\n[metadata]\n"
+    out = out + "-> name    => " + name + "\n"
+    out = out + "-> version => " + version + "\n"
+    out = out + "-> authors => " + authors + "\n"
+    out = out + "-> license => " + license + "\n"
+    if is_gui is out = out + "-> gui     => true\n" end
+    if bin_name != "" is
+        if build_type == "Already in contents/ (prebuilt)" is
+            out = out + "-> bins." + bin_name + " => \"bin/" + bin_name + "\"\n"
+        else is
+            out = out + "-> bins." + bin_name + " => \"\"\n"
+        end
+    end
+
+    if array_len(tags) > 0 is
+        out = out + "-> tags => [\n"
+        let mut i: int = 0
+        while i < array_len(tags) is
+            out = out + "    \"" + tags[i] + "\"\n"
+            i += 1
+        end
+        out = out + "]\n"
+    end
+
+    out = out + "\n[description]\n"
+    out = out + "-> summary => " + summary + "\n"
+    out = out + "-> long    => " + long_desc + "\n"
+
+    out = out + "\n[sandbox]\n"
+    out = out + "-> network  => " + to_string(needs_network) + "\n"
+    out = out + "-> gui      => " + to_string(is_gui) + "\n"
+    out = out + "-> full_gui => false\n"
+    out = out + "-> dev      => false\n"
+    out = out + "-> disabled => false\n"
+    out = out + "-> filesystem => []\n"
+
+    out = out + "\n[build]\n-> commands => []\n-> deb_deps => []\n\n[runtime]\n-> deb_deps => []\n"
+
+    if is_gui is
+        out = out + "\n[desktop]\n"
+        let display: string = string_upper(string_slice(name, 0, 1)) + string_slice(name, 1, string_len(name))
+        out = out + "-> display_name => " + display + "\n"
+        out = out + "-> icon         => icons/" + name + ".svg\n"
+        let cats: string = if categories == "" then "Utility;" else categories
+        out = out + "-> categories   => " + cats + "\n"
+        out = out + "-> comment      => " + summary + "\n"
+    end
+    return out
+end
+
+fn generate_build_toml(pkg_name: string, bin_name: string, build_type: string) -> string is
+    if string_contains(build_type, "Download") is
+        return "# build.toml for " + pkg_name + "\n" +
+            "type         = \"download\"\n" +
+            "url          = \"https://github.com/YOUR_USER/" + pkg_name + "/releases/download/v{{version}}/" + pkg_name + "-linux-x86_64\"\n" +
+            "install_path = \"bin/" + bin_name + "\"\n" +
+            "runtime_deps = []\n"
+    end
+    return "# build.toml for " + pkg_name + "\n" +
+        "type         = \"build\"\n" +
+        "commands     = [\"cargo build --release\"]\n" +
+        "output       = \"target/release/" + bin_name + "\"\n" +
+        "install_path = \"bin/" + bin_name + "\"\n" +
+        "build_deps   = [\"build-essential\"]\n" +
+        "runtime_deps = []\n"
+end
+
+fn generate_readme(name: string, summary: string, authors: string, license: string, is_gui: bool) -> string is
+    let usage_suffix: string = if is_gui then " &" else " --help"
+    return "# " + name + "\n\n" + summary + "\n\n## Installation\n\n```sh\nsudo hpm install " + name + "\n```\n\n" +
+        "## Usage\n\n```sh\n" + name + usage_suffix + "\n```\n\n## Authors\n\n" + authors + "\n\n## License\n\n" + license + "\n"
+end
+
+fn generate_ci_workflow() -> string is
+    return "name: Validate HPM Package\non:\n  push:\n    branches: [main]\n    tags: ['v*']\n  pull_request:\n    branches: [main]\n\n" +
+        "jobs:\n  validate:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n\n" +
+        "      - name: Check info.hk exists\n        run: test -f info.hk || (echo \"ERROR: info.hk missing\"; exit 1)\n\n" +
+        "      - name: Check version matches tag\n        if: startsWith(github.ref, 'refs/tags/')\n        run: |\n" +
+        "          TAG=\"${{GITHUB_REF_NAME#v}}\"\n          HK_VER=$(grep -E '-> version =>' info.hk | head -1 | sed 's/.*=> //' | tr -d ' ')\n" +
+        "          [ \"$TAG\" = \"$HK_VER\" ] || (echo \"ERROR: tag $TAG != info.hk $HK_VER\"; exit 1)\n\n" +
+        "      - name: Check package source exists\n        run: |\n          [ -d contents ] || [ -f build.toml ] || (echo \"ERROR: need contents/ or build.toml\"; exit 1)\n\n" +
+        "      - name: Check binaries are executable\n        run: |\n          for f in contents/bin/*; do\n" +
+        "            [ -f \"$f\" ] && [ ! -x \"$f\" ] && echo \"WARNING: $f not executable (git update-index --chmod=+x $f)\"\n          done\n          exit 0\n"
+end
+
+;; ── Prompty interaktywne ────────────────────────────────────────────────
+
+fn prompt(label: string, default_val: string) -> string is
+    let default_str: string = if default_val != "" then " [" + default_val + "]" else ""
+    let input: string = string_trim(io::read_line("  ? " + fmt::bold(label) + fmt::dim(default_str) + ": "))
+    if input == "" is return default_val end
+    return input
+end
+
+fn prompt_bool(label: string, default_val: bool) -> bool is
+    let hint: string = if default_val then "[Y/n]" else "[y/N]"
+    let input: string = string_lower(string_trim(io::read_line("  ? " + fmt::bold(label) + " " + fmt::dim(hint) + ": ")))
+    if input == "y" || input == "yes" is return true end
+    if input == "n" || input == "no" is return false end
+    return default_val
+end
+
+fn prompt_choice(label: string, choices: [string], default_idx: int) -> string is
+    write("  ? " + fmt::bold(label) + ":")
+    let mut i: int = 0
+    while i < array_len(choices) is
+        if i == default_idx is
+            write("    " + colors::white("[" + to_string(i) + "]") + " " + choices[i] + " " + fmt::dim("(default)"))
+        else is
+            write("    " + fmt::dim("[" + to_string(i) + "]") + " " + choices[i])
+        end
+        i += 1
+    end
+    let input: string = string_trim(io::read_line("  Choice [" + colors::white(to_string(default_idx)) + "]: "))
+    let idx_opt: int? = parse_int(input)
+    if idx_opt == nil is return choices[default_idx] end
+    let idx: int = idx_opt
+    if idx < 0 || idx >= array_len(choices) is return choices[default_idx] end
+    return choices[idx]
+end
+
+fn validate_pkg_name(name: string) -> error::HpmResult<bool> is
+    if name == "" is
+        return error::HpmResult::Err(error::HpmError::InvalidArg("Package name cannot be empty"))
+    end
+    let mut i: int = 0
+    while i < string_len(name) is
+        let c: string = string_at(name, i)
+        if !regex::is_match(c, "[a-zA-Z0-9_-]") is
+            return error::HpmResult::Err(error::HpmError::InvalidArg(
+                "Package name '" + name + "' contains invalid characters.\nOnly letters, digits, hyphens and underscores are allowed."))
+        end
+        i += 1
+    end
+    if string_starts_with(name, "-") || string_starts_with(name, "_") is
+        return error::HpmResult::Err(error::HpmError::InvalidArg("Package name must start with a letter or digit"))
+    end
+    return error::HpmResult::Ok(true)
+end
