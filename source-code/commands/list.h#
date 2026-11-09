@@ -1,0 +1,84 @@
+mod colors
+mod error
+mod state
+mod paths
+mod repo
+
+use "std -> fmt" from "fmt"
+
+pub fn list_installed() -> error::HpmResult<bool> is
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            if array_len(s.packages) == 0 is
+                write("→ No packages installed.")
+                return error::HpmResult::Ok(true)
+            end
+            write("→ Installed packages:")
+            write("  Package              Version         Pinned   Tags")
+
+            let mut seen_names: [string] = []
+            let mut i: int = 0
+            while i < array_len(s.packages) is
+                let name: string = s.packages[i].name
+                if !contains_str(seen_names, name) is
+                    seen_names = array_push(seen_names, name)
+                end
+                i += 1
+            end
+
+            let mut n: int = 0
+            while n < array_len(seen_names) is
+                let pkg_name: string = seen_names[n]
+                let current_ver: string = state::get_current_version(pkg_name, paths::store_path())
+                let versions: [state::VersionInfo] = state::versions_of(s.packages, pkg_name)
+
+                let mut v: int = 0
+                while v < array_len(versions) is
+                    let info: state::VersionInfo = versions[v]
+                    let is_current: bool = info.version == current_ver
+                    let pinned: string = if info.pinned then fmt::red("✓") else fmt::red("✗")
+
+                    let mut tags_str: string = ""
+                    if repo::has_cached_meta(pkg_name) is
+                        let meta: repo::PackageMeta = repo::load_cached_meta(pkg_name)
+                        let mut tagged: [string] = []
+                        let mut t: int = 0
+                        while t < array_len(meta.tags) is
+                            tagged = array_push(tagged, "@" + meta.tags[t])
+                            t += 1
+                        end
+                        tags_str = tagged.join(" ")
+                    end
+
+                    let name_disp: string = if is_current then colors::magenta(pkg_name) else pkg_name
+                    let ver_disp: string = if is_current then colors::white(info.version) else info.version
+                    let current_marker: string = if is_current then fmt::dim("(current)") else ""
+
+                    write("  " + pad(name_disp, 20) + " " + pad(ver_disp, 15) + " " + pad(pinned, 8) + " " + current_marker + " " + fmt::dim(tags_str))
+                    v += 1
+                end
+                n += 1
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is
+        out = out + " "
+    end
+    return out
+end
