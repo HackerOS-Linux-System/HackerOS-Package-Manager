@@ -1,0 +1,361 @@
+mod colors
+mod error
+mod state
+mod repo
+mod manifest
+mod squash
+mod paths
+mod utils
+
+use "std -> fs"     from "fs"
+use "std -> fmt"    from "fmt"
+use "std -> crypto" from "crypto"
+
+pub fn diff(args: [string]) -> error::HpmResult<bool> is
+    if array_len(args) < 2 is
+        write(fmt::red("✗") + " Usage: hpm diff <package> <ver1> [<ver2>]")
+        write("  If ver2 is omitted, compares ver1 against currently installed version.")
+        exit(1)
+    end
+
+    let pkg_name: string = args[0]
+    let ver1: string = args[1]
+
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            let mut ver2: string = ""
+            if array_len(args) >= 3 is
+                ver2 = args[2]
+            else is
+                ver2 = state::get_current_version(pkg_name, paths::store_path())
+                if ver2 == "" is
+                    return error::HpmResult::Err(error::HpmError::Manifest(
+                        "Package '" + pkg_name + "' not installed. Provide two explicit versions:\n  hpm diff " + pkg_name + " <ver1> <ver2>"))
+                end
+            end
+
+            write("→ Comparing " + fmt::bold(colors::white(pkg_name)) + "  " + fmt::dim(ver1) + " ↔ " + fmt::red(ver2) + "\n")
+
+            let path1: string = paths::store_path() + pkg_name + "/" + ver1
+            let path2: string = paths::store_path() + pkg_name + "/" + ver2
+            let in_store1: bool = fs::exists(path1)
+            let in_store2: bool = fs::exists(path2)
+            if in_store1 is squash::ensure_mounted(path1) end
+            if in_store2 is squash::ensure_mounted(path2) end
+
+            if !in_store1 || !in_store2 is
+                write("→ One or both versions not in local store — fetching from repo...")
+            end
+
+            write(colors::bold_underline("Manifest changes:"))
+
+            let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+            let mut have_m1: bool = false
+            let mut have_m2: bool = false
+            let mut m1: manifest::Manifest = manifest::default_manifest(pkg_name)
+            let mut m2: manifest::Manifest = manifest::default_manifest(pkg_name)
+
+            if in_store1 is
+                let r: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(path1)
+                match r is
+                    HpmResult::Ok(m) => is m1 = m have_m1 = true end
+                    HpmResult::Err(_) => is end
+                end
+            else is
+                match rm_r is
+                    HpmResult::Ok(rm) => is
+                        let fetched: manifest::Manifest? = fetch_manifest_for_version(pkg_name, ver1, rm)
+                        if fetched != nil is m1 = fetched have_m1 = true end
+                    end
+                    HpmResult::Err(_) => is end
+                end
+            end
+
+            if in_store2 is
+                let r2: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(path2)
+                match r2 is
+                    HpmResult::Ok(m) => is m2 = m have_m2 = true end
+                    HpmResult::Err(_) => is end
+                end
+            else is
+                match rm_r is
+                    HpmResult::Ok(rm) => is
+                        let fetched2: manifest::Manifest? = fetch_manifest_for_version(pkg_name, ver2, rm)
+                        if fetched2 != nil is m2 = fetched2 have_m2 = true end
+                    end
+                    HpmResult::Err(_) => is end
+                end
+            end
+
+            if have_m1 && have_m2 is
+                diff_manifests(m1, m2, ver1, ver2)
+            elsif !have_m1 && have_m2 is
+                write("  ⚠ Version " + ver1 + " manifest not available")
+            elsif have_m1 && !have_m2 is
+                write("  ⚠ Version " + ver2 + " manifest not available")
+            else is
+                write("  ⚠ Neither version manifest available locally")
+            end
+
+            if in_store1 && in_store2 is
+                write("")
+                write(colors::bold_underline("File changes:"))
+                diff_files(path1, path2, ver1, ver2)
+            elsif !in_store1 && !in_store2 is
+                write("")
+                write(fmt::dim("→ Install both versions to compare files:"))
+                write("  hpm install " + pkg_name + "@" + ver1)
+                write("  hpm install " + pkg_name + "@" + ver2)
+            else is
+                let missing: string = if !in_store1 then ver1 else ver2
+                write("")
+                write(fmt::dim("→ Version " + missing + " not in store — file diff unavailable."))
+                write("  Install it to compare: " + fmt::dim("hpm install " + pkg_name + "@" + missing))
+            end
+
+            write("")
+            write(colors::bold_underline("Checksums:"))
+            let idx1: int = state::find_index(s.packages, pkg_name, ver1)
+            let idx2: int = state::find_index(s.packages, pkg_name, ver2)
+            if idx1 >= 0 && idx2 >= 0 is
+                let c1: string = short16(s.packages[idx1].checksum)
+                let c2: string = short16(s.packages[idx2].checksum)
+                write("  " + fmt::dim(ver1) + " " + fmt::dim("→") + " " + fmt::dim(c1))
+                write("  " + fmt::red(ver2) + " " + fmt::dim("→") + " " + fmt::dim(c2))
+                if c1 == c2 is write("  → Contents appear identical.") end
+            else is
+                write("  → Checksum data not available for one or both versions.")
+            end
+
+            write("")
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+fn short16(s: string) -> string is
+    let n: int = if string_len(s) < 16 then string_len(s) else 16
+    return string_slice(s, 0, n)
+end
+
+fn diff_manifests(old: manifest::Manifest, new_m: manifest::Manifest, ver1: string, ver2: string) is
+    let mut any_change: bool = false
+
+    if old.version != new_m.version is
+        write("  ~ " + pad("version:", 16) + " " + fmt::dim(old.version) + " → " + colors::white(new_m.version))
+        any_change = true
+    end
+    if old.authors != new_m.authors is
+        write("  ~ " + pad("authors:", 16) + " " + fmt::dim(old.authors) + " → " + colors::white(new_m.authors))
+        any_change = true
+    end
+    if old.license != new_m.license is
+        write("  ~ " + pad("license:", 16) + " " + fmt::dim(old.license) + " → " + colors::white(new_m.license))
+        any_change = true
+    end
+    if old.summary != new_m.summary is
+        write("  ~ " + pad("summary:", 16) + " " + fmt::dim(old.summary) + " → " + colors::white(new_m.summary))
+        any_change = true
+    end
+
+    let mut all_deps: [string] = []
+    let mut i: int = 0
+    while i < array_len(old.deps.keys) is
+        if !contains_str(all_deps, old.deps.keys[i]) is all_deps = array_push(all_deps, old.deps.keys[i]) end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(new_m.deps.keys) is
+        if !contains_str(all_deps, new_m.deps.keys[j]) is all_deps = array_push(all_deps, new_m.deps.keys[j]) end
+        j += 1
+    end
+    let mut d: int = 0
+    while d < array_len(all_deps) is
+        let dep: string = all_deps[d]
+        let has1: bool = manifest::osm_contains(old.deps, dep)
+        let has2: bool = manifest::osm_contains(new_m.deps, dep)
+        if has1 && has2 is
+            let v1: string = manifest::osm_get(old.deps, dep)
+            let v2: string = manifest::osm_get(new_m.deps, dep)
+            if v1 != v2 is
+                write("  ~ dep " + pad(dep, 16) + " " + fmt::dim(v1) + " → " + colors::white(v2))
+                any_change = true
+            end
+        elsif !has1 && has2 is
+            write("  + dep " + pad(dep, 16) + " " + fmt::red(manifest::osm_get(new_m.deps, dep)) + " (new dependency)")
+            any_change = true
+        elsif has1 && !has2 is
+            write("  − dep " + pad(dep, 16) + " " + fmt::red(manifest::osm_get(old.deps, dep)) + " (removed dependency)")
+            any_change = true
+        end
+        d += 1
+    end
+
+    let mut bi: int = 0
+    while bi < array_len(new_m.bins) is
+        if !contains_str(old.bins, new_m.bins[bi]) is
+            write("  + bin " + pad(new_m.bins[bi], 16) + " (new binary)")
+            any_change = true
+        end
+        bi += 1
+    end
+    let mut bj: int = 0
+    while bj < array_len(old.bins) is
+        if !contains_str(new_m.bins, old.bins[bj]) is
+            write("  − bin " + pad(old.bins[bj], 16) + " (removed binary)")
+            any_change = true
+        end
+        bj += 1
+    end
+
+    let mut ti: int = 0
+    while ti < array_len(new_m.tags) is
+        if !contains_str(old.tags, new_m.tags[ti]) is
+            write("  + tag @" + new_m.tags[ti])
+            any_change = true
+        end
+        ti += 1
+    end
+    let mut tj: int = 0
+    while tj < array_len(old.tags) is
+        if !contains_str(new_m.tags, old.tags[tj]) is
+            write("  − tag @" + old.tags[tj])
+            any_change = true
+        end
+        tj += 1
+    end
+
+    if old.sandbox.network != new_m.sandbox.network is
+        write("  ~ sandbox.network " + fmt::dim(to_string(old.sandbox.network)) + " → " + colors::white(to_string(new_m.sandbox.network)))
+        any_change = true
+    end
+    if old.sandbox.gui != new_m.sandbox.gui is
+        write("  ~ sandbox.gui " + fmt::dim(to_string(old.sandbox.gui)) + " → " + colors::white(to_string(new_m.sandbox.gui)))
+        any_change = true
+    end
+
+    if !any_change is
+        write("  → No manifest changes between " + fmt::dim(ver1) + " and " + fmt::red(ver2))
+    end
+end
+
+struct FileHash is
+    pub rel:  string
+    pub hash: string
+end
+
+fn collect_files_rel(base: string) -> [FileHash] is
+    let mut out: [FileHash] = []
+    if !fs::exists(base) is return out end
+    let entries: [string] = fs::walk(base)
+    let prefix: string = base + "/"
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let p: string = entries[i]
+        if fs::is_file(p) is
+            let rel: string = if string_starts_with(p, prefix) then string_slice(p, string_len(prefix), string_len(p)) else p
+            if rel != "info.hk" is
+                let data: bytes = fs::read_bytes(p)
+                let hash: string = crypto::sha256_bytes(data)
+                out = array_push(out, FileHash { rel: rel, hash: short16(hash) })
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+fn find_hash(files: [FileHash], rel: string) -> string is
+    let mut i: int = 0
+    while i < array_len(files) is
+        if files[i].rel == rel is return files[i].hash end
+        i += 1
+    end
+    return ""
+end
+
+fn diff_files(path1: string, path2: string, ver1: string, ver2: string) is
+    let files1: [FileHash] = collect_files_rel(path1)
+    let files2: [FileHash] = collect_files_rel(path2)
+
+    let mut all: [string] = []
+    let mut i: int = 0
+    while i < array_len(files1) is
+        if !contains_str(all, files1[i].rel) is all = array_push(all, files1[i].rel) end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(files2) is
+        if !contains_str(all, files2[j].rel) is all = array_push(all, files2[j].rel) end
+        j += 1
+    end
+
+    let mut added: [string] = []
+    let mut removed: [string] = []
+    let mut changed: [string] = []
+
+    let mut k: int = 0
+    while k < array_len(all) is
+        let rel: string = all[k]
+        let h1: string = find_hash(files1, rel)
+        let h2: string = find_hash(files2, rel)
+        if h1 != "" && h2 != "" is
+            if h1 != h2 is changed = array_push(changed, rel) end
+        elsif h1 == "" && h2 != "" is
+            added = array_push(added, rel)
+        elsif h1 != "" && h2 == "" is
+            removed = array_push(removed, rel)
+        end
+        k += 1
+    end
+
+    let mut any_change: bool = false
+    let mut ai: int = 0
+    while ai < array_len(added) is write("  + " + added[ai]) any_change = true ai += 1 end
+    let mut ri: int = 0
+    while ri < array_len(removed) is write("  − " + removed[ri]) any_change = true ri += 1 end
+    let mut ci: int = 0
+    while ci < array_len(changed) is write("  ~ " + changed[ci]) any_change = true ci += 1 end
+
+    if !any_change is
+        write("  → Files identical between " + fmt::dim(ver1) + " and " + fmt::red(ver2))
+    else is
+        write("")
+        write("  " + fmt::bold("Summary:") + " " + fmt::red(to_string(array_len(added))) + " added  " +
+            fmt::red(to_string(array_len(removed))) + " removed  " + fmt::dim(to_string(array_len(changed))) + " modified")
+    end
+end
+
+fn fetch_manifest_for_version(pkg_name: string, version: string, rm: repo::RepoManager) -> manifest::Manifest? is
+    let versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, pkg_name)
+    match versions_r is
+        HpmResult::Ok(versions) => is
+            let mut i: int = 0
+            while i < array_len(versions) is
+                if versions[i].version == version is return versions[i].manifest end
+                i += 1
+            end
+            return nil
+        end
+        HpmResult::Err(_) => return nil
+    end
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+fn pad(s: string, width: int) -> string is
+    let mut out: string = s
+    while string_len(out) < width is
+        out = out + " "
+    end
+    return out
+end
