@@ -1,0 +1,431 @@
+mod error
+mod db
+mod utils
+
+use "std -> time" from "time"
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+use "std -> sort" from "sort"
+
+pub struct VersionInfo is
+    pub name:               string
+    pub version:            string
+    pub checksum:           string
+    pub pinned:             bool
+    pub manually_installed: bool
+    pub installed_at:       int
+    pub required_by:        [string]
+    pub depends_on:         [string]
+    pub conflicts_with:     [string]
+end
+
+pub fn version_info_new(name: string, version: string, checksum: string, manually_installed: bool) -> VersionInfo is
+    return VersionInfo {
+        name: name, version: version, checksum: checksum, pinned: false,
+        manually_installed: manually_installed, installed_at: time::now_unix(),
+        required_by: [], depends_on: [], conflicts_with: [],
+    }
+end
+
+pub struct RollbackEntry is
+    pub timestamp:   int
+    pub description: string
+    pub snapshot:    [VersionInfo]
+end
+
+;; Odpowiednik `WrapperNames` — mapa "pkg:bin" -> nazwa wrappera w /usr/bin,
+;; jako uporządkowane, równoległe tablice (jak `manifest::OrderedStrMap`).
+pub struct WrapperNames is
+    pub keys: [string]
+    pub vals: [string]
+end
+
+pub fn wrapper_names_new() -> WrapperNames is
+    return WrapperNames { keys: [], vals: [] }
+end
+
+pub fn wn_key(pkg_name: string, bin_name: string) -> string is
+    return pkg_name + ":" + bin_name
+end
+
+pub fn wn_get(wn: WrapperNames, pkg_name: string, bin_name: string) -> string is
+    let k: string = wn_key(pkg_name, bin_name)
+    let mut i: int = 0
+    while i < array_len(wn.keys) is
+        if wn.keys[i] == k is return wn.vals[i] end
+        i += 1
+    end
+    return ""
+end
+
+pub fn wn_has(wn: WrapperNames, pkg_name: string, bin_name: string) -> bool is
+    return wn_get(wn, pkg_name, bin_name) != ""
+end
+
+;; Odpowiednik `WrapperNames::set` — zapisuje i od razu persystuje (zgodnie
+;; z Rust, gdzie `set` samo woła `self.save()`).
+pub fn wn_set(wn: WrapperNames, pkg_name: string, bin_name: string, wrapper_name: string) -> WrapperNames is
+    let k: string = wn_key(pkg_name, bin_name)
+    let mut i: int = 0
+    let mut new_vals: [string] = []
+    let mut found: bool = false
+    while i < array_len(wn.keys) is
+        if wn.keys[i] == k is
+            new_vals = array_push(new_vals, wrapper_name)
+            found = true
+        else is
+            new_vals = array_push(new_vals, wn.vals[i])
+        end
+        i += 1
+    end
+    let mut updated: WrapperNames = wn
+    if found is
+        updated = WrapperNames { keys: wn.keys, vals: new_vals }
+    else is
+        updated = WrapperNames { keys: array_push(wn.keys, k), vals: array_push(new_vals, wrapper_name) }
+    end
+    db::save_wrapper_names(updated)
+    return updated
+end
+
+pub fn wn_remove_pkg(wn: WrapperNames, pkg_name: string) -> WrapperNames is
+    let prefix: string = pkg_name + ":"
+    let mut new_keys: [string] = []
+    let mut new_vals: [string] = []
+    let mut i: int = 0
+    while i < array_len(wn.keys) is
+        if !string_starts_with(wn.keys[i], prefix) is
+            new_keys = array_push(new_keys, wn.keys[i])
+            new_vals = array_push(new_vals, wn.vals[i])
+        end
+        i += 1
+    end
+    let updated: WrapperNames = WrapperNames { keys: new_keys, vals: new_vals }
+    db::save_wrapper_names(updated)
+    return updated
+end
+
+pub fn wrapper_names_load() -> WrapperNames is
+    let r: error::HpmResult<WrapperNames> = db::load_wrapper_names()
+    match r is
+        HpmResult::Ok(wn) => return wn
+        HpmResult::Err(_) => return wrapper_names_new()
+    end
+end
+
+;; ── State ────────────────────────────────────────────────────────────
+
+pub struct State is
+    pub packages: [VersionInfo]
+    pub history:  [RollbackEntry]
+end
+
+fn max_history() -> int is return 20 end
+
+pub fn state_new() -> State is
+    return State { packages: [], history: [] }
+end
+
+;; ── Wyszukiwanie w płaskiej liście (odpowiednik nawigacji po HashMap) ──
+
+pub fn find_index(packages: [VersionInfo], name: string, version: string) -> int is
+    let mut i: int = 0
+    while i < array_len(packages) is
+        if packages[i].name == name && packages[i].version == version is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; Wszystkie wersje danego pakietu (odpowiednik `vers.keys()`)
+pub fn versions_of(packages: [VersionInfo], name: string) -> [VersionInfo] is
+    let mut out: [VersionInfo] = []
+    let mut i: int = 0
+    while i < array_len(packages) is
+        if packages[i].name == name is out = array_push(out, packages[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn has_package(packages: [VersionInfo], name: string) -> bool is
+    return array_len(versions_of(packages, name)) > 0
+end
+
+;; ── Load / Save ──────────────────────────────────────────────────────
+
+pub fn state_load() -> error::HpmResult<State> is
+    return db::load_state()
+end
+
+pub fn state_save(s: State) -> error::HpmResult<bool> is
+    return db::save_state(s)
+end
+
+;; ── Snapshot / rollback ──────────────────────────────────────────────
+
+pub fn push_snapshot(s: State, description: string) -> State is
+    let entry: RollbackEntry = RollbackEntry {
+        timestamp: time::now_unix(), description: description, snapshot: s.packages,
+    }
+    let mut new_history: [RollbackEntry] = array_push(s.history, entry)
+    if array_len(new_history) > max_history() is
+        let drop_n: int = array_len(new_history) - max_history()
+        new_history = utils::array_slice(new_history, drop_n, array_len(new_history))
+    end
+    return State { packages: s.packages, history: new_history }
+end
+
+;; Zwraca (nowy_state, ostatni_wpis_lub_nil) — H# nie ma `Option<&T>`
+;; zwracanego obok mutacji w jednej wartości, więc para jest jawna.
+pub struct PopSnapshotResult is
+    pub state: State
+    pub entry: RollbackEntry
+    pub had_entry: bool
+end
+
+pub fn pop_snapshot(s: State) -> PopSnapshotResult is
+    let n: int = array_len(s.history)
+    if n == 0 is
+        return PopSnapshotResult { state: s, entry: RollbackEntry { timestamp: 0, description: "", snapshot: [] }, had_entry: false }
+    end
+    let last: RollbackEntry = s.history[n - 1]
+    let new_history: [RollbackEntry] = s.history[0..n - 1]
+    return PopSnapshotResult { state: State { packages: s.packages, history: new_history }, entry: last, had_entry: true }
+end
+
+pub fn list_history(s: State) -> [RollbackEntry] is
+    return s.history
+end
+
+pub fn restore_snapshot(s: State, index: int) -> State is
+    if index < 0 || index >= array_len(s.history) is return s end
+    let snapshot: [VersionInfo] = s.history[index].snapshot
+    let bumped: State = push_snapshot(s, "pre-rollback snapshot")
+    return State { packages: snapshot, history: bumped.history }
+end
+
+;; ── Mutacja pakietów ──────────────────────────────────────────────────
+
+pub fn split_pkg_ver(spec: string) -> [string] is
+    let at: int = string_find(spec, "@")
+    if at < 0 is return [spec, ""] end
+    return [string_slice(spec, 0, at), string_slice(spec, at + 1, string_len(spec))]
+end
+
+pub fn update_package(s: State, package: string, version: string, checksum: string,
+                       manually_installed: bool, depends_on: [string], conflicts_with: [string]) -> State is
+    let mut info: VersionInfo = version_info_new(package, version, checksum, manually_installed)
+    info.depends_on = depends_on
+    info.conflicts_with = conflicts_with
+
+    let idx: int = find_index(s.packages, package, version)
+    let mut new_packages: [VersionInfo] = []
+    if idx >= 0 is
+        let mut i: int = 0
+        while i < array_len(s.packages) is
+            if i == idx is new_packages = array_push(new_packages, info)
+            else is new_packages = array_push(new_packages, s.packages[i]) end
+            i += 1
+        end
+    else is
+        new_packages = array_push(s.packages, info)
+    end
+
+    ;; Zaktualizuj `required_by` u wszystkich zależności.
+    let pkg_ver_key: string = package + "@" + version
+    let mut i: int = 0
+    while i < array_len(depends_on) is
+        let dep_spec: string = depends_on[i]
+        let parts: [string] = split_pkg_ver(dep_spec)
+        let dep_name: string = parts[0]
+        let dep_ver: string = parts[1]
+        let mut j: int = 0
+        while j < array_len(new_packages) is
+            let matches_name: bool = new_packages[j].name == dep_name
+            let matches_ver: bool = dep_ver == "" || new_packages[j].version == dep_ver
+            if matches_name && matches_ver is
+                let mut vi: VersionInfo = new_packages[j]
+                if !array_contains_str(vi.required_by, pkg_ver_key) is
+                    vi.required_by = array_push(vi.required_by, pkg_ver_key)
+                end
+                new_packages[j] = vi
+            end
+            j += 1
+        end
+        i += 1
+    end
+
+    return State { packages: new_packages, history: s.history }
+end
+
+fn array_contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return true end
+        i += 1
+    end
+    return false
+end
+
+fn array_remove_str(arr: [string], target: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] != target is out = array_push(out, arr[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn remove_package_version(s: State, package: string, version: string) -> State is
+    let idx: int = find_index(s.packages, package, version)
+    let mut deps: [string] = []
+    if idx >= 0 is deps = s.packages[idx].depends_on end
+
+    let pkg_ver_key: string = package + "@" + version
+
+    let mut new_packages: [VersionInfo] = []
+    let mut i: int = 0
+    while i < array_len(s.packages) is
+        let p: VersionInfo = s.packages[i]
+        if p.name == package && p.version == version is
+            i += 1
+            continue
+        end
+        let mut updated: VersionInfo = p
+        let mut d: int = 0
+        while d < array_len(deps) is
+            let parts: [string] = split_pkg_ver(deps[d])
+            let dep_name: string = parts[0]
+            let dep_ver: string = parts[1]
+            if updated.name == dep_name && (dep_ver == "" || updated.version == dep_ver) is
+                updated.required_by = array_remove_str(updated.required_by, pkg_ver_key)
+            end
+            d += 1
+        end
+        new_packages = array_push(new_packages, updated)
+        i += 1
+    end
+
+    ;; Wyczyść persystentne nazwy wrapperów dla tego pakietu.
+    let wn: WrapperNames = wrapper_names_load()
+    wn_remove_pkg(wn, package)
+
+    return State { packages: new_packages, history: s.history }
+end
+
+;; ── Zapytania ─────────────────────────────────────────────────────────
+
+pub fn reverse_deps(s: State, package: string) -> [string] is
+    let mut result: [string] = []
+    let mut i: int = 0
+    while i < array_len(s.packages) is
+        let p: VersionInfo = s.packages[i]
+        if p.name != package is
+            let mut d: int = 0
+            let mut found: bool = false
+            while d < array_len(p.depends_on) && !found is
+                let parts: [string] = split_pkg_ver(p.depends_on[d])
+                if parts[0] == package is
+                    let key: string = p.name + "@" + p.version
+                    if !array_contains_str(result, key) is
+                        result = array_push(result, key)
+                    end
+                    found = true
+                end
+                d += 1
+            end
+        end
+        i += 1
+    end
+    sort::sort_strings(result)
+    return result
+end
+
+pub fn orphans(s: State) -> [VersionInfo] is
+    let mut result: [VersionInfo] = []
+    let mut i: int = 0
+    while i < array_len(s.packages) is
+        let p: VersionInfo = s.packages[i]
+        if !p.manually_installed && array_len(p.required_by) == 0 is
+            result = array_push(result, p)
+        end
+        i += 1
+    end
+    return result
+end
+
+pub fn check_conflicts(s: State, package: string, declared_conflicts: [string]) -> [string] is
+    let mut violations: [string] = []
+    let mut i: int = 0
+    while i < array_len(s.packages) is
+        let p: VersionInfo = s.packages[i]
+        let mut c: int = 0
+        while c < array_len(p.conflicts_with) is
+            let parts: [string] = split_pkg_ver(p.conflicts_with[c])
+            if parts[0] == package is
+                violations = array_push(violations, p.name + "@" + p.version + " conflicts with " + package)
+            end
+            c += 1
+        end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(declared_conflicts) is
+        let parts: [string] = split_pkg_ver(declared_conflicts[j])
+        if has_package(s.packages, parts[0]) is
+            violations = array_push(violations, package + " conflicts with installed package " + parts[0])
+        end
+        j += 1
+    end
+    return violations
+end
+
+;; `get_current_version`/`get_previous_version` — Rust czytał to z
+;; dowiązania symbolicznego `<store>/<pkg>/current` (`fs::read_link`).
+;; H# nie ma `readlink()` w bezpiecznej, udokumentowanej formie (odczyt
+;; symlinka w libc wymaga wypełnienia bufora przez wywoływanego — C
+;; `readlink(path, buf, size)` — a H# nie ma sposobu na zmarshalowanie
+;; wypełnionego bufora C z powrotem na `string` bez surowego, nieprzenośnego
+;; dostępu do pamięci). `utils::set_current_version` w dalszym ciągu
+;; TWORZY prawdziwy symlink przez `extern static [c] fn symlink(...)`
+;; (tworzenie idzie dwoma stringami WEJŚCIOWYMI, więc działa bez problemu —
+;; problem jest tylko z odczytem), więc `<store>/<pkg>/current` nadal
+;; realnie istnieje jako symlink na dysku (dla narzędzi spoza hpm, `ls -la`,
+;; itp.) — ale HPM sam odczytuje "którą wersję ustawiono jako bieżącą" z
+;; towarzyszącego pliku tekstowego `current.hpm-marker` zapisywanego przez
+;; `utils::set_current_version` w tym samym katalogu, zamiast z symlinka.
+pub fn get_current_version(package: string, store_path: string) -> string is
+    let marker: string = store_path + package + "/current.hpm-marker"
+    if !fs::exists(marker) is return "" end
+    return string_trim(fs::read(marker))
+end
+
+fn compare_versions_any(a: any, b: any) -> int is
+    return utils::compare_versions(a, b)
+end
+
+pub fn get_previous_version(s: State, package: string, store_path: string) -> string is
+    let current: string = get_current_version(package, store_path)
+    if current == "" is return "" end
+    let mut vers: [VersionInfo] = versions_of(s.packages, package)
+    if array_len(vers) == 0 is return "" end
+
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(vers) is
+        names = array_push(names, vers[i].version)
+        i += 1
+    end
+    sort::sort_by(names, compare_versions_any) ;; sortuje w miejscu (nie polegamy na wartości zwracanej)
+
+    let mut pos: int = -1
+    let mut j: int = 0
+    while j < array_len(names) is
+        if names[j] == current is pos = j end
+        j += 1
+    end
+    if pos <= 0 is return "" end
+    return names[pos - 1]
+end
