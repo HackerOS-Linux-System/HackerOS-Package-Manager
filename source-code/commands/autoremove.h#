@@ -1,0 +1,78 @@
+mod colors
+mod error
+mod state
+mod utils
+mod remove
+
+use "std -> io"  from "io"
+use "std -> fmt" from "fmt"
+
+pub fn autoremove() -> error::HpmResult<bool> is
+    let lock_r: error::HpmResult<int> = utils::acquire_lock()
+    match lock_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lock_fd) => is
+            let result: error::HpmResult<bool> = autoremove_inner()
+            utils::release_lock(lock_fd)
+            return result
+        end
+    end
+end
+
+fn autoremove_inner() -> error::HpmResult<bool> is
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(initial_state) => is
+            let mut s: state::State = initial_state
+            let mut removed_total: int = 0
+
+            let mut looping: bool = true
+            while looping is
+                let orphans: [state::VersionInfo] = state::orphans(s)
+                if array_len(orphans) == 0 is
+                    looping = false
+                    continue
+                end
+
+                write("→ The following packages were installed as dependencies and are no longer needed:\n")
+                let mut i: int = 0
+                while i < array_len(orphans) is
+                    write("  – " + colors::white(orphans[i].name) + "@" + orphans[i].version)
+                    i += 1
+                end
+                write("")
+
+                let answer: string = io::read_line("Remove " + to_string(array_len(orphans)) + " package(s)? [y/N] ")
+                if string_lower(string_trim(answer)) != "y" is
+                    write("→ Aborted.")
+                    return error::HpmResult::Ok(true)
+                end
+
+                s = state::push_snapshot(s, "pre-autoremove " + to_string(array_len(orphans)) + " packages")
+                let mut o: int = 0
+                while o < array_len(orphans) is
+                    let rr: error::HpmResult<state::State> = remove::remove_version(orphans[o].name, orphans[o].version, s)
+                    match rr is
+                        HpmResult::Err(e) => return error::HpmResult::Err(e)
+                        HpmResult::Ok(new_s) => is
+                            s = new_s
+                            write("  ✔ Removed " + colors::white(orphans[o].name) + "@" + orphans[o].version)
+                            removed_total = removed_total + 1
+                        end
+                    end
+                    o += 1
+                end
+            end
+
+            if removed_total == 0 is
+                write("✔ Nothing to remove — no orphaned packages found.")
+            else is
+                let save_r: error::HpmResult<bool> = state::state_save(s)
+                if error::is_err(save_r) is return save_r end
+                write("\n✔ Removed " + to_string(removed_total) + " orphaned package(s).")
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
