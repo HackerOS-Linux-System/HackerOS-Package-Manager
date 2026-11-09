@@ -1,0 +1,3 @@
+pub fn white(s: string) -> string is return "\x1b[37m" + s + "\x1b[0m" end
+pub fn magenta(s: string) -> string is return "\x1b[35m" + s + "\x1b[0m" end
+pub fn bold_underline(s: string) -> string is return "\x1b[1m\x1b[4m" + s + "\x1b[0m" end
