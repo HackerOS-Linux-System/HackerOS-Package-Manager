@@ -1,0 +1,402 @@
+pub struct HkNode is
+    pub is_map:  bool
+    pub str_val: string
+    pub keys:    [string]
+    pub vals:    [HkNode]
+end
+
+;; ── Konstruktory węzłów ──────────────────────────────────────────────
+
+pub fn node_str(v: string) -> HkNode is
+    return HkNode { is_map: false, str_val: v, keys: [], vals: [] }
+end
+
+pub fn node_map() -> HkNode is
+    return HkNode { is_map: true, str_val: "", keys: [], vals: [] }
+end
+
+;; Zwraca węzeł `n` z wstawionym/nadpisanym kluczem — styl "rebuild i
+;; zwróć", bo `HkNode` bywa zagnieżdżony dowolnie głęboko (przez kropkowane
+;; klucze/sekcje), a mutacja zwróconej-przez-funkcję kopii zagnieżdżonej
+;; struktury nie propaguje się z powrotem do oryginału (tak samo jak w
+;; Rust bez `&mut`) — więc każdy poziom musi jawnie `return`ować swoją
+;; zaktualizowaną wersję aż do korzenia (`node_set_path` niżej robi
+;; dokładnie to, rekurencyjnie).
+pub fn node_set(n: HkNode, key: string, val: HkNode) -> HkNode is
+    let mut i: int = 0
+    let mut found: bool = false
+    let mut new_vals: [HkNode] = []
+    while i < array_len(n.keys) is
+        if n.keys[i] == key is
+            new_vals = array_push(new_vals, val)
+            found = true
+        else is
+            new_vals = array_push(new_vals, n.vals[i])
+        end
+        i += 1
+    end
+    if found is
+        return HkNode { is_map: true, str_val: n.str_val, keys: n.keys, vals: new_vals }
+    end
+    let new_keys: [string] = array_push(n.keys, key)
+    new_vals = array_push(new_vals, val)
+    return HkNode { is_map: true, str_val: n.str_val, keys: new_keys, vals: new_vals }
+end
+
+pub fn node_has(n: HkNode, key: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(n.keys) is
+        if n.keys[i] == key is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn node_get(n: HkNode, key: string) -> HkNode is
+    let mut i: int = 0
+    while i < array_len(n.keys) is
+        if n.keys[i] == key is return n.vals[i] end
+        i += 1
+    end
+    return HkNode { is_map: false, str_val: "", keys: [], vals: [] } ;; węzeł "nil"
+end
+
+pub fn node_get_or_new_map(n: HkNode, key: string) -> HkNode is
+    if node_has(n, key) is return node_get(n, key) end
+    return node_map()
+end
+
+pub fn node_is_empty_value(n: HkNode) -> bool is
+    if n.is_map is return array_len(n.keys) == 0 end
+    return n.str_val == ""
+end
+
+pub fn node_get_str(n: HkNode, key: string) -> string is
+    if !node_has(n, key) is return "" end
+    let v: HkNode = node_get(n, key)
+    if v.is_map is return "" end
+    return v.str_val
+end
+
+pub fn node_get_bool(n: HkNode, key: string) -> bool is
+    let v: string = string_lower(node_get_str(n, key))
+    return v == "true" || v == "1" || v == "yes"
+end
+
+;; Odpowiednik `get_string_list` z Rust `manifest.rs`: obsługuje zarówno
+;; format mapowy (lista `[ ... ]` zbudowana jako mapa klucz->pusta wartość,
+;; albo prawdziwa zagnieżdżona mapa jak `bins.x`), jak i fallback do
+;; stringa rozdzielanego przecinkami.
+pub fn node_get_string_list(n: HkNode, key: string) -> [string] is
+    if !node_has(n, key) is return [] end
+    let v: HkNode = node_get(n, key)
+    if v.is_map is
+        let mut out: [string] = []
+        let mut i: int = 0
+        while i < array_len(v.keys) is
+            let child: HkNode = v.vals[i]
+            if node_is_empty_value(child) || !child.is_map is
+                out = array_push(out, v.keys[i])
+            end
+            i += 1
+        end
+        return out
+    end
+    let s: string = string_trim(v.str_val)
+    if s == "" || s == "[]" || s == "{{}}" is return [] end
+    let parts: [string] = string_split(s, ",")
+    let mut out2: [string] = []
+    let mut j: int = 0
+    while j < array_len(parts) is
+        let item: string = string_trim(strip_quotes(parts[j]))
+        if item != "" is out2 = array_push(out2, item) end
+        j += 1
+    end
+    return out2
+end
+
+pub fn node_keys(n: HkNode) -> [string] is
+    return n.keys
+end
+
+;; ── Pomocnicze do parsowania tekstu ──────────────────────────────────
+;;
+;; Cudzysłowy: `bytes::config::hk_parse_value` już usuwa WSZYSTKIE `"` z
+;; wartości (`string_replace(v, "\"", "")`), więc dla wartości zwróconych
+;; STĄD nie trzeba nic więcej — `strip_quotes` służy tylko elementom list
+;; wieloliniowych, które parsujemy sami (nie przechodzą przez
+;; `hk_parse_value`, bo nie mają swojego `->`/`=>` na tej linii).
+fn strip_quotes(raw: string) -> string is
+    let s: string = string_trim(raw)
+    let n: int = string_len(s)
+    if n >= 2 && string_at(s, 0) == "\"" && string_at(s, n - 1) == "\"" is
+        return string_slice(s, 1, n - 1)
+    end
+    return s
+end
+
+;; Klucz z linii `-> klucz => wartość`: zdejmuje wiodące "->"/"-"/">" i spacje,
+;; ucina przy "=>" (gdy go brak — cała reszta linii), przycina białe znaki.
+fn hk_parse_key(line: string) -> string is
+    let mut s: string = string_trim(line)
+    while string_len(s) > 0 && (string_starts_with(s, "-") || string_starts_with(s, ">")) is
+        s = string_slice(s, 1, string_len(s))
+    end
+    s = string_trim(s)
+    let arrow: int = string_find(s, "=>")
+    if arrow >= 0 is
+        s = string_slice(s, 0, arrow)
+    end
+    return string_trim(s)
+end
+
+;; Wartość z linii `-> klucz => wartość`: tekst po "=>", bez komentarza
+;; końcowego ("  !" / "  ;;" poza cudzysłowem) i bez cudzysłowów. Zwraca ""
+;; zarówno dla braku "=>" jak i dla pustej wartości (rozróżnienie robi
+;; wywołujący przez `string_contains(line, "=>")`).
+fn hk_parse_value(line: string) -> string is
+    let arrow: int = string_find(line, "=>")
+    if arrow < 0 is return "" end
+    let v: string = string_trim(string_slice(line, arrow + 2, string_len(line)))
+    let n: int = string_len(v)
+    let mut i: int = 0
+    let mut in_q: bool = false
+    let mut cut: int = n
+    while i < n is
+        let c: string = string_at(v, i)
+        if c == "\"" is
+            in_q = !in_q
+        end
+        if !in_q && i >= 2 && string_at(v, i - 1) == " " && string_at(v, i - 2) == " " is
+            if c == "!" || (c == ";" && i + 1 < n && string_at(v, i + 1) == ";") is
+                cut = i - 2
+                i = n
+            end
+        end
+        i += 1
+    end
+    return string_replace(string_trim(string_slice(v, 0, cut)), "\"", "")
+end
+
+;; Rozbija nagłówek sekcji "[a.b.c]" -> ["a", "b", "c"]
+fn split_section_path(header: string) -> [string] is
+    let inner: string = string_trim(string_slice(header, 1, string_len(header) - 1))
+    return string_split(inner, ".")
+end
+
+;; Rozbija klucz z dopiskiem kropkowym "bins.sysforge" -> ["bins", "sysforge"]
+fn arr_concat(a: [string], b: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(a) is
+        out = array_push(out, a[i])
+        i += 1
+    end
+    i = 0
+    while i < array_len(b) is
+        out = array_push(out, b[i])
+        i += 1
+    end
+    return out
+end
+
+fn arr_tail(a: [string], from: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = from
+    while i < array_len(a) is
+        out = array_push(out, a[i])
+        i += 1
+    end
+    return out
+end
+
+fn split_dotted_key(key: string) -> [string] is
+    let dot: int = string_find(key, ".")
+    if dot < 0 is return [key] end
+    let head: string = string_slice(key, 0, dot)
+    let tail: string = string_slice(key, dot + 1, string_len(key))
+    return [head, tail]
+end
+
+;; Zagnieżdża wartość `val` pod ścieżką `path` (>= 1 element) wewnątrz
+;; mapowego węzła `base`, tworząc pośrednie mapy w miarę potrzeby.
+fn node_set_path(base: HkNode, path: [string], val: HkNode) -> HkNode is
+    if array_len(path) == 1 is
+        return node_set(base, path[0], val)
+    end
+    let head: string = path[0]
+    let rest: [string] = arr_tail(path, 1)
+    let child: HkNode = node_get_or_new_map(base, head)
+    let updated_child: HkNode = node_set_path(child, rest, val)
+    return node_set(base, head, updated_child)
+end
+
+fn node_get_by_path(n: HkNode, path: [string]) -> HkNode is
+    let mut cur: HkNode = n
+    let mut i: int = 0
+    while i < array_len(path) is
+        cur = node_get(cur, path[i])
+        i += 1
+    end
+    return cur
+end
+
+;; ── Główny parser ─────────────────────────────────────────────────────
+;;
+;; Rozbiór KAŻDEJ pojedynczej linii `-> klucz => wartość` (klucz jeszcze
+;; kropkowany, wartość jeszcze w cudzysłowach/z komentarzem) idzie przez
+;; `hk_parse_key`/`hk_parse_value` (lokalne, patrz wyżej) —
+;; to jest to samo, co `bytes` sam robi dla `Bytes.hk`. Reszta (sekcje,
+;; kropkowane zagnieżdżanie, wieloliniowe listy, dogięcie opisu) buduje z
+;; tego drzewo `HkNode`, bo `bytes`'owy `Project` nie ma na to miejsca.
+pub fn parse_hk(contents: string) -> HkNode is
+    let raw_lines: [string] = string_split(contents, "\n")
+    let mut root: HkNode = node_map()
+    let mut section_path: [string] = []
+    let mut i: int = 0
+    let n_lines: int = array_len(raw_lines)
+
+    ;; Ścieżka klucza ostatniej pojedynczej wartości string (do dogięcia
+    ;; wieloliniowych opisów typu `long`), pusta gdy nieaktualne.
+    let mut last_value_path: [string] = []
+    let mut have_last_value: bool = false
+
+    while i < n_lines is
+        let raw_line: string = raw_lines[i]
+        let trimmed: string = string_trim(raw_line)
+        i += 1
+
+        if trimmed == "" is continue end
+        if string_starts_with(trimmed, "!") is continue end
+
+        if string_starts_with(trimmed, "[") && string_ends_with(trimmed, "]") is
+            section_path = split_section_path(trimmed)
+            have_last_value = false
+            continue
+        end
+
+        if string_starts_with(trimmed, "->") is
+            ;; `hk_parse_key` sam zdejmuje "->"/"-"/">" wiodące i
+            ;; przycina do przecinka; `hk_parse_value` zwraca
+            ;; treść po "=>", już bez cudzysłowów i bez komentarza "  !"/
+            ;; "  ;;". Rozróżnienie "brak wartości" od "pusta wartość"
+            ;; (`-> sysdig =>` — puste, dozwolone dla [conflicts]) robimy
+            ;; sami, bo `hk_parse_value` zwraca "" w obu przypadkach.
+            let key: string = hk_parse_key(trimmed)
+            let has_arrow: bool = string_contains(trimmed, "=>")
+            let mut after: string = ""
+            if has_arrow is
+                after = string_trim(hk_parse_value(trimmed))
+            end
+
+            let key_path: [string] = split_dotted_key(key)
+            let full_path: [string] = arr_concat(section_path, key_path)
+
+            if after == "[" is
+                ;; Lista wieloliniowa — czytaj aż do samotnego "]"
+                let mut items: HkNode = node_map()
+                let mut done: bool = false
+                while !done && i < n_lines is
+                    let item_line: string = string_trim(raw_lines[i])
+                    i += 1
+                    if item_line == "]" is
+                        done = true
+                    elsif item_line == "" is
+                        continue
+                    else is
+                        let item_val: string = strip_quotes(item_line)
+                        items = node_set(items, item_val, node_str(""))
+                    end
+                end
+                root = node_set_path(root, full_path, items)
+                have_last_value = false
+            elsif after == "[]" || after == "{{}}" is
+                root = node_set_path(root, full_path, node_map())
+                have_last_value = false
+            else is
+                let val_node: HkNode = node_str(after)
+                root = node_set_path(root, full_path, val_node)
+                last_value_path = full_path
+                have_last_value = true
+            end
+            continue
+        end
+
+        ;; Linia bez "->", "[" ani "!" — dogięcie (kontynuacja) poprzedniej
+        ;; wartości tekstowej, np. wieloliniowy `long => ...`.
+        if have_last_value is
+            let current: HkNode = node_get_by_path(root, last_value_path)
+            if !current.is_map is
+                let joined: string = current.str_val + " " + trimmed
+                root = node_set_path(root, last_value_path, node_str(joined))
+            end
+        end
+    end
+
+    return root
+end
+
+;; ── Interpolacja `{klucz}` / `{sekcja.klucz}` ────────────────────────
+;;
+;; Odpowiednik `hk_parser::resolve_interpolations` z Rust: przechodzi po
+;; wszystkich liściach-stringach i podmienia wystąpienia `{ścieżka}` na
+;; wartość pod tą ścieżką w całym drzewie configu (np. opis pakietu może
+;; odwołać się do `{metadata.name}`).
+pub fn resolve_interpolations(root: HkNode) -> HkNode is
+    return resolve_node(root, root)
+end
+
+fn resolve_node(n: HkNode, root: HkNode) -> HkNode is
+    if !n.is_map is
+        return node_str(resolve_string(n.str_val, root))
+    end
+    let mut new_vals: [HkNode] = []
+    let mut i: int = 0
+    while i < array_len(n.vals) is
+        new_vals = array_push(new_vals, resolve_node(n.vals[i], root))
+        i += 1
+    end
+    return HkNode { is_map: true, str_val: n.str_val, keys: n.keys, vals: new_vals }
+end
+
+fn resolve_string(s: string, root: HkNode) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    let n: int = string_len(s)
+    while i < n is
+        let ch: string = string_at(s, i)
+        if ch == "{" is
+            let rest_from_i: string = string_slice(s, i, n)
+            let close: int = string_find(rest_from_i, "}")
+            if close < 0 is
+                out = out + rest_from_i
+                i = n
+            else is
+                let path_str: string = string_slice(s, i + 1, i + close)
+                let path: [string] = string_split(path_str, ".")
+                let resolved: HkNode = node_get_by_path(root, path)
+                if !resolved.is_map && resolved.str_val != "" is
+                    out = out + resolved.str_val
+                else is
+                    out = out + "{" + path_str + "}"
+                end
+                i = i + close + 1
+            end
+        else is
+            out = out + ch
+            i += 1
+        end
+    end
+    return out
+end
+
+;; ── Wczytanie pliku .hk ───────────────────────────────────────────────
+
+pub fn load_hk_file(path: string) -> HkNode is
+    if !file_exists(path) is
+        return node_map()
+    end
+    let contents: string = file_read(path)
+    let parsed: HkNode = parse_hk(contents)
+    return resolve_interpolations(parsed)
+end
