@@ -1,0 +1,436 @@
+mod error
+mod state
+mod utils
+mod manifest
+mod squash
+mod paths
+mod installer
+mod db
+mod colors
+
+use "std -> fs"  from "fs"
+use "std -> fmt" from "fmt"
+
+struct Report is
+    pub oks:      [string]
+    pub warnings: [string]
+    pub errors:   [string]
+end
+
+fn report_new() -> Report is
+    return Report { oks: [], warnings: [], errors: [] }
+end
+
+pub fn doctor() -> error::HpmResult<bool> is
+    write("→ Running hpm diagnostics...\n")
+
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            let mut r: Report = report_new()
+
+            if fs::exists(db::db_path()) is
+                r.oks = array_push(r.oks, "hpm.db exists and is readable")
+            else is
+                r.warnings = array_push(r.warnings, "hpm.db does not exist yet (no packages installed)")
+            end
+
+            let store_path: string = paths::store_path()
+            if !fs::exists(store_path) is
+                r.warnings = array_push(r.warnings, "Store directory " + store_path + " does not exist")
+            else is
+                r.oks = array_push(r.oks, "Store directory " + store_path + " exists")
+            end
+
+            let mut names: [string] = []
+            let mut i: int = 0
+            while i < array_len(s.packages) is
+                if !contains_str(names, s.packages[i].name) is names = array_push(names, s.packages[i].name) end
+                i += 1
+            end
+
+            let mut n: int = 0
+            while n < array_len(names) is
+                let pkg_name: string = names[n]
+                let pkg_store_dir: string = store_path + pkg_name
+
+                let current_ver: string = state::get_current_version(pkg_name, store_path)
+                if current_ver != "" is
+                    r.oks = array_push(r.oks, pkg_name + ": current → " + current_ver)
+                else is
+                    r.errors = array_push(r.errors, pkg_name + ": missing current symlink")
+                end
+
+                let versions: [state::VersionInfo] = state::versions_of(s.packages, pkg_name)
+                let mut v: int = 0
+                while v < array_len(versions) is
+                    let info: state::VersionInfo = versions[v]
+                    let ver_dir: string = pkg_store_dir + "/" + info.version
+
+                    if !fs::exists(ver_dir) is
+                        r.errors = array_push(r.errors, pkg_name + "@" + info.version + ": directory missing from store (" + ver_dir + ")")
+                    else is
+                        let mount_r: error::HpmResult<bool> = squash::ensure_mounted(ver_dir)
+                        if error::is_err(mount_r) is
+                            match mount_r is
+                                HpmResult::Err(e) => r.errors = array_push(r.errors, pkg_name + "@" + info.version + ": could not mount compressed store: " + error::message(e))
+                                HpmResult::Ok(_)  => is end
+                            end
+                        else is
+                            let hash_r: error::HpmResult<string> = utils::compute_dir_hash(ver_dir)
+                            match hash_r is
+                                HpmResult::Ok(actual) => is
+                                    if actual == info.checksum is
+                                        r.oks = array_push(r.oks, pkg_name + "@" + info.version + ": checksum OK")
+                                    else is
+                                        r.errors = array_push(r.errors, pkg_name + "@" + info.version + ": checksum MISMATCH\n    stored:   " +
+                                            short12(info.checksum) + "\n    computed: " + short12(actual))
+                                    end
+                                end
+                                HpmResult::Err(e) => r.warnings = array_push(r.warnings, pkg_name + "@" + info.version + ": could not compute checksum: " + error::message(e))
+                            end
+
+                            let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(ver_dir)
+                            match mr is
+                                HpmResult::Ok(m) => is
+                                    let mut b: int = 0
+                                    while b < array_len(m.bins) is
+                                        let bin_name: string = m.bins[b]
+                                        let wrapper: string = paths::bin_dir() + "/" + bin_name
+                                        if !fs::exists(wrapper) is
+                                            let alt_wrapper: string = paths::bin_dir() + "/" + pkg_name + "-" + bin_name
+                                            if fs::exists(alt_wrapper) is
+                                                r.warnings = array_push(r.warnings, pkg_name + "@" + info.version + ": " + paths::bin_dir() + "/" + bin_name +
+                                                    " missing but " + paths::bin_dir() + "/" + pkg_name + "-" + bin_name + " exists (renamed wrapper)")
+                                            elsif current_ver == info.version is
+                                                r.errors = array_push(r.errors, pkg_name + "@" + info.version + ": " + paths::bin_dir() + "/" + bin_name +
+                                                    " wrapper missing (package is current but has no wrapper)")
+                                            else is
+                                                r.warnings = array_push(r.warnings, pkg_name + "@" + info.version + ": " + paths::bin_dir() + "/" + bin_name +
+                                                    " wrapper missing (non-current version, OK)")
+                                            end
+                                        else is
+                                            let content: string = fs::read(wrapper)
+                                            if string_contains(content, "hpm run " + pkg_name + " ") is
+                                                r.oks = array_push(r.oks, pkg_name + "@" + info.version + ": " + paths::bin_dir() + "/" + bin_name + " wrapper OK")
+                                            else is
+                                                r.warnings = array_push(r.warnings, pkg_name + "@" + info.version + ": " + paths::bin_dir() + "/" + bin_name +
+                                                    " wrapper exists but doesn't call hpm run")
+                                            end
+                                        end
+                                        b += 1
+                                    end
+
+                                    if m.is_gui || m.sandbox.gui is
+                                        let desktop: string = paths::desktop_dir() + "/" + pkg_name + ".desktop"
+                                        if !fs::exists(desktop) is
+                                            r.warnings = array_push(r.warnings, pkg_name + ": GUI app but no .desktop file at " + desktop)
+                                        else is
+                                            r.oks = array_push(r.oks, pkg_name + ": .desktop file present")
+                                        end
+                                    end
+                                end
+                                HpmResult::Err(_) => r.warnings = array_push(r.warnings, pkg_name + "@" + info.version + ": could not read info.hk from store")
+                            end
+                        end
+                    end
+                    v += 1
+                end
+                n += 1
+            end
+
+            if fs::exists(store_path) is
+                let entries: [string] = fs::list_dir(store_path)
+                let mut ei: int = 0
+                while ei < array_len(entries) is
+                    if !contains_str(names, entries[ei]) is
+                        r.warnings = array_push(r.warnings, "Store directory " + store_path + "/" + entries[ei] + " exists but is not in state (orphaned store entry)")
+                    end
+                    ei += 1
+                end
+            end
+
+            if fs::exists(paths::bin_dir()) is
+                let bentries: [string] = fs::list_dir(paths::bin_dir())
+                let mut bi: int = 0
+                while bi < array_len(bentries) is
+                    let path: string = paths::bin_dir() + "/" + bentries[bi]
+                    if fs::is_file(path) is
+                        let content: string = fs::read(path)
+                        if string_contains(content, "hpm run ") is
+                            let pkg: string = extract_pkg_from_wrapper(content)
+                            if pkg != "" && !contains_str(names, pkg) is
+                                r.warnings = array_push(r.warnings, paths::bin_dir() + "/" + bentries[bi] + ": wrapper references '" + pkg + "' but it is not installed")
+                            end
+                        end
+                    end
+                    bi += 1
+                end
+            end
+
+            r = check_duplicate_wrappers(s, names, r)
+
+            write("→ Summary:\n")
+            let mut oi: int = 0
+            while oi < array_len(r.oks) is write("  " + fmt::red("✔") + " " + r.oks[oi]) oi += 1 end
+            let mut wi: int = 0
+            while wi < array_len(r.warnings) is write("  ⚠ " + r.warnings[wi]) wi += 1 end
+            let mut xi: int = 0
+            while xi < array_len(r.errors) is write("  " + fmt::red("✗") + " " + r.errors[xi]) xi += 1 end
+
+            write("")
+            let total: int = array_len(r.oks) + array_len(r.warnings) + array_len(r.errors)
+            write("  Checks:   " + to_string(total))
+            write("  " + fmt::red("✔") + " OK:       " + to_string(array_len(r.oks)))
+            write("  ⚠ Warnings: " + to_string(array_len(r.warnings)))
+            write("  " + fmt::red("✗") + " Errors:   " + to_string(array_len(r.errors)))
+
+            if array_len(r.errors) > 0 is
+                write("\n→ Run " + fmt::dim("hpm repair") + " to attempt automatic repair.")
+            elsif array_len(r.warnings) == 0 is
+                write("\n" + fmt::red("✔") + " All checks passed.")
+            end
+
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+;; NOTE: `check_duplicate_wrappers` mutuje `r` przez pola-tablice — H#
+;; struktury lokalne (nie `self`) NIE propagują mutacji przez granicę
+;; wywołania funkcji (patrz `hk_parser.h#` nagłówek), więc ta funkcja
+;; zwraca nowy Report i wołający go podstawia z powrotem.
+fn check_duplicate_wrappers(s: state::State, names: [string], r: Report) -> Report is
+    let mut wrapper_bins: [string] = []
+    let mut wrapper_owners: [[string]] = []
+
+    let mut n: int = 0
+    while n < array_len(names) is
+        let pkg_name: string = names[n]
+        let current_ver: string = state::get_current_version(pkg_name, paths::store_path())
+        if current_ver != "" is
+            let ver_dir: string = paths::store_path() + pkg_name + "/" + current_ver
+            squash::ensure_mounted(ver_dir)
+            let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(ver_dir)
+            match mr is
+                HpmResult::Ok(m) => is
+                    let mut b: int = 0
+                    while b < array_len(m.bins) is
+                        let bin_name: string = m.bins[b]
+                        let idx: int = index_of_str(wrapper_bins, bin_name)
+                        if idx < 0 is
+                            wrapper_bins = array_push(wrapper_bins, bin_name)
+                            wrapper_owners = array_push(wrapper_owners, [pkg_name])
+                        else is
+                            wrapper_owners[idx] = array_push(wrapper_owners[idx], pkg_name)
+                        end
+                        b += 1
+                    end
+                end
+                HpmResult::Err(_) => is end
+            end
+        end
+        n += 1
+    end
+
+    let mut new_warnings: [string] = r.warnings
+    let mut i: int = 0
+    while i < array_len(wrapper_bins) is
+        if array_len(wrapper_owners[i]) > 1 is
+            new_warnings = array_push(new_warnings, paths::bin_dir() + "/" + wrapper_bins[i] +
+                " is claimed by multiple packages: " + wrapper_owners[i].join(", "))
+        end
+        i += 1
+    end
+
+    return Report { oks: r.oks, warnings: new_warnings, errors: r.errors }
+end
+
+fn index_of_str(arr: [string], target: string) -> int is
+    let mut i: int = 0
+    while i < array_len(arr) is
+        if arr[i] == target is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    return index_of_str(arr, target) >= 0
+end
+
+fn short12(s: string) -> string is
+    let n: int = if string_len(s) < 12 then string_len(s) else 12
+    return string_slice(s, 0, n)
+end
+
+fn extract_pkg_from_wrapper(content: string) -> string is
+    let lines: [string] = string_split(content, "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = lines[i]
+        if string_starts_with(line, "exec ") is
+            let rest: string = string_slice(line, 5, string_len(line))
+            let parts: [string] = string_split(string_trim(rest), " ")
+            if array_len(parts) >= 3 && parts[1] == "run" is return parts[2] end
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; ── Repair ───────────────────────────────────────────────────────────
+
+pub fn repair() -> error::HpmResult<bool> is
+    write("→ Running hpm repair...\n")
+
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            let hpm_exe: string = installer::which_hpm_for_wrappers()
+            let store: string = paths::store_path()
+            let mut fixed: int = 0
+
+            let mut names: [string] = []
+            let mut i: int = 0
+            while i < array_len(s.packages) is
+                if !contains_str(names, s.packages[i].name) is names = array_push(names, s.packages[i].name) end
+                i += 1
+            end
+
+            ;; 1. Napraw brakujące "current"
+            let mut n: int = 0
+            while n < array_len(names) is
+                let pkg_name: string = names[n]
+                let pkg_dir: string = store + pkg_name
+                if state::get_current_version(pkg_name, store) == "" is
+                    let versions: [state::VersionInfo] = state::versions_of(s.packages, pkg_name)
+                    let mut newest: string = ""
+                    let mut vi: int = 0
+                    while vi < array_len(versions) is
+                        if newest == "" || utils::compare_versions(versions[vi].version, newest) > 0 is newest = versions[vi].version end
+                        vi += 1
+                    end
+                    if newest != "" && fs::exists(pkg_dir + "/" + newest) is
+                        utils::set_current_version(pkg_dir, newest)
+                        write("  " + fmt::red("✔") + " Fixed missing 'current' symlink for " + colors::white(pkg_name) + " → " + fmt::red(newest))
+                        fixed = fixed + 1
+                    end
+                end
+                n += 1
+            end
+
+            ;; 2. Napraw brakujące wrappery
+            let mut n2: int = 0
+            while n2 < array_len(names) is
+                let pkg_name: string = names[n2]
+                let current_ver: string = state::get_current_version(pkg_name, store)
+                if current_ver != "" is
+                    let ver_dir: string = store + pkg_name + "/" + current_ver
+                    if fs::exists(ver_dir) is
+                        squash::ensure_mounted(ver_dir)
+                        let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(ver_dir)
+                        match mr is
+                            HpmResult::Ok(m) => is
+                                let mut b: int = 0
+                                while b < array_len(m.bins) is
+                                    let bin_name: string = m.bins[b]
+                                    let wrapper: string = paths::bin_dir() + "/" + bin_name
+                                    let mut needs_fix: bool = true
+                                    if fs::exists(wrapper) is
+                                        let content: string = fs::read(wrapper)
+                                        needs_fix = !string_contains(content, "hpm run " + pkg_name + " ")
+                                    end
+                                    if needs_fix is
+                                        let mut bin_rel: string = ""
+                                        if manifest::osm_contains(m.bin_paths, bin_name) is
+                                            let explicit: string = manifest::osm_get(m.bin_paths, bin_name)
+                                            if fs::exists(ver_dir + "/" + explicit) is bin_rel = explicit end
+                                        else is
+                                            bin_rel = installer::find_binary_in_dir(ver_dir, bin_name)
+                                        end
+                                        if bin_rel != "" is
+                                            let content2: string = "#!/bin/sh\nexec " + hpm_exe + " run " + pkg_name + " " + bin_rel + " \"$@\"\n"
+                                            fs::write(wrapper, content2)
+                                            utils::make_executable(wrapper)
+                                            write("  " + fmt::red("✔") + " Repaired wrapper " + paths::bin_dir() + "/" + colors::white(bin_name) + " for " + pkg_name + "@" + current_ver)
+                                            fixed = fixed + 1
+                                        else is
+                                            write("  ⚠ Cannot repair " + paths::bin_dir() + "/" + bin_name + ": binary not found in store")
+                                        end
+                                    end
+                                    b += 1
+                                end
+                            end
+                            HpmResult::Err(_) => is end
+                        end
+                    end
+                end
+                n2 += 1
+            end
+
+            ;; 3. Usuń osierocone wrappery
+            if fs::exists(paths::bin_dir()) is
+                let bentries: [string] = fs::list_dir(paths::bin_dir())
+                let mut bi: int = 0
+                while bi < array_len(bentries) is
+                    let path: string = paths::bin_dir() + "/" + bentries[bi]
+                    if fs::is_file(path) is
+                        let content: string = fs::read(path)
+                        if string_contains(content, "hpm run ") is
+                            let pkg: string = extract_pkg_from_wrapper(content)
+                            if pkg != "" && !contains_str(names, pkg) is
+                                fs::remove(path)
+                                write("  " + fmt::red("✔") + " Removed stale wrapper " + colors::white(bentries[bi]) + " (package '" + pkg + "' not installed)")
+                                fixed = fixed + 1
+                            end
+                        end
+                    end
+                    bi += 1
+                end
+            end
+
+            ;; 4. Napraw .desktop
+            let mut n3: int = 0
+            while n3 < array_len(names) is
+                let pkg_name: string = names[n3]
+                let current_ver: string = state::get_current_version(pkg_name, store)
+                if current_ver != "" is
+                    let ver_dir: string = store + pkg_name + "/" + current_ver
+                    if fs::exists(ver_dir) is
+                        squash::ensure_mounted(ver_dir)
+                        let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(ver_dir)
+                        match mr is
+                            HpmResult::Ok(m) => is
+                                if m.is_gui || m.sandbox.gui || m.sandbox.full_gui is
+                                    let desktop: string = paths::desktop_dir() + "/" + pkg_name + ".desktop"
+                                    if !fs::exists(desktop) is
+                                        let dr: error::HpmResult<bool> = installer::install_desktop_integration_pub(ver_dir, m, pkg_name, hpm_exe)
+                                        match dr is
+                                            HpmResult::Ok(_) => is
+                                                write("  " + fmt::red("✔") + " Restored .desktop for " + colors::white(pkg_name))
+                                                fixed = fixed + 1
+                                            end
+                                            HpmResult::Err(e) => write("  ⚠ Could not restore .desktop for " + pkg_name + ": " + error::message(e))
+                                        end
+                                    end
+                                end
+                            end
+                            HpmResult::Err(_) => is end
+                        end
+                    end
+                end
+                n3 += 1
+            end
+
+            if fixed == 0 is
+                write(fmt::red("✔") + " Nothing needed repair.")
+            else is
+                write("\n" + fmt::red("✔") + " Repaired " + to_string(fixed) + " issue(s).")
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
