@@ -1,0 +1,96 @@
+mod error
+mod state
+mod manifest
+mod sandbox
+mod squash
+mod paths
+mod installer
+
+use "std -> fs"  from "fs"
+use "std -> fmt" from "fmt"
+
+pub fn run(package_spec: string, bin: string, extra_args: [string]) -> error::HpmResult<bool> is
+    let parts: [string] = string_split(package_spec, "@")
+    let pkg_name: string = parts[0]
+    let version: string = if array_len(parts) > 1 then parts[1] else ""
+
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(s) => is
+            if !state::has_package(s.packages, pkg_name) is
+                return error::HpmResult::Err(error::HpmError::PackageNotFound(
+                    pkg_name + "' is not installed. Install with: hpm install " + pkg_name))
+            end
+
+            let mut pkg_path: string = ""
+            if version != "" is
+                let candidate: string = paths::store_path() + pkg_name + "/" + version
+                if !fs::exists(candidate) is
+                    return error::HpmResult::Err(error::HpmError::VersionNotFound(pkg_name, version))
+                end
+                pkg_path = candidate
+            else is
+                let current_ver: string = state::get_current_version(pkg_name, paths::store_path())
+                if current_ver == "" is
+                    return error::HpmResult::Err(error::HpmError::Manifest("No current version set for package '" + pkg_name + "'"))
+                end
+                pkg_path = paths::store_path() + pkg_name + "/" + current_ver
+            end
+
+            let mount_r: error::HpmResult<bool> = squash::ensure_mounted(pkg_path)
+            if error::is_err(mount_r) is return mount_r end
+
+            let bin_rel: string = installer::find_binary_in_dir(pkg_path, bin)
+            if bin_rel == "" is
+                let files: [string] = list_files_except_info_hk(pkg_path)
+                if array_len(files) == 0 is
+                    return error::HpmResult::Err(error::HpmError::Manifest(
+                        "Package '" + pkg_name + "' store is empty. Try reinstalling: hpm install " + pkg_name))
+                end
+                let mut listing: [string] = []
+                let mut i: int = 0
+                while i < array_len(files) is
+                    listing = array_push(listing, "    " + files[i])
+                    i += 1
+                end
+                return error::HpmResult::Err(error::HpmError::Manifest(
+                    "Binary '" + bin + "' not found in package '" + pkg_name + "'.\n  Files installed:\n" +
+                    listing.join("\n") + "\n  Hint: check 'bins' field in info.hk matches the actual binary name."))
+            end
+
+            let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(pkg_path)
+            let mut m: manifest::Manifest = manifest::default_manifest(pkg_name)
+            match mr is
+                HpmResult::Ok(loaded) => m = loaded
+                HpmResult::Err(_)     => is end
+            end
+
+            let run_r: error::HpmResult<int> = sandbox::setup_sandbox(pkg_path, m, false, bin_rel, extra_args)
+            if error::is_err(run_r) is
+                match run_r is
+                    HpmResult::Err(e) => return error::HpmResult::Err(e)
+                    HpmResult::Ok(_)  => is end
+                end
+            end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+fn list_files_except_info_hk(dir: string) -> [string] is
+    let mut out: [string] = []
+    let entries: [string] = fs::walk(dir)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        if fs::is_file(entries[i]) is
+            let name: string = entries[i]
+            if !string_ends_with(name, "info.hk") is
+                let rel: string = if string_starts_with(name, dir + "/") then string_slice(name, string_len(dir) + 1, string_len(name)) else name
+                out = array_push(out, rel)
+            end
+        end
+        i += 1
+    end
+    return out
+end
