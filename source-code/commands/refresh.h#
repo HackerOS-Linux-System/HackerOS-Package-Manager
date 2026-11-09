@@ -1,0 +1,63 @@
+mod colors
+mod error
+mod repo
+
+use "bit -> progress-bar" from "pbar"
+use "std -> fmt" from "fmt"
+
+pub fn refresh() -> error::HpmResult<bool> is
+    repo::invalidate_meta_cache()
+
+    write("Downloading package index...")
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            let total: int = repo::index_len(rm.index)
+            write("Fetching metadata for " + to_string(total) + " packages (reading info.hk from each repo)...")
+
+            let names: [string] = repo::index_names(rm.index)
+            let mut pb: bar::ProgressBar = bar::bar_new(total, "Fetching metadata")
+            let mut ok: int = 0
+            let mut i: int = 0
+            while i < array_len(names) is
+                let meta_r: error::HpmResult<repo::PackageMeta> = repo::fetch_package_meta(rm, names[i])
+                match meta_r is
+                    HpmResult::Ok(_)  => ok = ok + 1
+                    HpmResult::Err(_) => is end
+                end
+                pb = pb.inc(1)
+                pb = pb.set_message(names[i])
+                pb.draw()
+                i += 1
+            end
+            pb = pb.finish("Metadata fetched")
+            let failed: int = if total > ok then total - ok else 0
+
+            write("→ Get package index from HackerOS Package Repository")
+            write("→ Reading package lists...   " + fmt::red("Done"))
+            write("→ Fetching metadata...        " + fmt::red(to_string(ok)) + " / " + colors::white(to_string(total)) + " packages")
+
+            if failed > 0 is
+                write("⚠ " + to_string(failed) + " package(s) could not be reached (network error or no info.hk)")
+            end
+
+            let tags: [string] = repo::all_tags(rm)
+            if array_len(tags) > 0 is
+                let mut labels: [string] = []
+                let mut ti: int = 0
+                while ti < array_len(tags) is
+                    labels = array_push(labels, colors::white("@" + tags[ti]))
+                    ti += 1
+                end
+                write("→ Group tags (from info.hk): " + labels.join("  "))
+            end
+
+            write("")
+            write(colors::white(to_string(total)) + " packages available.")
+            write("  Versions and tags are read from each package's " + fmt::dim("info.hk") + " — not from repo.json.")
+            write("")
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
