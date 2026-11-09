@@ -1,0 +1,1276 @@
+mod error
+mod manifest
+mod repo
+mod state
+mod utils
+mod hooks
+mod sandbox
+mod squash
+mod paths
+mod colors
+mod verbose
+mod remove
+
+use "std -> fs"   from "fs"
+use "std -> fmt"  from "fmt"
+use "std -> io"   from "io"
+use "std -> env"  from "env"
+use "std -> time" from "time"
+
+fn max_candidates_per_pkg() -> int is return 6 end
+fn max_search_steps() -> int is return 2000 end
+
+fn system_critical_bins() -> [string] is
+    return ["sh", "bash", "zsh", "fish", "dash", "ls", "cp", "mv", "rm", "mkdir", "rmdir", "ln",
+        "chmod", "chown", "cat", "echo", "printf", "test", "true", "false", "[",
+        "grep", "sed", "awk", "find", "xargs", "sort", "uniq", "wc", "head", "tail",
+        "tar", "gzip", "bzip2", "xz", "zstd", "zip", "unzip", "mount", "umount", "sudo", "su",
+        "passwd", "id", "whoami", "ps", "kill", "killall", "top", "htop",
+        "ip", "ifconfig", "ping", "curl", "wget", "ssh", "scp",
+        "apt", "dpkg", "apt-get", "apt-cache", "systemctl", "journalctl",
+        "python", "python3", "perl", "ruby", "node", "npm",
+        "git", "make", "gcc", "cc", "g++", "clang", "env", "which", "whereis", "type",
+        "hostname", "uname", "df", "du", "useradd", "userdel", "groupadd", "usermod", "crontab"]
+end
+
+fn contains_str(arr: [string], target: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(arr) is if arr[i] == target is return true end i += 1 end
+    return false
+end
+
+;; ── Klasyfikacja konfliktu wrappera ─────────────────────────────────
+
+fn wc_free() -> string is return "free" end
+fn wc_foreign() -> string is return "foreign" end
+fn wc_system_critical() -> string is return "system_critical" end
+;; "hpm:<pkg>" dla WrapperConflict::HpmWrapper
+
+fn classify_wrapper(bin_name: string, path: string) -> string is
+    if !fs::exists(path) is return wc_free() end
+    if contains_str(system_critical_bins(), bin_name) is return wc_system_critical() end
+    let content: string = fs::read(path)
+    if string_contains(content, "hpm run ") && string_starts_with(content, "#!/bin/sh") is
+        let lines: [string] = string_split(content, "\n")
+        let mut i: int = 0
+        while i < array_len(lines) is
+            if string_starts_with(lines[i], "exec ") is
+                let parts: [string] = string_split(string_trim(string_slice(lines[i], 5, string_len(lines[i]))), " ")
+                if array_len(parts) >= 3 && parts[1] == "run" is return "hpm:" + parts[2] end
+            end
+            i += 1
+        end
+        return "hpm:"
+    end
+    return wc_foreign()
+end
+
+fn describe_foreign_file(path: string) -> string is
+    if !fs::exists(path) is return "unknown" end
+    let content: string = fs::read(path)
+    if string_starts_with(content, "#!") is
+        let nl: int = string_find(content, "\n")
+        let end_idx: int = if nl > 0 && nl < 80 then nl else (if string_len(content) < 80 then string_len(content) else 80)
+        return "script: " + string_trim(string_slice(content, 0, end_idx))
+    end
+    if string_len(content) >= 4 && string_slice(content, 1, 4) == "ELF" is return "compiled binary (ELF)" end
+    return to_string(fs::size(path)) + " bytes"
+end
+
+;; Zwraca nazwę wrappera do użycia, albo "" jeśli użytkownik zdecydował
+;; pominąć wrapper dla tej binarki (odpowiednik `Option<String>`).
+fn resolve_wrapper_name(bin_name: string, pkg_name: string) -> string is
+    let wn: state::WrapperNames = state::wrapper_names_load()
+    if state::wn_has(wn, pkg_name, bin_name) is
+        let cached_name: string = state::wn_get(wn, pkg_name, bin_name)
+        let cached_path: string = paths::bin_dir() + "/" + cached_name
+        let conflict: string = classify_wrapper(cached_name, cached_path)
+        if conflict == wc_free() || conflict == "hpm:" + pkg_name is return cached_name end
+    end
+
+    let target: string = paths::bin_dir() + "/" + bin_name
+    let conflict: string = classify_wrapper(bin_name, target)
+    let mut chosen: string = ""
+
+    if conflict == wc_free() is
+        chosen = bin_name
+    elsif string_starts_with(conflict, "hpm:") is
+        let pkg: string = string_slice(conflict, 4, string_len(conflict))
+        if pkg == pkg_name is chosen = bin_name
+        else is
+            write("  ⚠ " + fmt::bold("Conflict:") + " " + paths::bin_dir() + "/" + bin_name + " used by '" + colors::white(pkg) + "'")
+            chosen = ask_wrapper_resolution(bin_name, pkg_name, "another hpm package")
+        end
+    elsif conflict == wc_foreign() is
+        let ft: string = describe_foreign_file(target)
+        write("  ⚠ " + fmt::bold("Conflict:") + " " + paths::bin_dir() + "/" + colors::white(bin_name) + " exists (" + fmt::dim(ft) + ")")
+        chosen = ask_wrapper_resolution(bin_name, pkg_name, ft)
+    else is
+        write("  " + fmt::red("✗") + " " + paths::bin_dir() + "/" + colors::white(bin_name) + " is a critical system tool — blocked.")
+        let suggested: string = pkg_name + "-" + bin_name
+        let alt_path: string = paths::bin_dir() + "/" + suggested
+        if !fs::exists(alt_path) is
+            let answer: string = io::read_line("    Use '" + suggested + "' instead? [Y/n] ")
+            if string_lower(string_trim(answer)) != "n" is chosen = suggested end
+        end
+    end
+
+    if chosen != "" && chosen != bin_name is
+        let wn2: state::WrapperNames = state::wrapper_names_load()
+        state::wn_set(wn2, pkg_name, bin_name, chosen)
+    end
+    return chosen
+end
+
+fn ask_wrapper_resolution(bin_name: string, pkg_name: string, conflict_desc: string) -> string is
+    let suggested: string = pkg_name + "-" + bin_name
+    let alt_path: string = paths::bin_dir() + "/" + suggested
+    write("  [1] Overwrite " + paths::bin_dir() + "/" + bin_name + " (replaces " + conflict_desc + ")")
+    if !fs::exists(alt_path) is write("  [2] Use " + paths::bin_dir() + "/" + suggested + " instead (safe)") end
+    write("  [3] Skip wrapper for '" + bin_name + "'")
+    let input: string = string_trim(io::read_line("  Choice [2]: "))
+    if input == "1" is return bin_name end
+    if input == "3" is return "" end
+    if !fs::exists(alt_path) is return suggested end
+    let custom: string = string_trim(io::read_line("    " + alt_path + " also exists. Custom name (or Enter to skip): "))
+    return custom
+end
+
+fn write_wrapper_atomic(wrapper_path: string, content: string) -> error::HpmResult<bool> is
+    let tmp_path: string = wrapper_path + ".hpm.tmp"
+    fs::write(tmp_path, content)
+    let r: error::HpmResult<bool> = utils::make_executable(tmp_path)
+    if error::is_err(r) is return r end
+    fs::rename(tmp_path, wrapper_path)
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Punkt wejścia ────────────────────────────────────────────────────
+
+pub fn install(specs_raw: [string]) -> error::HpmResult<bool> is
+    let use_release: bool = contains_str(specs_raw, "--release")
+    let require_signed: bool = contains_str(specs_raw, "--require-signed")
+    if contains_str(specs_raw, "--verbose") || contains_str(specs_raw, "-v") is
+        verbose::set_verbose(true)
+    end
+    let mut specs: [string] = []
+    let mut si: int = 0
+    while si < array_len(specs_raw) is
+        let s: string = specs_raw[si]
+        if s != "--release" && s != "--require-signed" && s != "--verbose" && s != "-v" is
+            specs = array_push(specs, s)
+        end
+        si += 1
+    end
+
+    if require_signed && !use_release is
+        write(fmt::red("✗") + " --require-signed only makes sense together with --release")
+        exit(1)
+    end
+    if array_len(specs) == 0 is
+        write(fmt::red("✗") + " Usage: hpm install <package>[@<version>]... | @<tag>... [--release] [--require-signed] [--verbose]")
+        exit(1)
+    end
+
+    let lock_r: error::HpmResult<int> = utils::acquire_lock()
+    match lock_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lock_fd) => is
+            let result: error::HpmResult<bool> = install_inner(specs, use_release, require_signed)
+            utils::release_lock(lock_fd)
+            return result
+        end
+    end
+end
+
+fn install_inner(specs: [string], use_release: bool, require_signed: bool) -> error::HpmResult<bool> is
+    let rm_r: error::HpmResult<repo::RepoManager> = repo::repo_manager_load()
+    match rm_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(rm) => is
+            let s_r: error::HpmResult<state::State> = state::state_load()
+            match s_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(initial_state) => is
+                    let mut s: state::State = initial_state
+
+                    let mut expanded: [string] = []
+                    let mut i: int = 0
+                    while i < array_len(specs) is
+                        let spec: string = specs[i]
+                        if string_starts_with(spec, "@") is
+                            let tag: string = string_slice(spec, 1, string_len(spec))
+                            let pkgs: [string] = repo::packages_for_tag(rm, tag)
+                            if array_len(pkgs) == 0 is
+                                write("⚠ No packages for tag '@" + tag + "'")
+                                let all: [string] = repo::all_tags(rm)
+                                if array_len(all) > 0 is
+                                    let mut labeled: [string] = []
+                                    let mut ai: int = 0
+                                    while ai < array_len(all) is labeled = array_push(labeled, "@" + all[ai]) ai += 1 end
+                                    write("  Available tags: " + labeled.join(", "))
+                                end
+                                exit(1)
+                            end
+                            write("→ @" + colors::white(tag) + " → " + to_string(array_len(pkgs)) + " packages: " + labeled_join(pkgs))
+                            let mut pi: int = 0
+                            while pi < array_len(pkgs) is
+                                if !contains_str(expanded, pkgs[pi]) is expanded = array_push(expanded, pkgs[pi]) end
+                                pi += 1
+                            end
+                        else is
+                            if !contains_str(expanded, spec) is expanded = array_push(expanded, spec) end
+                        end
+                        i += 1
+                    end
+
+                    let dup_r: error::HpmResult<bool> = check_inter_package_conflicts(expanded)
+                    if error::is_err(dup_r) is return dup_r end
+
+                    let mut to_install: [string] = []
+                    let mut ei: int = 0
+                    while ei < array_len(expanded) is
+                        let spec: string = expanded[ei]
+                        let parts: [string] = split_spec(spec)
+                        let pkg_name: string = parts[0]
+                        let requested_ver: string = parts[1]
+                        if repo::get_package_url(rm, pkg_name) == "" is
+                            return error::HpmResult::Err(error::HpmError::PackageNotFound(pkg_name + "' not found.\n  Run `hpm refresh` to refresh."))
+                        end
+                        if requested_ver != "" is
+                            if state::find_index(s.packages, pkg_name, requested_ver) >= 0 is
+                                write(fmt::red("✔") + " " + colors::white(pkg_name) + "@" + colors::white(requested_ver) + " is already installed")
+                                ei += 1
+                                continue
+                            end
+                        else is
+                            let cur: string = state::get_current_version(pkg_name, paths::store_path())
+                            if cur != "" is
+                                write(fmt::red("✔") + " " + colors::white(pkg_name) + " is already installed (" + colors::white(cur) + ")")
+                                ei += 1
+                                continue
+                            end
+                        end
+                        to_install = array_push(to_install, spec)
+                        ei += 1
+                    end
+
+                    if array_len(to_install) == 0 is
+                        write(fmt::red("✔") + " Nothing to do.")
+                        return error::HpmResult::Ok(true)
+                    end
+
+                    let solved_r: error::HpmResult<[AssignedPkg]> = solve_batch_versions(to_install, rm, s)
+                    match solved_r is
+                        HpmResult::Err(e) => return error::HpmResult::Err(e)
+                        HpmResult::Ok(resolved) => is
+                            s = state::push_snapshot(s, "pre-install " + to_install.join(", "))
+                            let mut any_installed: bool = false
+
+                            let mut ti: int = 0
+                            while ti < array_len(to_install) is
+                                let parts: [string] = split_spec(to_install[ti])
+                                let pkg_name: string = parts[0]
+                                let selected_ver: string = assignment_version_of(resolved, pkg_name)
+                                if selected_ver == "" is
+                                    return error::HpmResult::Err(error::HpmError::Manifest("Internal error: no resolved version for '" + pkg_name + "'"))
+                                end
+
+                                let install_r: error::HpmResult<state::State> = if use_release then
+                                    install_single_from_release(pkg_name, selected_ver, rm, s, true, require_signed)
+                                else
+                                    install_single(pkg_name, selected_ver, rm, s, true)
+
+                                match install_r is
+                                    HpmResult::Err(e) => return error::HpmResult::Err(e)
+                                    HpmResult::Ok(new_s) => s = new_s
+                                end
+                                any_installed = true
+                                ti += 1
+                            end
+
+                            if any_installed is
+                                let save_r: error::HpmResult<bool> = state::state_save(s)
+                                if error::is_err(save_r) is return save_r end
+                            end
+                            return error::HpmResult::Ok(true)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+fn labeled_join(pkgs: [string]) -> string is
+    let mut labeled: [string] = []
+    let mut i: int = 0
+    while i < array_len(pkgs) is labeled = array_push(labeled, colors::white(pkgs[i])) i += 1 end
+    return labeled.join(", ")
+end
+
+fn split_spec(spec: string) -> [string] is
+    let at: int = string_find(spec, "@")
+    if at < 0 is return [spec, ""] end
+    return [string_slice(spec, 0, at), string_slice(spec, at + 1, string_len(spec))]
+end
+
+fn check_inter_package_conflicts(specs: [string]) -> error::HpmResult<bool> is
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < array_len(specs) is
+        names = array_push(names, split_spec(specs[i])[0])
+        i += 1
+    end
+    let mut a: int = 0
+    while a < array_len(names) is
+        let mut b: int = a + 1
+        while b < array_len(names) is
+            if names[a] == names[b] is
+                return error::HpmResult::Err(error::HpmError::InvalidArg("Duplicate package '" + names[a] + "' in install list"))
+            end
+            b += 1
+        end
+        a += 1
+    end
+    return error::HpmResult::Ok(true)
+end
+
+;; ── Solver (backtracking) ────────────────────────────────────────────
+
+pub struct PkgCandidates is
+    pub name:      string
+    pub versions:  [string]
+    pub manifests: [manifest::Manifest]
+end
+
+pub struct AssignedPkg is
+    pub name:     string
+    pub version:  string
+    pub manifest: manifest::Manifest
+end
+
+pub struct SolveResult is
+    pub solved:     bool
+    pub assignment: [AssignedPkg]
+    pub steps_left: int
+end
+
+pub fn assignment_version_of(assignment: [AssignedPkg], name: string) -> string is
+    let mut i: int = 0
+    while i < array_len(assignment) is
+        if assignment[i].name == name is return assignment[i].version end
+        i += 1
+    end
+    return ""
+end
+
+fn find_candidates(candidates: [PkgCandidates], name: string) -> PkgCandidates is
+    let mut i: int = 0
+    while i < array_len(candidates) is
+        if candidates[i].name == name is return candidates[i] end
+        i += 1
+    end
+    return PkgCandidates { name: name, versions: [], manifests: [] }
+end
+
+fn batch_conflict(assignment: [AssignedPkg], name: string, m: manifest::Manifest) -> bool is
+    let mut i: int = 0
+    while i < array_len(assignment) is
+        let other: AssignedPkg = assignment[i]
+        let mut c: int = 0
+        while c < array_len(m.conflicts) is
+            if state::split_pkg_ver(m.conflicts[c])[0] == other.name is return true end
+            c += 1
+        end
+        let mut c2: int = 0
+        while c2 < array_len(other.manifest.conflicts) is
+            if state::split_pkg_ver(other.manifest.conflicts[c2])[0] == name is return true end
+            c2 += 1
+        end
+        i += 1
+    end
+    return false
+end
+
+pub fn backtrack_solve(order: [string], idx: int, candidates: [PkgCandidates], s: state::State,
+                       assignment: [AssignedPkg], steps: int) -> SolveResult is
+    if idx == array_len(order) is return SolveResult { solved: true, assignment: assignment, steps_left: steps } end
+
+    let name: string = order[idx]
+    let pc: PkgCandidates = find_candidates(candidates, name)
+    let mut remaining_steps: int = steps
+
+    let mut i: int = 0
+    while i < array_len(pc.versions) is
+        if remaining_steps <= 0 is return SolveResult { solved: false, assignment: assignment, steps_left: 0 } end
+        remaining_steps = remaining_steps - 1
+
+        let ver: string = pc.versions[i]
+        let man: manifest::Manifest = pc.manifests[i]
+
+        let installed_conflict: bool = array_len(state::check_conflicts(s, name, man.conflicts)) > 0
+        let bconflict: bool = batch_conflict(assignment, name, man)
+
+        if !installed_conflict && !bconflict is
+            let new_assignment: [AssignedPkg] = array_push(assignment, AssignedPkg { name: name, version: ver, manifest: man })
+            let result: SolveResult = backtrack_solve(order, idx + 1, candidates, s, new_assignment, remaining_steps)
+            remaining_steps = result.steps_left
+            if result.solved is return result end
+        end
+        i += 1
+    end
+    return SolveResult { solved: false, assignment: assignment, steps_left: remaining_steps }
+end
+
+fn solve_batch_versions(specs: [string], rm: repo::RepoManager, s: state::State) -> error::HpmResult<[AssignedPkg]> is
+    write("→ Resolving versions for " + to_string(array_len(specs)) + " package(s)...")
+
+    let mut candidates: [PkgCandidates] = []
+    let mut order: [string] = []
+
+    let mut i: int = 0
+    while i < array_len(specs) is
+        let parts: [string] = split_spec(specs[i])
+        let pkg_name: string = parts[0]
+        let requested_ver: string = parts[1]
+
+        let versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, pkg_name)
+        match versions_r is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(all_versions) => is
+                let mut cand_versions: [string] = []
+                let mut cand_manifests: [manifest::Manifest] = []
+
+                if requested_ver != "" is
+                    let mut found: bool = false
+                    let mut vi: int = 0
+                    while vi < array_len(all_versions) is
+                        if all_versions[vi].version == requested_ver is
+                            cand_versions = array_push(cand_versions, all_versions[vi].version)
+                            cand_manifests = array_push(cand_manifests, all_versions[vi].manifest)
+                            found = true
+                        end
+                        vi += 1
+                    end
+                    if !found is
+                        return error::HpmResult::Err(error::HpmError::VersionNotFound(pkg_name, requested_ver))
+                    end
+                else is
+                    ;; najnowsze najpierw, do max_candidates_per_pkg()
+                    let sorted: [repo::TagManifest] = all_versions
+                    let n: int = array_len(sorted)
+                    let take_n: int = if n < max_candidates_per_pkg() then n else max_candidates_per_pkg()
+                    let mut k: int = 0
+                    while k < take_n is
+                        let tm: repo::TagManifest = sorted[n - 1 - k]
+                        cand_versions = array_push(cand_versions, tm.version)
+                        cand_manifests = array_push(cand_manifests, tm.manifest)
+                        k += 1
+                    end
+                end
+
+                if array_len(cand_versions) == 0 is
+                    return error::HpmResult::Err(error::HpmError::Manifest(
+                        "No installable version found for '" + pkg_name + "' — this repository has no usable git tags.\n" +
+                        "  hpm reads installable versions ONLY from git tags. Push one:\n\n" +
+                        "  git tag <version>          (e.g. git tag 1.0.15, matching info.hk's version)\n  git push origin <version>\n\n" +
+                        "  Then run `hpm refresh` and try again."))
+                end
+
+                order = array_push(order, pkg_name)
+                candidates = array_push(candidates, PkgCandidates { name: pkg_name, versions: cand_versions, manifests: cand_manifests })
+            end
+        end
+        i += 1
+    end
+
+    let result: SolveResult = backtrack_solve(order, 0, candidates, s, [], max_search_steps())
+    if !result.solved is
+        let mut details: [string] = []
+        let mut di: int = 0
+        while di < array_len(order) is
+            let pc: PkgCandidates = find_candidates(candidates, order[di])
+            details = array_push(details, "  " + order[di] + " — tried: " + pc.versions.join(", "))
+            di += 1
+        end
+        return error::HpmResult::Err(error::HpmError::Manifest(
+            "Could not find a conflict-free combination of versions for this batch:\n" + details.join("\n") +
+            "\n  Try installing these one at a time, or pin exact versions with '" + fmt::dim("pkg@version") + "'."))
+    end
+
+    let mut ri: int = 0
+    while ri < array_len(result.assignment) is
+        let a: AssignedPkg = result.assignment[ri]
+        let pc: PkgCandidates = find_candidates(candidates, a.name)
+        if array_len(pc.versions) > 0 && pc.versions[0] != a.version is
+            write("  ⚠ " + a.name + ": using " + colors::white(a.version) + " instead of latest (" + pc.versions[0] + ") to avoid a conflict")
+        end
+        ri += 1
+    end
+
+    write("  " + fmt::red("✔") + " Resolved: " + assignment_summary(result.assignment))
+    return error::HpmResult::Ok(result.assignment)
+end
+
+fn assignment_summary(assignment: [AssignedPkg]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(assignment) is
+        parts = array_push(parts, assignment[i].name + "@" + assignment[i].version)
+        i += 1
+    end
+    return parts.join(", ")
+end
+
+;; ── which hpm / checkout ──────────────────────────────────────────────
+
+pub fn which_hpm_for_wrappers() -> string is
+    if utils::command_exists("hpm") is return "hpm" end
+    write("  ⚠ 'hpm' is not on PATH — wrappers will point at a fixed path for now.")
+    write("    Put hpm on PATH (e.g. " + fmt::dim("~/.local/bin") + ") and reinstall to make wrappers portable.")
+    return "hpm"
+end
+
+;; Wyciąga drzewo danego rev (tag/commit/HEAD) z lokalnego klonu do `dest`
+;; przez `git archive` (szybkie, bez checkoutu roboczego drzewa).
+fn checkout_rev_to_dir(repo_path: string, rev: string, dest: string) -> error::HpmResult<bool> is
+    utils::mkdir_all(dest)
+    let cmd: string = "git -C " + shq(repo_path) + " archive " + shq(rev) + " | tar -x -C " + shq(dest)
+    let r: error::HpmResult<int> = utils::run_command("sh", ["-c", cmd])
+    match r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(code) => is
+            if code != 0 is return error::HpmResult::Err(error::HpmError::Git("git archive failed for " + rev)) end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+fn shq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+;; ── install_single / install_single_from_release ───────────────────
+
+pub fn install_single(pkg_name: string, version: string, rm: repo::RepoManager, s: state::State, manually_installed: bool) -> error::HpmResult<state::State> is
+    let pkg_url: string = repo::get_package_url(rm, pkg_name)
+    if pkg_url == "" is return error::HpmResult::Err(error::HpmError::PackageNotFound(pkg_name)) end
+
+    write("→ Fetching " + colors::white(pkg_name) + "...")
+    let repo_r: error::HpmResult<string> = repo::clone_package_repo(pkg_name, pkg_url)
+    match repo_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(repo_path) => is
+            let mut selected_version: string = version
+            let mut rev: string = if version != "" then "v" + version else ""
+
+            if version == "" is
+                let versions_r: error::HpmResult<[repo::TagManifest]> = repo::get_package_versions(rm, pkg_name)
+                match versions_r is
+                    HpmResult::Ok(vs) => is
+                        if array_len(vs) > 0 is
+                            selected_version = vs[array_len(vs) - 1].version
+                            rev = "v" + selected_version
+                        else is
+                            write("  ⚠ No tags for '" + pkg_name + "', installing from HEAD.")
+                            selected_version = "HEAD"
+                            rev = "HEAD"
+                        end
+                    end
+                    HpmResult::Err(_) => is selected_version = "HEAD" rev = "HEAD" end
+                end
+            end
+
+            write("  → Extracting " + colors::white(pkg_name) + "@" + fmt::red(selected_version) + "...")
+            let checkout_dir: string = env::temp_dir() + "/hpm-checkout-" + pkg_name + "-" + to_string(time::now_unix())
+            let ext_r: error::HpmResult<bool> = checkout_rev_to_dir(repo_path, rev, checkout_dir)
+            if error::is_err(ext_r) is
+                ;; fallback: spróbuj gołej wersji (bez "v")
+                let ext_r2: error::HpmResult<bool> = checkout_rev_to_dir(repo_path, selected_version, checkout_dir)
+                if error::is_err(ext_r2) is match ext_r2 is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+            end
+
+            let result: error::HpmResult<state::State> = finish_install(pkg_name, selected_version, checkout_dir, rm, s, manually_installed)
+            fs::rmdir_all(checkout_dir)
+            return result
+        end
+    end
+end
+
+pub fn install_single_from_release(pkg_name: string, tag: string, rm: repo::RepoManager, s: state::State,
+                                   manually_installed: bool, require_signed: bool) -> error::HpmResult<state::State> is
+    let pkg_url: string = repo::get_package_url(rm, pkg_name)
+    if pkg_url == "" is return error::HpmResult::Err(error::HpmError::PackageNotFound(pkg_name)) end
+
+    write("→ Resolving GitHub release for " + colors::white(pkg_name) + "...")
+    let owner_repo: [string] = repo::parse_github_owner_repo(pkg_url)
+    if array_len(owner_repo) < 2 is
+        return error::HpmResult::Err(error::HpmError::InvalidArg("--release requires a github.com repo URL in repo.json for '" + pkg_name + "' (got: " + pkg_url + ")"))
+    end
+    let owner: string = owner_repo[0]
+    let repo_name: string = owner_repo[1]
+
+    let rel_r: error::HpmResult<repo::GithubRelease> = repo::fetch_github_release(owner, repo_name, tag)
+    match rel_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(release) => is
+            let mut hpm_asset: repo::GithubAsset = repo::GithubAsset { name: "", browser_download_url: "" }
+            let mut sha_asset: repo::GithubAsset = repo::GithubAsset { name: "", browser_download_url: "" }
+            let mut sig_asset: repo::GithubAsset = repo::GithubAsset { name: "", browser_download_url: "" }
+            let mut ai: int = 0
+            while ai < array_len(release.assets) is
+                let a: repo::GithubAsset = release.assets[ai]
+                if string_ends_with(a.name, ".hpm") is hpm_asset = a end
+                ai += 1
+            end
+            if hpm_asset.name == "" is
+                return error::HpmResult::Err(error::HpmError::Manifest(
+                    "Release '" + release.tag_name + "' of " + owner + "/" + repo_name + " has no .hpm asset.\n" +
+                    "  The maintainer needs to run `hpm build --output name.hpm` and attach it to the Release."))
+            end
+            let mut aj: int = 0
+            while aj < array_len(release.assets) is
+                let a: repo::GithubAsset = release.assets[aj]
+                if a.name == hpm_asset.name + ".sha256" is sha_asset = a end
+                if a.name == hpm_asset.name + ".sig" is sig_asset = a end
+                aj += 1
+            end
+
+            write("  → Downloading " + colors::white(hpm_asset.name) + "...")
+            let tmp_archive: string = env::temp_dir() + "/hpm-release-" + to_string(time::now_unix()) + ".hpm"
+            let dl_r: error::HpmResult<bool> = utils::download_file(hpm_asset.browser_download_url, tmp_archive)
+            if error::is_err(dl_r) is match dl_r is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+
+            if sha_asset.name != "" is
+                write("  → Verifying checksum...")
+                let tmp_sha: string = tmp_archive + ".sha256"
+                utils::download_file(sha_asset.browser_download_url, tmp_sha)
+                let expected_line: string = string_trim(fs::read(tmp_sha))
+                let expected: string = if array_len(string_split(expected_line, " ")) > 0 then string_split(expected_line, " ")[0] else ""
+                let actual_r: error::HpmResult<string> = utils::compute_file_hash(tmp_archive)
+                match actual_r is
+                    HpmResult::Ok(actual) => is
+                        if expected != "" && expected != actual is
+                            return error::HpmResult::Err(error::HpmError::Manifest(
+                                "Checksum mismatch for " + hpm_asset.name + "!\n  expected: " + expected + "\n  actual:   " + actual +
+                                "\n  Refusing to install a package whose contents don't match its published checksum."))
+                        end
+                    end
+                    HpmResult::Err(e) => return error::HpmResult::Err(e)
+                end
+                fs::remove(tmp_sha)
+            else is
+                write("  ⚠ No .sha256 asset alongside " + hpm_asset.name + " — integrity not verified.")
+            end
+
+            if sig_asset.name != "" is
+                write("  → Verifying GPG signature...")
+                let tmp_sig: string = tmp_archive + ".sig"
+                utils::download_file(sig_asset.browser_download_url, tmp_sig)
+                let sig_r: error::HpmResult<string> = verify_sig(tmp_archive, tmp_sig)
+                fs::remove(tmp_sig)
+                match sig_r is
+                    HpmResult::Ok(signer) => write("  " + fmt::red("✔") + " GPG signature OK, signed by: " + colors::white(signer))
+                    HpmResult::Err(e) => return error::HpmResult::Err(error::HpmError::Manifest(
+                        "GPG signature verification FAILED for " + hpm_asset.name + ": " + error::message(e) +
+                        "\n  Refusing to install a package whose signature doesn't check out."))
+                end
+            elsif require_signed is
+                return error::HpmResult::Err(error::HpmError::Manifest(
+                    "--require-signed was given, but " + hpm_asset.name + " has no .sig asset attached to this release.\n" +
+                    "  Refusing to install an unsigned package."))
+            else is
+                write("  ⚠ No .sig asset alongside " + hpm_asset.name + " — not GPG-signed, authenticity not verified.")
+            end
+
+            write("  → Extracting " + colors::white(hpm_asset.name) + "...")
+            let checkout_dir: string = env::temp_dir() + "/hpm-release-checkout-" + to_string(time::now_unix())
+            utils::mkdir_all(checkout_dir)
+            let tar_r: error::HpmResult<int> = utils::run_command("tar", ["-xf", tmp_archive, "-C", checkout_dir])
+            fs::remove(tmp_archive)
+            match tar_r is
+                HpmResult::Err(e) => return error::HpmResult::Err(e)
+                HpmResult::Ok(code) => is
+                    if code != 0 is
+                        return error::HpmResult::Err(error::HpmError::Io("Failed to extract " + hpm_asset.name + " (needs `tar` with zstd support — `apt install zstd`)"))
+                    end
+                end
+            end
+
+            let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(checkout_dir)
+            match mr is
+                HpmResult::Err(e) => return error::HpmResult::Err(error::HpmError::Manifest(hpm_asset.name + " does not contain a valid info.hk: " + error::message(e)))
+                HpmResult::Ok(m) => is
+                    let selected_version: string = m.version
+                    let result: error::HpmResult<state::State> = finish_install(pkg_name, selected_version, checkout_dir, rm, s, manually_installed)
+                    fs::rmdir_all(checkout_dir)
+                    return result
+                end
+            end
+        end
+    end
+end
+
+fn verify_sig(data_file: string, sig_file: string) -> error::HpmResult<string> is
+    if !utils::command_exists("gpg") is
+        return error::HpmResult::Err(error::HpmError::Sandbox("gpg is not installed — cannot verify signatures"))
+    end
+    let out_file: string = env::temp_dir() + "/hpm-verify-" + to_string(time::now_unix())
+    utils::run_command("sh", ["-c", "gpg --status-fd 1 --verify " + shq(sig_file) + " " + shq(data_file) + " > " + shq(out_file) + " 2>&1"])
+    let mut output: string = ""
+    if fs::exists(out_file) is output = fs::read(out_file) fs::remove(out_file) end
+    if string_contains(output, "[GNUPG:] BADSIG") is return error::HpmResult::Err(error::HpmError::Sandbox("BAD signature")) end
+    if string_contains(output, "[GNUPG:] NO_PUBKEY") is return error::HpmResult::Err(error::HpmError::Sandbox("signing key not in trusted keyring")) end
+    let lines: [string] = string_split(output, "\n")
+    let mut i: int = 0
+    while i < array_len(lines) is
+        if string_contains(lines[i], "[GNUPG:] GOODSIG") is
+            let parts: [string] = string_split(string_trim(lines[i]), " ")
+            if array_len(parts) > 0 is return error::HpmResult::Ok(parts[array_len(parts) - 1]) end
+        end
+        i += 1
+    end
+    return error::HpmResult::Err(error::HpmError::Sandbox("No valid signatures found"))
+end
+
+;; ── finish_install: ogon wspólny dla obu ścieżek ────────────────────
+
+fn finish_install(pkg_name: string, selected_version_in: string, src_dir: string, rm: repo::RepoManager,
+                  s: state::State, manually_installed: bool) -> error::HpmResult<state::State> is
+    let selected_version: string = selected_version_in
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(src_dir)
+    let mut m: manifest::Manifest = manifest::default_manifest(pkg_name)
+    match mr is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(loaded) => m = loaded
+    end
+
+    let arch_r: error::HpmResult<bool> = manifest::check_arch_compatibility(m.arch)
+    if error::is_err(arch_r) is match arch_r is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+
+    let has_build_toml: bool = fs::exists(src_dir + "/build.toml")
+    let mut build_cfg: repo::BuildConfig = repo::BuildConfig { name: "", source_type: "", download_url: "", binary_path: "",
+        strip_components: 0, build_commands: [], build_output: "", build_deps: [], runtime_deps: [], install_path: "" }
+    if has_build_toml is build_cfg = repo::parse_build_config(fs::read(src_dir + "/build.toml")) end
+
+    let violations: [string] = state::check_conflicts(s, pkg_name, m.conflicts)
+    if array_len(violations) > 0 is
+        let mut labeled: [string] = []
+        let mut vi: int = 0
+        while vi < array_len(violations) is labeled = array_push(labeled, "  " + fmt::red("✗") + " " + violations[vi]) vi += 1 end
+        return error::HpmResult::Err(error::HpmError::Manifest("Cannot install '" + pkg_name + "': conflicts:\n" + labeled.join("\n")))
+    end
+
+    let mut s2: state::State = s
+
+    ;; Zależności
+    let mut di: int = 0
+    while di < array_len(m.deps.keys) is
+        let dep_name: string = m.deps.keys[di]
+        let dep_req: string = m.deps.vals[di]
+        let dep_cur: string = state::get_current_version(dep_name, paths::store_path())
+        let already_ok: bool = dep_cur != "" && utils::satisfies(dep_cur, dep_req)
+        if !already_ok is
+            write("\n  → Installing dep: " + colors::white(dep_name) + (if dep_req == "" then "" else " (" + dep_req + ")"))
+            let dep_ver: string = if dep_req == "" || string_starts_with(dep_req, ">") || string_starts_with(dep_req, "=") then "" else dep_req
+            let dep_r: error::HpmResult<state::State> = install_single(dep_name, dep_ver, rm, s2, false)
+            match dep_r is
+                HpmResult::Ok(new_s) => s2 = new_s
+                HpmResult::Err(e)    => return error::HpmResult::Err(e)
+            end
+        end
+        di += 1
+    end
+
+    ;; Build deps (.deb)
+    let mut build_deb: [string] = m.build.deb_deps
+    let mut bd: int = 0
+    while bd < array_len(build_cfg.build_deps) is
+        if !contains_str(build_deb, build_cfg.build_deps[bd]) is build_deb = array_push(build_deb, build_cfg.build_deps[bd]) end
+        bd += 1
+    end
+    if array_len(build_deb) > 0 is
+        let ensure_r: error::HpmResult<bool> = utils::ensure_deb_packages(build_deb)
+        if error::is_err(ensure_r) is match ensure_r is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+    end
+
+    ;; Build
+    let contents_src: string = src_dir + "/contents"
+    if has_build_toml is
+        let cr: error::HpmResult<bool> = run_build_config(build_cfg, src_dir, selected_version, m, pkg_name)
+        if error::is_err(cr) is match cr is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+    else is
+        let cr2: error::HpmResult<bool> = run_classic_build(src_dir, m)
+        if error::is_err(cr2) is match cr2 is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+    end
+
+    if !fs::exists(contents_src) is
+        return error::HpmResult::Err(error::HpmError::Manifest("No 'contents/' for '" + pkg_name + "@" + selected_version + "'"))
+    end
+
+    ;; Pre-install hook
+    if m.has_hooks is
+        let store_path_str: string = paths::store_path() + pkg_name + "/" + selected_version
+        let ctx: hooks::HookContext = hooks::HookContext { pkg_name: pkg_name, pkg_version: selected_version, store_path: store_path_str, old_version: "" }
+        let hr: error::HpmResult<bool> = hooks::run_hook(src_dir, hooks::HookKind::PreInstall, ctx, m)
+        if error::is_err(hr) is match hr is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+    end
+
+    ;; Staging atomowy
+    let pkg_dir: string = paths::store_path() + pkg_name
+    let dest_dir: string = pkg_dir + "/" + selected_version
+    let staging_dir: string = pkg_dir + "/.staging-" + selected_version
+    if fs::exists(staging_dir) is fs::rmdir_all(staging_dir) end
+    utils::mkdir_all(staging_dir)
+
+    let copy_r: error::HpmResult<bool> = utils::copy_dir_all(contents_src, staging_dir)
+    if error::is_err(copy_r) is
+        fs::rmdir_all(staging_dir)
+        match copy_r is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end
+    end
+    make_all_binaries_executable(staging_dir, m)
+    if fs::exists(src_dir + "/info.hk") is fs::copy(src_dir + "/info.hk", staging_dir + "/info.hk") end
+    hooks::install_hooks(src_dir, staging_dir)
+
+    if fs::exists(dest_dir) is fs::rmdir_all(dest_dir) end
+    fs::rename(staging_dir, dest_dir)
+
+    ;; Runtime deps (.deb)
+    let mut runtime_deb: [string] = m.runtime.deb_deps
+    let mut rd: int = 0
+    while rd < array_len(build_cfg.runtime_deps) is
+        if !contains_str(runtime_deb, build_cfg.runtime_deps[rd]) is runtime_deb = array_push(runtime_deb, build_cfg.runtime_deps[rd]) end
+        rd += 1
+    end
+    if array_len(runtime_deb) > 0 is utils::ensure_deb_packages(runtime_deb) end
+
+    ;; Wrappery
+    let hpm_exe: string = which_hpm_for_wrappers()
+    let mut bi: int = 0
+    while bi < array_len(m.bins) is
+        let bin_name: string = m.bins[bi]
+        let mut bin_rel: string = ""
+        if manifest::osm_contains(m.bin_paths, bin_name) is
+            let explicit: string = manifest::osm_get(m.bin_paths, bin_name)
+            if fs::exists(dest_dir + "/" + explicit) is
+                utils::make_executable(dest_dir + "/" + explicit)
+                bin_rel = explicit
+            else is
+                bin_rel = find_binary_in_dir(dest_dir, bin_name)
+            end
+        else is
+            bin_rel = find_binary_in_dir(dest_dir, bin_name)
+        end
+
+        if bin_rel == "" is
+            print_binary_not_found_help(dest_dir, bin_name)
+            bi += 1
+            continue
+        end
+        utils::make_executable(dest_dir + "/" + bin_rel)
+
+        let wrapper_name: string = resolve_wrapper_name(bin_name, pkg_name)
+        if wrapper_name == "" is
+            write("  ℹ Skipped '" + bin_name + "'. Run: " + hpm_exe + " run " + pkg_name + " " + bin_rel)
+            bi += 1
+            continue
+        end
+
+        let wrapper_path: string = paths::bin_dir() + "/" + wrapper_name
+        let content: string = "#!/bin/sh\nexec " + hpm_exe + " run " + pkg_name + " " + bin_rel + " \"$@\"\n"
+        let wr: error::HpmResult<bool> = write_wrapper_atomic(wrapper_path, content)
+        if error::is_err(wr) is match wr is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+
+        if wrapper_name == bin_name is
+            write("  " + fmt::red("✔") + " Wrapper: " + colors::white(bin_name) + " → " + pkg_name + "/" + selected_version + "/" + fmt::dim(bin_rel))
+        else is
+            write("  " + fmt::red("✔") + " Wrapper: " + colors::white(bin_name) + " (as " + fmt::dim(wrapper_name) + ") → " + pkg_name + "/" + selected_version + "/" + fmt::dim(bin_rel))
+        end
+        bi += 1
+    end
+
+    if m.is_gui || m.sandbox.gui || m.sandbox.full_gui is
+        install_desktop_integration_pub(dest_dir, m, pkg_name, hpm_exe)
+    end
+
+    install_completions(dest_dir, bin_name_for_pkg(m, pkg_name))
+
+    if m.has_hooks is
+        let store_path_str2: string = paths::store_path() + pkg_name + "/" + selected_version
+        let ctx2: hooks::HookContext = hooks::HookContext { pkg_name: pkg_name, pkg_version: selected_version, store_path: store_path_str2, old_version: "" }
+        hooks::run_hook(dest_dir, hooks::HookKind::PostInstall, ctx2, m)
+    end
+
+    let mut depends_on: [string] = []
+    let mut ddi: int = 0
+    while ddi < array_len(m.deps.keys) is
+        let dep_name: string = m.deps.keys[ddi]
+        let dep_ver: string = state::get_current_version(dep_name, paths::store_path())
+        depends_on = array_push(depends_on, if dep_ver != "" then dep_name + "@" + dep_ver else dep_name)
+        ddi += 1
+    end
+    let checksum_r: error::HpmResult<string> = utils::compute_dir_hash(dest_dir)
+    let checksum: string = unwrap_or_empty_s(checksum_r)
+    let s3: state::State = state::update_package(s2, pkg_name, selected_version, checksum, manually_installed, depends_on, m.conflicts)
+
+    let set_r: error::HpmResult<bool> = utils::set_current_version(pkg_dir, selected_version)
+    if error::is_err(set_r) is match set_r is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+
+    let comp_r: error::HpmResult<bool> = squash::compress_after_install(dest_dir)
+    match comp_r is
+        HpmResult::Ok(compressed) => is
+            if compressed is
+                let sidecar_size: int = squash::on_disk_size(dest_dir)
+                write("  " + fmt::red("✔") + " Compressed store (" + fmt::dim(human_bytes(sidecar_size)) + ")")
+            end
+        end
+        HpmResult::Err(e) => write("  ⚠ Could not compress package store (" + error::message(e) + ") — continuing uncompressed")
+    end
+
+    write(fmt::red("✔") + " " + colors::white(pkg_name) + "@" + fmt::red(selected_version) + " installed successfully")
+    return error::HpmResult::Ok(s3)
+end
+
+fn unwrap_or_empty_s(r: error::HpmResult<string>) -> string is
+    match r is
+        HpmResult::Ok(v)  => return v
+        HpmResult::Err(_) => return ""
+    end
+end
+
+fn human_bytes(b: int) -> string is
+    if b < 1024 is return to_string(b) + " B" end
+    if b < 1048576 is return to_string((b / 1024)) + " KB" end
+    return to_string(b / 1048576) + " MB"
+end
+
+;; ── Bash/zsh/fish completions ────────────────────────────────────────
+
+fn install_completions(dest_dir: string, bin_name: string) is
+    let completions_dir: string = dest_dir + "/completions"
+    if !fs::exists(completions_dir) is return end
+
+    let home: string = env::home()
+    let targets_ext: [string] = [".bash", ".zsh", ".fish"]
+    let targets_dir: [string] = [home + "/.local/share/bash-completion/completions", home + "/.local/share/zsh/site-functions", home + "/.config/fish/completions"]
+
+    let mut i: int = 0
+    while i < array_len(targets_ext) is
+        let src: string = completions_dir + "/" + bin_name + targets_ext[i]
+        if fs::exists(src) is
+            utils::mkdir_all(targets_dir[i])
+            let dst: string = targets_dir[i] + "/" + bin_name + targets_ext[i]
+            fs::copy(src, dst)
+            write("  " + fmt::red("✔") + " Completion: " + fmt::dim(bin_name + targets_ext[i]) + " → " + fmt::dim(targets_dir[i]))
+        end
+        i += 1
+    end
+end
+
+fn bin_name_for_pkg(m: manifest::Manifest, pkg_name: string) -> string is
+    if array_len(m.bins) > 0 is return m.bins[0] end
+    return pkg_name
+end
+
+;; ── Desktop integration ──────────────────────────────────────────────
+
+pub fn install_desktop_integration_pub(dest_dir: string, m: manifest::Manifest, pkg_name: string, hpm_exe: string) -> error::HpmResult<bool> is
+    let icon_name: string = install_icon(dest_dir, m, pkg_name)
+    utils::mkdir_all(paths::desktop_dir())
+    let desktop_path: string = paths::desktop_dir() + "/" + pkg_name + ".desktop"
+
+    if m.desktop.desktop_file != "" is
+        let custom: string = dest_dir + "/" + m.desktop.desktop_file
+        if fs::exists(custom) is
+            fs::copy(custom, desktop_path)
+            patch_desktop_exec(desktop_path, hpm_exe, pkg_name, m)
+            return error::HpmResult::Ok(true)
+        end
+    end
+    let found: string = find_file_by_ext(dest_dir, ".desktop")
+    if found != "" is
+        fs::copy(found, desktop_path)
+        patch_desktop_exec(desktop_path, hpm_exe, pkg_name, m)
+        return error::HpmResult::Ok(true)
+    end
+
+    let bin_name: string = bin_name_for_pkg(m, pkg_name)
+    let mut display_name: string = m.desktop.display_name
+    if display_name == "" is
+        display_name = string_upper(string_slice(pkg_name, 0, 1)) + string_slice(pkg_name, 1, string_len(pkg_name))
+    end
+    let categories: string = if m.desktop.categories != "" then m.desktop.categories else "Utility;"
+    let comment: string = if m.desktop.comment != "" then m.desktop.comment else m.summary
+    let exec_cmd: string = hpm_exe + " run " + pkg_name + " " + bin_name
+
+    let mut content: string = "[Desktop Entry]\nType=Application\nName=" + display_name + "\nComment=" + comment +
+        "\nExec=" + exec_cmd + " %F\nCategories=" + categories + "\nTerminal=" + (if m.is_gui then "false" else "true") + "\n"
+    if icon_name != "" is content = content + "Icon=" + icon_name + "\n" end
+    if m.desktop.nodisplay is content = content + "NoDisplay=true\n" end
+    if m.desktop.mime_types != "" is content = content + "MimeType=" + m.desktop.mime_types + "\n" end
+    if m.desktop.keywords != "" is content = content + "Keywords=" + m.desktop.keywords + "\n" end
+    fs::write(desktop_path, content)
+    utils::run_command("update-desktop-database", [paths::desktop_dir()])
+    return error::HpmResult::Ok(true)
+end
+
+fn install_icon(dest_dir: string, m: manifest::Manifest, pkg_name: string) -> string is
+    let mut icon_src: string = ""
+    if m.desktop.icon != "" is
+        let p: string = dest_dir + "/" + m.desktop.icon
+        if fs::exists(p) is icon_src = p end
+    end
+    if icon_src == "" is
+        let candidates: [string] = [dest_dir + "/icons/" + pkg_name + ".png", dest_dir + "/icons/" + pkg_name + ".svg", dest_dir + "/" + pkg_name + ".png"]
+        let mut ci: int = 0
+        while ci < array_len(candidates) && icon_src == "" is
+            if fs::exists(candidates[ci]) is icon_src = candidates[ci] end
+            ci += 1
+        end
+    end
+    if icon_src == "" is icon_src = find_file_by_ext(dest_dir, ".png") end
+    if icon_src == "" is icon_src = find_file_by_ext(dest_dir, ".svg") end
+    if icon_src == "" is return "" end
+
+    let ext: string = if string_ends_with(icon_src, ".svg") then "svg" else "png"
+    if ext == "svg" is
+        let td: string = paths::icon_dir() + "/scalable/apps"
+        utils::mkdir_all(td)
+        fs::copy(icon_src, td + "/" + pkg_name + ".svg")
+    else is
+        let td2: string = paths::icon_dir() + "/256x256/apps"
+        utils::mkdir_all(td2)
+        fs::copy(icon_src, td2 + "/" + pkg_name + "." + ext)
+        utils::mkdir_all(paths::pixmap_dir())
+        fs::copy(icon_src, paths::pixmap_dir() + "/" + pkg_name + "." + ext)
+    end
+    utils::run_command("gtk-update-icon-cache", ["-f", "-t", paths::icon_dir()])
+    return pkg_name
+end
+
+fn patch_desktop_exec(path: string, hpm_exe: string, pkg_name: string, m: manifest::Manifest) is
+    let content: string = fs::read(path)
+    let bin_name: string = bin_name_for_pkg(m, pkg_name)
+    let new_exec: string = hpm_exe + " run " + pkg_name + " " + bin_name
+    let lines: [string] = string_split(content, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let line: string = lines[i]
+        if string_starts_with(line, "Exec=") is
+            let rest: string = string_slice(line, 5, string_len(line))
+            let tokens: [string] = string_split(rest, " ")
+            let mut suffix_parts: [string] = []
+            let mut ti: int = 0
+            while ti < array_len(tokens) is
+                if ti > 0 && string_starts_with(tokens[ti], "%") is suffix_parts = array_push(suffix_parts, tokens[ti]) end
+                ti += 1
+            end
+            if array_len(suffix_parts) == 0 is out = array_push(out, "Exec=" + new_exec)
+            else is out = array_push(out, "Exec=" + new_exec + " " + suffix_parts.join(" ")) end
+        else is
+            out = array_push(out, line)
+        end
+        i += 1
+    end
+    fs::write(path, out.join("\n") + "\n")
+end
+
+fn find_file_by_ext(dir: string, ext: string) -> string is
+    if !fs::exists(dir) is return "" end
+    let entries: [string] = fs::walk(dir)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        if fs::is_file(entries[i]) && string_ends_with(entries[i], ext) is return entries[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; ── Wykonywalność binarek ────────────────────────────────────────────
+
+pub fn make_all_binaries_executable(dir: string, m: manifest::Manifest) is
+    let mut i: int = 0
+    while i < array_len(m.bins) is
+        let bin_name: string = m.bins[i]
+        let mut handled: bool = false
+        if manifest::osm_contains(m.bin_paths, bin_name) is
+            let explicit: string = manifest::osm_get(m.bin_paths, bin_name)
+            let p: string = dir + "/" + explicit
+            if fs::exists(p) is utils::make_executable(p) handled = true end
+        end
+        if !handled is
+            let c1: string = dir + "/bin/" + bin_name
+            let c2: string = dir + "/" + bin_name
+            if fs::exists(c1) is utils::make_executable(c1) end
+            if fs::exists(c2) is utils::make_executable(c2) end
+            let rel: string = find_binary_in_dir(dir, bin_name)
+            if rel != "" is utils::make_executable(dir + "/" + rel) end
+        end
+        i += 1
+    end
+    make_scripts_executable_recursive(dir)
+end
+
+fn make_scripts_executable_recursive(dir: string) is
+    if !fs::exists(dir) is return end
+    let entries: [string] = fs::walk(dir)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let p: string = entries[i]
+        if fs::is_file(p) is
+            let head: string = fs::read(p)
+            if string_len(head) >= 2 && string_slice(head, 0, 2) == "#!" is
+                utils::make_executable(p)
+            end
+        end
+        i += 1
+    end
+end
+
+fn print_binary_not_found_help(dest_dir: string, bin_name: string) is
+    write("⚠ Binary '" + colors::white(bin_name) + "' not found in installed files.")
+    let entries: [string] = fs::walk(dest_dir)
+    let mut execs: [string] = []
+    let mut i: int = 0
+    while i < array_len(entries) is
+        if fs::is_file(entries[i]) is
+            let exec_check: error::HpmResult<int> = utils::run_command("test", ["-x", entries[i]])
+            match exec_check is
+                HpmResult::Ok(code) => is if code == 0 is execs = array_push(execs, entries[i]) end end
+                HpmResult::Err(_)   => is end
+            end
+        end
+        i += 1
+    end
+    if array_len(execs) == 0 is
+        write("  No executables. Fix: git update-index --chmod=+x contents/bin/<binary>")
+    else is
+        write("  Executables found:")
+        let prefix: string = dest_dir + "/"
+        let mut j: int = 0
+        while j < array_len(execs) is
+            let rel: string = if string_starts_with(execs[j], prefix) then string_slice(execs[j], string_len(prefix), string_len(execs[j])) else execs[j]
+            write("    " + rel)
+            j += 1
+        end
+    end
+end
+
+pub fn find_binary_in_dir(pkg_dir: string, bin_name: string) -> string is
+    if fs::exists(pkg_dir + "/bin/" + bin_name) is return "bin/" + bin_name end
+    if fs::exists(pkg_dir + "/" + bin_name) is return bin_name end
+    let entries: [string] = fs::walk(pkg_dir)
+    let prefix: string = pkg_dir + "/"
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let p: string = entries[i]
+        if fs::is_file(p) is
+            let name: string = if string_starts_with(p, prefix) then string_slice(p, string_len(prefix), string_len(p)) else p
+            let base_parts: [string] = string_split(name, "/")
+            let base: string = base_parts[array_len(base_parts) - 1]
+            if base == bin_name is return name end
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; ── Build (classic [build] commands / build.toml) ───────────────────
+
+pub fn run_classic_build(src_dir: string, m: manifest::Manifest) -> error::HpmResult<bool> is
+    let build_script: string = src_dir + "/build.info"
+    if fs::exists(build_script) is
+        utils::make_executable(build_script)
+        return sandbox::run_commands(src_dir, m, ["./build.info"])
+    end
+    if array_len(m.build.commands) > 0 is
+        return sandbox::run_commands(src_dir, m, m.build.commands)
+    end
+    return error::HpmResult::Ok(true)
+end
+
+pub fn run_build_config(cfg: repo::BuildConfig, src_dir: string, version: string, m: manifest::Manifest, pkg_name: string) -> error::HpmResult<bool> is
+    let contents_dir: string = src_dir + "/contents"
+    utils::mkdir_all(contents_dir)
+    let install_path: string = if cfg.install_path != "" then cfg.install_path else "bin/" + pkg_name
+    let dest: string = contents_dir + "/" + install_path
+    let dest_parent: string = dirname_of(dest)
+    if dest_parent != "" is utils::mkdir_all(dest_parent) end
+
+    if cfg.source_type == "prebuilt" || cfg.source_type == "" is
+        return error::HpmResult::Ok(true) ;; już w contents/
+    end
+
+    if cfg.source_type == "download" is
+        let resolved_url: string = string_replace(cfg.download_url, "{{version}}", version)
+        write("  → Downloading " + fmt::dim(resolved_url) + "...")
+        let tmp_path: string = env::temp_dir() + "/hpm-dl-" + to_string(time::now_unix())
+        let dl_r: error::HpmResult<bool> = utils::download_file(resolved_url, tmp_path)
+        if error::is_err(dl_r) is match dl_r is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+
+        let is_tar: bool = string_contains(resolved_url, ".tar.") || string_ends_with(resolved_url, ".tgz")
+        let is_zip: bool = string_ends_with(resolved_url, ".zip")
+        if is_tar is
+            let ex: string = env::temp_dir() + "/hpm-extract-" + to_string(time::now_unix())
+            utils::mkdir_all(ex)
+            let mut tar_args: [string] = ["-xf", tmp_path, "-C", ex]
+            if cfg.strip_components > 0 is tar_args = array_push(tar_args, "--strip-components=" + to_string(cfg.strip_components)) end
+            let tr: error::HpmResult<int> = utils::run_command("tar", tar_args)
+            match tr is
+                HpmResult::Ok(code) => is if code != 0 is return error::HpmResult::Err(error::HpmError::Io("tar extraction failed")) end end
+                HpmResult::Err(e)   => return error::HpmResult::Err(e)
+            end
+            if cfg.binary_path == "" is utils::copy_dir_all(ex, contents_dir)
+            else is fs::copy(ex + "/" + cfg.binary_path, dest) utils::make_executable(dest) end
+        elsif is_zip is
+            let ex2: string = env::temp_dir() + "/hpm-extract-" + to_string(time::now_unix())
+            utils::mkdir_all(ex2)
+            let ur: error::HpmResult<int> = utils::run_command("unzip", ["-q", tmp_path, "-d", ex2])
+            match ur is
+                HpmResult::Ok(code) => is if code != 0 is return error::HpmResult::Err(error::HpmError::Io("unzip failed")) end end
+                HpmResult::Err(e)   => return error::HpmResult::Err(e)
+            end
+            if cfg.binary_path == "" is utils::copy_dir_all(ex2, contents_dir)
+            else is fs::copy(ex2 + "/" + cfg.binary_path, dest) utils::make_executable(dest) end
+        else is
+            fs::copy(tmp_path, dest)
+            utils::make_executable(dest)
+        end
+        fs::remove(tmp_path)
+        return error::HpmResult::Ok(true)
+    end
+
+    if cfg.source_type == "build" is
+        write("  → Building from source...")
+        verbose::vlog("build.toml [source=build]: src_dir=" + src_dir)
+        let script: string = src_dir + "/_hpm_build.sh"
+        fs::write(script, "#!/bin/sh\nset -e\n" + cfg.build_commands.join("\n"))
+        utils::make_executable(script)
+        let br: error::HpmResult<bool> = sandbox::run_commands(src_dir, m, ["./_hpm_build.sh"])
+        fs::remove(script)
+        if error::is_err(br) is match br is HpmResult::Err(e) => return error::HpmResult::Err(e) HpmResult::Ok(_) => is end end end
+
+        let out: string = src_dir + "/" + cfg.build_output
+        if !fs::exists(out) is
+            return error::HpmResult::Err(error::HpmError::Manifest("Build output '" + cfg.build_output + "' not found."))
+        end
+        if fs::is_dir(out) is utils::copy_dir_all(out, contents_dir)
+        else is fs::copy(out, dest) utils::make_executable(dest) end
+        return error::HpmResult::Ok(true)
+    end
+
+    return error::HpmResult::Ok(true)
+end
+
+fn dirname_of(p: string) -> string is
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < string_len(p) is
+        if string_at(p, i) == "/" is idx = i end
+        i += 1
+    end
+    if idx < 0 is return "" end
+    return string_slice(p, 0, idx)
+end
