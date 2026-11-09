@@ -1,0 +1,233 @@
+mod colors
+mod error
+mod state
+mod utils
+mod manifest
+mod hooks
+mod squash
+mod paths
+
+use "std -> fs"   from "fs"
+use "std -> fmt"  from "fmt"
+use "std -> io"   from "io"
+use "std -> env"  from "env"
+use "std -> time" from "time"
+
+pub fn remove(spec: string) -> error::HpmResult<bool> is
+    let lock_r: error::HpmResult<int> = utils::acquire_lock()
+    match lock_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(lock_fd) => is
+            let result: error::HpmResult<bool> = remove_inner(spec)
+            utils::release_lock(lock_fd)
+            return result
+        end
+    end
+end
+
+fn remove_inner(spec: string) -> error::HpmResult<bool> is
+    let s_r: error::HpmResult<state::State> = state::state_load()
+    match s_r is
+        HpmResult::Err(e) => return error::HpmResult::Err(e)
+        HpmResult::Ok(initial_state) => is
+            let mut s: state::State = initial_state
+
+            let at: int = string_find(spec, "@")
+            let pkg_name: string = if at >= 0 then string_slice(spec, 0, at) else spec
+            let version: string = if at >= 0 then string_slice(spec, at + 1, string_len(spec)) else ""
+
+            if !state::has_package(s.packages, pkg_name) is
+                return error::HpmResult::Err(error::HpmError::PackageNotFound(pkg_name))
+            end
+
+            let rdeps: [string] = state::reverse_deps(s, pkg_name)
+            if array_len(rdeps) > 0 is
+                let other_versions_exist: bool = array_len(state::versions_of(s.packages, pkg_name)) > 1
+                let remaining_rdeps: [string] = if version != "" && !other_versions_exist then [] else rdeps
+                if array_len(remaining_rdeps) > 0 is
+                    write("⚠ The following packages depend on " + colors::white(pkg_name) + ":")
+                    let mut i: int = 0
+                    while i < array_len(remaining_rdeps) is
+                        write("  → " + remaining_rdeps[i])
+                        i += 1
+                    end
+                    let answer: string = io::read_line("Remove anyway? [y/N] ")
+                    if string_lower(string_trim(answer)) != "y" is
+                        write("→ Aborted.")
+                        return error::HpmResult::Ok(true)
+                    end
+                end
+            end
+
+            s = state::push_snapshot(s, "pre-remove " + spec)
+
+            if version != "" is
+                let rr: error::HpmResult<state::State> = remove_version(pkg_name, version, s)
+                match rr is
+                    HpmResult::Err(e) => return error::HpmResult::Err(e)
+                    HpmResult::Ok(new_s) => is
+                        s = new_s
+                        write(fmt::red("✔") + " " + colors::white(pkg_name) + "@" + colors::white(version) + " removed")
+                    end
+                end
+            else is
+                let versions: [state::VersionInfo] = state::versions_of(s.packages, pkg_name)
+                let mut i: int = 0
+                while i < array_len(versions) is
+                    let rr: error::HpmResult<state::State> = remove_version(pkg_name, versions[i].version, s)
+                    match rr is
+                        HpmResult::Err(e) => return error::HpmResult::Err(e)
+                        HpmResult::Ok(new_s) => s = new_s
+                    end
+                    i += 1
+                end
+                write(fmt::red("✔") + " " + colors::white(pkg_name) + " removed")
+            end
+
+            let save_r: error::HpmResult<bool> = state::state_save(s)
+            if error::is_err(save_r) is return save_r end
+            return error::HpmResult::Ok(true)
+        end
+    end
+end
+
+;; Zwraca ZAKTUALIZOWANY stan (styl funkcyjny, spójny z resztą portu —
+;; patrz `state.h#`) zamiast mutować `&mut State` jak w Rust.
+pub fn remove_version(pkg_name: string, version: string, s: state::State) -> error::HpmResult<state::State> is
+    let pkg_path: string = paths::store_path() + pkg_name + "/" + version
+    if !fs::exists(pkg_path) is
+        return error::HpmResult::Err(error::HpmError::Io("Path " + pkg_path + " does not exist"))
+    end
+    let mount_r: error::HpmResult<bool> = squash::ensure_mounted(pkg_path)
+    if error::is_err(mount_r) is
+        match mount_r is
+            HpmResult::Err(e) => return error::HpmResult::Err(e)
+            HpmResult::Ok(_)  => is end
+        end
+    end
+
+    let versions: [state::VersionInfo] = state::versions_of(s.packages, pkg_name)
+    let is_last_version: bool = array_len(versions) <= 1
+
+    let mut staged_post_remove: string = ""
+
+    let mr: error::HpmResult<manifest::Manifest> = manifest::Manifest::load_from_path(pkg_path)
+    match mr is
+        HpmResult::Ok(m) => is
+            let ctx: hooks::HookContext = hooks::HookContext {
+                pkg_name: pkg_name, pkg_version: version, store_path: paths::store_path(), old_version: "",
+            }
+
+            if hooks::hook_exists(pkg_path, hooks::HookKind::PreRemove) is
+                let hr: error::HpmResult<bool> = hooks::run_hook(pkg_path, hooks::HookKind::PreRemove, ctx, m)
+                if error::is_err(hr) is
+                    match hr is
+                        HpmResult::Err(e) => return error::HpmResult::Err(e)
+                        HpmResult::Ok(_)  => is end
+                    end
+                end
+            end
+
+            ;; Post-remove musi zadziałać PO fizycznym usunięciu plików — hook
+            ;; mieszka w tych plikach, więc kopiujemy hooks/ do stagingu wcześniej.
+            let hooks_src: string = pkg_path + "/hooks"
+            if fs::exists(hooks_src) && hooks::hook_exists(pkg_path, hooks::HookKind::PostRemove) is
+                let staging: string = env::temp_dir() + "/hpm-post-remove-" + pkg_name + "-" + version + "-" + to_string(time::now_unix())
+                let staged_hooks: string = staging + "/hooks"
+                utils::mkdir_all(staged_hooks)
+                utils::copy_dir_all(hooks_src, staged_hooks)
+                staged_post_remove = staging
+            end
+
+            let wn: state::WrapperNames = state::wrapper_names_load()
+            if is_last_version is
+                let mut b: int = 0
+                while b < array_len(m.bins) is
+                    let bin: string = m.bins[b]
+                    let wrapper_name: string = if state::wn_has(wn, pkg_name, bin) then state::wn_get(wn, pkg_name, bin) else bin
+                    let wrapper: string = paths::bin_dir() + "/" + wrapper_name
+                    if fs::exists(wrapper) is
+                        let content: string = fs::read(wrapper)
+                        if string_contains(content, "hpm run " + pkg_name + " ") is
+                            fs::remove(wrapper)
+                        end
+                    end
+                    if wrapper_name != bin is
+                        let default_wrapper: string = paths::bin_dir() + "/" + bin
+                        if fs::exists(default_wrapper) is
+                            let content2: string = fs::read(default_wrapper)
+                            if string_contains(content2, "hpm run " + pkg_name + " ") is
+                                fs::remove(default_wrapper)
+                            end
+                        end
+                    end
+                    b += 1
+                end
+
+                if m.is_gui || m.sandbox.gui || m.sandbox.full_gui is
+                    remove_desktop_integration(pkg_name)
+                end
+            end
+        end
+        HpmResult::Err(_) => is end
+    end
+
+    squash::unmount(pkg_path)
+    fs::rmdir_all(pkg_path)
+    squash::remove_sidecar(pkg_path)
+    let mut new_s: state::State = state::remove_package_version(s, pkg_name, version)
+
+    if staged_post_remove != "" is
+        let ctx2: hooks::HookContext = hooks::HookContext {
+            pkg_name: pkg_name, pkg_version: version, store_path: paths::store_path(), old_version: "",
+        }
+        hooks::run_hook(staged_post_remove, hooks::HookKind::PostRemove, ctx2, manifest::default_manifest(pkg_name))
+        fs::rmdir_all(staged_post_remove)
+    end
+
+    ;; Zaktualizuj symlink `current`, jeśli wskazywał na właśnie usuniętą wersję.
+    let current_ver: string = state::get_current_version(pkg_name, paths::store_path())
+    if current_ver == version is
+        let pkg_dir: string = paths::store_path() + pkg_name
+        let remaining: [state::VersionInfo] = state::versions_of(new_s.packages, pkg_name)
+        if array_len(remaining) > 0 is
+            let mut newest: string = remaining[0].version
+            let mut i: int = 0
+            while i < array_len(remaining) is
+                if utils::compare_versions(remaining[i].version, newest) > 0 is newest = remaining[i].version end
+                i += 1
+            end
+            utils::set_current_version(pkg_dir, newest)
+            write("  → Switched current to " + colors::white(newest))
+        end
+    end
+
+    return error::HpmResult::Ok(new_s)
+end
+
+fn remove_desktop_integration(pkg_name: string) is
+    let desktop: string = paths::desktop_dir() + "/" + pkg_name + ".desktop"
+    if fs::exists(desktop) is fs::remove(desktop) end
+
+    let sizes: [string] = ["16x16", "32x32", "48x48", "64x64", "128x128", "256x256", "scalable"]
+    let exts: [string] = ["png", "svg", "xpm"]
+    let mut s: int = 0
+    while s < array_len(sizes) is
+        let mut e: int = 0
+        while e < array_len(exts) is
+            let icon: string = paths::icon_dir() + "/" + sizes[s] + "/apps/" + pkg_name + "." + exts[e]
+            if fs::exists(icon) is fs::remove(icon) end
+            e += 1
+        end
+        s += 1
+    end
+    let mut e2: int = 0
+    while e2 < array_len(exts) is
+        let pixmap: string = paths::pixmap_dir() + "/" + pkg_name + "." + exts[e2]
+        if fs::exists(pixmap) is fs::remove(pixmap) end
+        e2 += 1
+    end
+
+    utils::run_command("update-desktop-database", [paths::desktop_dir()])
+    utils::run_command("gtk-update-icon-cache", ["-f", "-t", paths::icon_dir()])
+end
