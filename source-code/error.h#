@@ -1,0 +1,131 @@
+use "bit -> nidus" from "nidus"
+
+;; Warianty 1:1 z Rust `enum HpmError`:
+;;   PackageNotFound(String)
+;;   VersionNotFound(String, String)
+;;   Io(io::Error)               -> Io(string)      (zserializowany komunikat)
+;;   Git(git2::Error)            -> Git(string)
+;;   Network(reqwest::Error)     -> Network(string)
+;;   Json(serde_json::Error)     -> Json(string)
+;;   Manifest(String)
+;;   Permission(String)
+;;   Sandbox(String)
+;;   InvalidArg(String)
+pub enum HpmError is
+    PackageNotFound(string)
+    VersionNotFound(string, string)
+    Io(string)
+    Git(string)
+    Network(string)
+    Json(string)
+    Manifest(string)
+    Permission(string)
+    Sandbox(string)
+    InvalidArg(string)
+end
+
+;; Odpowiednik `miette::Result<T>` (= `Result<T, Report>`) z Rust. H# nie ma
+;; wbudowanego Result<T, E> (patrz `landlock::LandlockResult<T>` po ten sam
+;; wzorzec w bibliotece `landlock`) — więc cały projekt HPM konsekwentnie
+;; używa tego jednego, ogólnego typu wyniku zamiast `T?` wszędzie tam, gdzie
+;; oryginalny kod Rust niósł też *treść* błędu (nie tylko fakt niepowodzenia).
+pub enum HpmResult<T> is
+    Ok(T)
+    Err(HpmError)
+end
+
+pub fn is_ok<T>(r: HpmResult<T>) -> bool is
+    match r is
+        HpmResult::Ok(_)  => return true
+        HpmResult::Err(_) => return false
+    end
+end
+
+pub fn is_err<T>(r: HpmResult<T>) -> bool is
+    return !is_ok(r)
+end
+
+;; Uwaga: brak tu generycznego `unwrap_or_die<T>() -> T`, które kończyłoby
+;; proces w gałęzi `Err` — `die()`/`exit()` nie mają w H# statusu typu `!`
+;; (nigdy-nie-wracającego) jak w Rust, więc nie dałoby się tym zaspokoić
+;; wymaganego zwracanego typu `T` w gałęzi błędu. Zamiast tego, każde
+;; miejsce wołające coś zwracającego `HpmResult<T>` robi jawny `match`
+;; (dokładnie tak samo jak `landlock::LandlockResult<T>` jest
+;; rozpakowywany w `sandbox.h#`) — patrz `main.h#` i `commands/*.h#`.
+
+;; Konstruktory pomocnicze (odpowiedniki `From<...>` z Rust `#[from]`)
+pub fn from_io(msg: string) -> HpmError is
+    return HpmError::Io(msg)
+end
+
+pub fn from_git(msg: string) -> HpmError is
+    return HpmError::Git(msg)
+end
+
+pub fn from_network(msg: string) -> HpmError is
+    return HpmError::Network(msg)
+end
+
+pub fn from_json(msg: string) -> HpmError is
+    return HpmError::Json(msg)
+end
+
+;; Komunikat błędu — odpowiednik `#[error("...")]`
+pub fn message(e: HpmError) -> string is
+    match e is
+        HpmError::PackageNotFound(name)      => return "Package not found: " + name
+        HpmError::VersionNotFound(name, ver) => return "Version not found: " + name + "@" + ver
+        HpmError::Io(msg)                    => return "IO error: " + msg
+        HpmError::Git(msg)                   => return "Git error: " + msg
+        HpmError::Network(msg)               => return "Network error: " + msg
+        HpmError::Json(msg)                  => return "JSON error: " + msg
+        HpmError::Manifest(msg)              => return "Invalid package manifest: " + msg
+        HpmError::Permission(msg)            => return "Permission denied: " + msg
+        HpmError::Sandbox(msg)               => return "Sandbox error: " + msg
+        HpmError::InvalidArg(msg)            => return "Invalid argument: " + msg
+    end
+end
+
+;; Kod diagnostyczny — odpowiednik `#[diagnostic(code(hpm::...))]`
+pub fn code(e: HpmError) -> string is
+    match e is
+        HpmError::PackageNotFound(_)    => return "hpm::package_not_found"
+        HpmError::VersionNotFound(_, _) => return "hpm::version_not_found"
+        HpmError::Io(_)                 => return "hpm::io_error"
+        HpmError::Git(_)                => return "hpm::git_error"
+        HpmError::Network(_)            => return "hpm::network_error"
+        HpmError::Json(_)               => return "hpm::json_error"
+        HpmError::Manifest(_)           => return "hpm::manifest_error"
+        HpmError::Permission(_)         => return "hpm::permission_denied"
+        HpmError::Sandbox(_)            => return "hpm::sandbox_error"
+        HpmError::InvalidArg(_)         => return "hpm::invalid_arg"
+    end
+end
+
+;; Zamienia HpmError na pełną diagnostykę `nidus_diagnostic::Diagnostic`, gotową do
+;; renderowania (kolorowe ramki, kod błędu, itd. — odpowiednik `fancy`
+;; feature `miette` w Rust).
+pub fn to_diagnostic(e: HpmError) -> nidus_diagnostic::Diagnostic is
+    let mut d: nidus_diagnostic::Diagnostic = nidus::error(message(e))
+    d = d.with_code(code(e))
+    return d
+end
+
+;; Wypisuje błąd na stderr w ładnym formacie i kończy proces kodem 1 —
+;; odpowiednik typowego `Err(e) => { eprintln!("{:?}", e); exit(1) }`
+;; ubranego w `miette`.
+pub fn die(e: HpmError) is
+    nidus::die(to_diagnostic(e))
+end
+
+;; Wersja nie-fatalna: tylko wypisuje diagnostykę i wraca (np. warningi
+;; zbierane po drodze, które nie przerywają całej operacji).
+pub fn report(e: HpmError) is
+    nidus::report(to_diagnostic(e))
+end
+
+;; Prosty format tekstowy "kod: komunikat" — używany tam, gdzie w Rust
+;; robiono `format!("{}", e)` bez pełnego renderu miette (np. logi, JSON).
+pub fn to_string(e: HpmError) -> string is
+    return code(e) + ": " + message(e)
+end
