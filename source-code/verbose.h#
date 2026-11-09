@@ -1,0 +1,27 @@
+use "std -> env" from "env"
+
+fn flag_key() -> string is
+    return "__HPM_VERBOSE__"
+end
+
+pub fn set_verbose(v: bool) is
+    if v is
+        env::set(flag_key(), "1")
+    end
+end
+
+pub fn is_verbose() -> bool is
+    return env::get_or(flag_key(), "0") == "1"
+end
+
+;; Odpowiednik `crate::vlog!("...", args...)` — H# nie ma formatowania
+;; wariadycznego makr, więc wołający sam składa string interpolacją
+;; (`"spawning {cmd} with args {args}"`), a `vlog` tylko dopisuje prefiks
+;; i warunkowo wypisuje. `std -> io` nie ma `eprintln` (brak rozróżnienia
+;; stdout/stderr w H#) — idzie więc przez wbudowane `write()`, tak jak
+;; cała reszta wyjścia diagnostycznego hpm.
+pub fn vlog(msg: string) is
+    if is_verbose() is
+        write("[verbose] " + msg)
+    end
+end
